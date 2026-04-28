@@ -4,7 +4,7 @@
 
 **Features:**
 
-* Refactored and expanded (with the help of AI) version of Hugh Pyle's ttyemy project
+* Refactored and expanded (with the help of AI) version of Hugh Pyle's ttyemu project
 * Supports Pygame and Tkinter frontends.
 * Backends for serial and ssh (Paramiko library)
     Ssh has not been well tested, so use with caution.
@@ -12,7 +12,7 @@
 * F3/F4 displays/hides the paper tape punch.
 * By default, output is limited to an authentic 10 characters per second. Hit F5 to unthrottle the speed.
 * Hit F6 to mute the sound.
-* Sound is generated using Hugh Pyle's ASR-33 sound recording and Pygame mixer. The sound module Sound now works with both Tkinter and Pygame frontends. If it's too loud, hit F7 to close the lid.
+* Sound is generated using Hugh Pyle's ASR-33 sound recording and Pygame mixer. The sound module, asr33_sounds_sm.py, now works with both Tkinter and Pygame frontends. If it's too loud, hit F7 to close the lid.
 * Hit F8 to switch between Line and Local modes.
 * Hit F9 to turn the printer output on and off.
 * Scrolling (with page up, down, home, end, mouse scroll - Tkinter frontend has a scrollbar)
