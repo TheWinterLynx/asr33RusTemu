@@ -24,46 +24,48 @@
 **Installation Notes**
 
 **Windows:**
-Install Python3 from the Microsoft Store or Python.org website.<br>
-(Tested using Python 3.13 on Windows 11 Home, version 25H2)<br>
+Install Python3 from the Microsoft Store.
+(Tested using Python 3.13 on Windows 11 Home, version 25H2)
 
-Python package installation is required to run asr33emu on Windows:<br>
-On Windows using PowerShell or from a Command Prompt:<br>
+Python package installation is required to run asr33emu on Windows:
+On Windows using PowerShell or from a Command Prompt:
+
 * python3 -m pip install PyYAML
 * python3 -m pip install pyserial
 * python3 -m pip install paramiko
-* python3 -m pip install pygame
+* python3 -m pip install pygame-ce
 * python3 -m pip install pillow
 * python3 -m pip install fonttools
 
-**Ubuntu**: (Tested on 24.04.3)<br>
-Python package installation is required to run asr33emu on Ubuntu Linux:<br>
+**Ubuntu**: (Tested on 24.04.3)
+Python package installation is required to run asr33emu on Ubuntu Linux:
+
 * sudo apt install python3-tk
 * sudo apt install python3-pygame
 * sudo apt install python3-pil.imagetk
 * sudo apt install python3-fonttools
 * sudo apt install python3-paramiko
 
-Using serial ports in Ubuntu requires adding yourself to the "dialout" group:<br>
-sudo usermod -a -G dialout $USER<br>
-Then reboot (logout/login seems to be insufficient)<br>
+Using serial ports in Ubuntu requires adding yourself to the "dialout" group:
+sudo usermod -a -G dialout $USER
+Then reboot (logout/login seems to be insufficient)
 
-**Running the asr33emu Terminal Emulator**<br>
-Run asr33emu from the project directory by typing:<br>
-    python3 ./asr33emu.py<br>
-This will start up the emulator using the configuration defined in asr33_config.yaml<br>
+**Running the asr33emu Terminal Emulator**
+Run asr33emu from the project directory by typing:
+python3 ./asr33emu.py
+This will start up the emulator using the configuration defined in asr33\_config.yaml
 Note that some config file parameters can be overridden on the command line or an alternate configuration file can be specified using "--config filename.yaml". Type: python3 ./asr33emu.py --help for more start up information.
 
 ***
 
-**PiDP8/I Useage Notes**<br>
-For the paper tape reader to load binary tapes, SIMH 8-bit terminal mode is required. In your boot script, ensure the SIMH emulator Terminal Input (TTI) device is set to operate in 8-bit mode by including the command:<br>
-set tti 8b<br>
+**PiDP8/I Useage Notes**
+For the paper tape reader to load binary tapes, SIMH 8-bit terminal mode is required. In your boot script, ensure the SIMH emulator Terminal Input (TTI) device is set to operate in 8-bit mode by including the command:
+set tti 8b
 
-Some PDP8 programs expect the keyboard to send mark-parity (bit-7 set to 1). This results in non-standard ASCII characters being sent but seems to be necessary for some OS8 programs. I found FOCAL-69 also requires keyboard mark-parity. An ASR-33 printer seems to ignore the parity bit. This feature can be enabled in the configuration file, asr33_config.yaml, by setting keyboard_parity_mode to "mark". It should be set to "space" to generate standard ASCII characters.<br>
+Some PDP8 programs expect the keyboard to send mark-parity (bit-7 set to 1). This results in non-standard ASCII characters being sent but seems to be necessary for some OS8 programs. I found FOCAL-69 also requires keyboard mark-parity. An ASR-33 printer seems to ignore the parity bit. This feature can be enabled in the configuration file, asr33\_config.yaml, by setting keyboard\_parity\_mode to "mark". It should be set to "space" to generate standard ASCII characters.
 
-For most PDP8 communications you will also want keyboard_uppercase_only set to "true".<br>
+For most PDP8 communications you will also want keyboard\_uppercase\_only set to "true".
 
-I find it quite convenient to load both the RIM and Binary loaders in the same PiDP8 start up configuration file. I use "1.script" for this purpose. If you're looking for a more realistic experience, you can use the front panel to load the RIM loader and asr33emu's simulated paper tape reader to load the binary loader and the front panel to start it running.<br>
+I find it quite convenient to load both the RIM and Binary loaders in the same PiDP8 start up configuration file. I use "1.script" for this purpose. If you're looking for a more realistic experience, you can use the front panel to load the RIM loader and asr33emu's simulated paper tape reader to load the binary loader and the front panel to start it running.
 
-The self-starting EDU20C BASIC paper tape loads and runs fine using asr33emu. It requires only the RIM loader to load and at 10 characters per second, it takes about 25 minutes to load and start. If you're impatient, you can turn off the data rate throttle in the emulator, and it will load in a few minutes at a rate of about 300 CPS. ASR-33 teletypes connected to PDP8's typically had a hardware tape-reader auto-start/stop feature. This feature cannot be easily simulated, but an auto-stop has been added to the reader. It works by detecting trailing 200 octal or null characters. If auto-stop is not enabled, when EDU20C BASIC auto-starts, the tape reader will feed trailer bytes to its startup dialog resulting in garbage being entered at the setup prompts.<br>
+The self-starting EDU20C BASIC paper tape loads and runs fine using asr33emu. It requires only the RIM loader to load and at 10 characters per second, it takes about 25 minutes to load and start. If you're impatient, you can turn off the data rate throttle in the emulator, and it will load in a few minutes at a rate of about 300 CPS. ASR-33 teletypes connected to PDP8's typically had a hardware tape-reader auto-start/stop feature. This feature cannot be easily simulated, but an auto-stop has been added to the reader. It works by detecting trailing 200 octal or null characters. If auto-stop is not enabled, when EDU20C BASIC auto-starts, the tape reader will feed trailer bytes to its startup dialog resulting in garbage being entered at the setup prompts.
