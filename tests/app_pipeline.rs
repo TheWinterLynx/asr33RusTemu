@@ -173,6 +173,44 @@ fn capacity_one_application_ingress_is_lossless_across_multiple_chunks() {
 }
 
 #[test]
+fn startup_cr_uses_legacy_pre_configuration_line_queue_semantics() {
+    for (mode, expected_transport) in [
+        (CommunicationMode::Line, b"\r".as_slice()),
+        (CommunicationMode::Local, b"".as_slice()),
+    ] {
+        let mut runtime = AppRuntime::new(
+            FakeTransport::default(),
+            FakeScheduler::default(),
+            TerminalOptions::default(),
+            ThrottleConfig {
+                tx_rate_cps: 0,
+                rx_rate_cps: 0,
+                tx_queue_capacity: 1,
+                rx_queue_capacity: 1,
+            },
+        )
+        .expect("valid runtime");
+        runtime
+            .start_with_initial_commands([
+                ApplicationCommand::Transmit(b"\r".to_vec()),
+                ApplicationCommand::SetCommunicationMode(mode),
+            ])
+            .expect("startup succeeds");
+        runtime.pump().expect("startup queue drains");
+        let sent = runtime
+            .transport()
+            .sent
+            .iter()
+            .flat_map(|command| match command {
+                TransportCommand::Send(data) => data.iter().copied(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sent, expected_transport);
+        assert_eq!(runtime.terminal().cursor_position(), (0, 0));
+    }
+}
+
+#[test]
 fn capacity_one_transport_ingress_is_lossless_across_multiple_chunks() {
     let mut runtime = runtime_with_throttle(
         true,

@@ -165,8 +165,23 @@ where
     }
 
     pub fn start(&mut self) -> Result<(), RuntimeError<T::Error>> {
+        self.start_with_initial_commands(std::iter::empty())
+    }
+
+    pub fn start_with_initial_commands<I>(
+        &mut self,
+        commands: I,
+    ) -> Result<(), RuntimeError<T::Error>>
+    where
+        I: IntoIterator<Item = ApplicationCommand>,
+    {
         match self.state {
             RuntimeState::Created => {
+                for command in commands {
+                    if let Err(rejected) = self.apply_application_command(command) {
+                        self.pending_application.push_back(rejected);
+                    }
+                }
                 self.transport.start().map_err(RuntimeError::Transport)?;
                 self.state = RuntimeState::Running;
                 Ok(())
@@ -336,6 +351,19 @@ where
         let Some(command) = self.pending_application.pop_front() else {
             return false;
         };
+        match self.apply_application_command(command) {
+            Ok(()) => true,
+            Err(rejected) => {
+                self.pending_application.push_front(rejected);
+                false
+            }
+        }
+    }
+
+    fn apply_application_command(
+        &mut self,
+        command: ApplicationCommand,
+    ) -> Result<(), ApplicationCommand> {
         match command {
             ApplicationCommand::SetPrinterEnabled(enabled) => {
                 if enabled {
@@ -343,15 +371,11 @@ where
                 } else {
                     self.terminal.disable_printing();
                 }
-                true
+                Ok(())
             }
             command => match self.throttle.handle_application_command(command) {
-                Ok(_) => true,
-                Err(rejected) => {
-                    self.pending_application
-                        .push_front(ApplicationCommand::Transmit(rejected.data));
-                    false
-                }
+                Ok(_) => Ok(()),
+                Err(rejected) => Err(ApplicationCommand::Transmit(rejected.data)),
             },
         }
     }

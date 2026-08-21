@@ -21,6 +21,26 @@ class ThrottleCharacterizationTests(unittest.TestCase):
         )
         return throttle, lower, upper
 
+    def test_startup_cr_queued_before_line_mode_is_sent_to_backend(self):
+        throttle, lower, _upper = self.make_throttle()
+        throttle.send_data(b"\r")
+        throttle.disable_loopback()
+        throttle._process_queue_item(
+            throttle._send_queue, 0, throttle._send_data_to_backend, 0.0
+        )
+        self.assertEqual(lower.sent, [b"\r"])
+
+    def test_startup_cr_queued_before_local_mode_is_discarded_not_looped_back(self):
+        throttle, lower, upper = self.make_throttle()
+        throttle.send_data(b"\r")
+        throttle.enable_loopback()
+        throttle._process_queue_item(
+            throttle._send_queue, 0, throttle._send_data_to_backend, 0.0
+        )
+        self.assertEqual(lower.sent, [])
+        self.assertEqual(upper.received, [])
+        self.assertTrue(throttle._loopback_queue.empty())
+
     def test_shared_timing_and_chunk_vectors(self):
         fixture_path = Path(__file__).parent / "fixtures" / "throttle_cases.json"
         cases = json.loads(fixture_path.read_text(encoding="utf-8"))

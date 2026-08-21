@@ -61,22 +61,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         terminal_options,
         throttle_config,
     )?;
-    runtime.start()?;
-    runtime.submit(ApplicationCommand::SetCommunicationMode(communication_mode))?;
-    runtime.submit(ApplicationCommand::SetThrottleMode(throttle_mode))?;
-    runtime.submit(ApplicationCommand::SetTxRate(
-        config.data_throttle.config.send_rate_cps,
-    ))?;
-    runtime.submit(ApplicationCommand::SetRxRate(
-        config.data_throttle.config.receive_rate_cps,
-    ))?;
-    runtime.submit(ApplicationCommand::SetPrinterEnabled(printer_enabled))?;
+    let mut initial_commands = Vec::new();
     if terminal_config.send_cr_at_startup {
-        runtime.submit(ApplicationCommand::Transmit(encode_input(
+        initial_commands.push(ApplicationCommand::Transmit(encode_input(
             &KeyboardInput::Return,
             keyboard,
-        )?))?;
+        )?));
     }
+    initial_commands.extend([
+        ApplicationCommand::SetCommunicationMode(communication_mode),
+        ApplicationCommand::SetThrottleMode(throttle_mode),
+        ApplicationCommand::SetTxRate(config.data_throttle.config.send_rate_cps),
+        ApplicationCommand::SetRxRate(config.data_throttle.config.receive_rate_cps),
+        ApplicationCommand::SetPrinterEnabled(printer_enabled),
+    ]);
+    runtime.start_with_initial_commands(initial_commands)?;
 
     let ui_options = UiOptions {
         title: "ASR-33 Teletype Emulator".to_owned(),

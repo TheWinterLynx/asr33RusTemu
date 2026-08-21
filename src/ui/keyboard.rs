@@ -1,4 +1,8 @@
 //! Pure conversion from logical keyboard input to ASR-33 bytes.
+//!
+//! Legacy Python raises `UnicodeEncodeError` for non-ASCII input. Rust returns
+//! [`KeyboardEncodingError`] instead; the UI displays it without submitting a
+//! partial payload or terminating the application.
 
 use crate::core::config::KeyboardParityMode;
 use crate::core::terminal::encode_even_parity;
@@ -161,5 +165,13 @@ mod tests {
         )
         .expect_err("legacy ASCII-only input is rejected");
         assert_eq!(error.to_string(), "keyboard character 'é' is not ASCII");
+        assert!(
+            encode_input(
+                &KeyboardInput::Text("Aé".into()),
+                options(KeyboardParityMode::Space),
+            )
+            .is_err(),
+            "a mixed input returns no partial byte payload"
+        );
     }
 }

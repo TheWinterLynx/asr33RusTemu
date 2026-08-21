@@ -57,32 +57,27 @@ impl EguiApp {
         }
     }
 
-    fn submit(&mut self, command: ApplicationCommand) {
+    fn submit(&mut self, context: &egui::Context, command: ApplicationCommand) {
         if let Err(error) = self.runtime.submit(command) {
             self.transport_error = Some(error.to_string());
         }
+        context.request_repaint();
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context) {
         let events = context.input(|input| input.events.clone());
-        for event in events {
-            let logical = match event {
-                egui::Event::Text(text) => Some(KeyboardInput::Text(text)),
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => map_key(key, modifiers),
-                _ => None,
-            };
+        for event in &events {
+            let logical = keyboard_input_for_event(event);
             if let Some(input) = logical {
                 match encode_input(&input, self.options.keyboard) {
                     Ok(bytes) if !bytes.is_empty() => {
-                        self.submit(ApplicationCommand::Transmit(bytes));
+                        self.submit(context, ApplicationCommand::Transmit(bytes));
                     }
                     Ok(_) => {}
-                    Err(error) => self.transport_error = Some(error.to_string()),
+                    Err(error) => {
+                        self.transport_error = Some(error.to_string());
+                        context.request_repaint();
+                    }
                 }
             }
         }
@@ -134,9 +129,10 @@ impl EguiApp {
                 .clicked()
             {
                 self.options.communication_mode = CommunicationMode::Line;
-                self.submit(ApplicationCommand::SetCommunicationMode(
-                    CommunicationMode::Line,
-                ));
+                self.submit(
+                    ui.ctx(),
+                    ApplicationCommand::SetCommunicationMode(CommunicationMode::Line),
+                );
             }
             if ui
                 .selectable_label(
@@ -146,9 +142,10 @@ impl EguiApp {
                 .clicked()
             {
                 self.options.communication_mode = CommunicationMode::Local;
-                self.submit(ApplicationCommand::SetCommunicationMode(
-                    CommunicationMode::Local,
-                ));
+                self.submit(
+                    ui.ctx(),
+                    ApplicationCommand::SetCommunicationMode(CommunicationMode::Local),
+                );
             }
             ui.separator();
             if ui
@@ -159,7 +156,10 @@ impl EguiApp {
                 .clicked()
             {
                 self.options.throttle_mode = ThrottleMode::Throttled;
-                self.submit(ApplicationCommand::SetThrottleMode(ThrottleMode::Throttled));
+                self.submit(
+                    ui.ctx(),
+                    ApplicationCommand::SetThrottleMode(ThrottleMode::Throttled),
+                );
             }
             if ui
                 .selectable_label(
@@ -169,9 +169,10 @@ impl EguiApp {
                 .clicked()
             {
                 self.options.throttle_mode = ThrottleMode::Unthrottled;
-                self.submit(ApplicationCommand::SetThrottleMode(
-                    ThrottleMode::Unthrottled,
-                ));
+                self.submit(
+                    ui.ctx(),
+                    ApplicationCommand::SetThrottleMode(ThrottleMode::Unthrottled),
+                );
             }
             ui.separator();
             let printer_label = if self.options.printer_enabled {
@@ -181,9 +182,10 @@ impl EguiApp {
             };
             if ui.button(printer_label).clicked() {
                 self.options.printer_enabled = !self.options.printer_enabled;
-                self.submit(ApplicationCommand::SetPrinterEnabled(
-                    self.options.printer_enabled,
-                ));
+                self.submit(
+                    ui.ctx(),
+                    ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
+                );
             }
         });
         if let Some(error) = &self.transport_error {
@@ -291,6 +293,19 @@ fn install_font(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
+fn keyboard_input_for_event(event: &egui::Event) -> Option<KeyboardInput> {
+    match event {
+        egui::Event::Text(text) => Some(KeyboardInput::Text(text.clone())),
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => map_key(*key, *modifiers),
+        _ => None,
+    }
+}
+
 fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyboardInput> {
     if modifiers.ctrl {
         let character = match key {
@@ -334,9 +349,21 @@ fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyboardInput> 
 
 #[cfg(test)]
 mod tests {
-    use super::repaint_delay;
+    use super::{keyboard_input_for_event, repaint_delay};
     use crate::app::PumpStatus;
+    use crate::ui::keyboard::KeyboardInput;
+    use eframe::egui::{Event, Key, Modifiers};
     use std::time::Duration;
+
+    fn key_event(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
 
     #[test]
     fn maps_every_runtime_status_to_non_blocking_repaint_policy() {
@@ -360,5 +387,50 @@ mod tests {
             repaint_delay(PumpStatus::TransportFailed),
             Some(Duration::from_millis(16))
         );
+    }
+
+    #[test]
+    fn printable_physical_input_uses_only_the_text_route() {
+        let events = [
+            key_event(Key::A, Modifiers::NONE),
+            Event::Text("a".to_owned()),
+        ];
+        let inputs = events
+            .iter()
+            .filter_map(keyboard_input_for_event)
+            .collect::<Vec<_>>();
+        assert_eq!(inputs, [KeyboardInput::Text("a".to_owned())]);
+    }
+
+    #[test]
+    fn return_backspace_and_tab_each_use_only_the_key_route() {
+        for (key, expected) in [
+            (Key::Enter, KeyboardInput::Return),
+            (Key::Backspace, KeyboardInput::Backspace),
+            (Key::Tab, KeyboardInput::Tab),
+        ] {
+            assert_eq!(
+                keyboard_input_for_event(&key_event(key, Modifiers::NONE)),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_letter_uses_key_route_and_clipboard_events_are_not_transmitted() {
+        let control_a = key_event(
+            Key::A,
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            keyboard_input_for_event(&control_a),
+            Some(KeyboardInput::Control('A'))
+        );
+        assert_eq!(keyboard_input_for_event(&Event::Copy), None);
+        assert_eq!(keyboard_input_for_event(&Event::Cut), None);
+        assert_eq!(keyboard_input_for_event(&Event::Paste("x".into())), None);
     }
 }
