@@ -16,6 +16,8 @@ pub enum FeedResult {
 pub struct ReaderFeed {
     reader: TapeReader,
     pending: Option<u8>,
+    checkpoint: Option<usize>,
+    awaiting_confirmation: bool,
     next_due: Duration,
 }
 
@@ -25,6 +27,8 @@ impl ReaderFeed {
         Self {
             reader,
             pending: None,
+            checkpoint: None,
+            awaiting_confirmation: false,
             next_due: now,
         }
     }
@@ -37,10 +41,30 @@ impl ReaderFeed {
     }
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        usize::from(self.pending.is_some())
+        usize::from(self.pending.is_some() || self.awaiting_confirmation)
     }
     pub fn clear_pending(&mut self) {
         self.pending = None;
+        self.checkpoint = None;
+        self.awaiting_confirmation = false;
+    }
+    #[must_use]
+    pub fn awaiting_confirmation(&self) -> bool {
+        self.awaiting_confirmation
+    }
+    /// Commit the current reader position after its byte reaches the runtime's
+    /// transport/terminal boundary.
+    pub fn confirm_transmitted(&mut self) {
+        self.awaiting_confirmation = false;
+        self.checkpoint = None;
+    }
+    /// Restore the position captured before the single unconfirmed byte.
+    pub fn rollback_unconfirmed(&mut self) {
+        if let Some(position) = self.checkpoint.take() {
+            self.reader.restore_position(position);
+        }
+        self.pending = None;
+        self.awaiting_confirmation = false;
     }
 
     pub fn tick<F>(&mut self, now: Duration, mut transmit: F) -> Option<Duration>
@@ -50,18 +74,30 @@ impl ReaderFeed {
         if self.reader.state() != ReaderState::Running {
             return None;
         }
+        if self.awaiting_confirmation {
+            return None;
+        }
         if now < self.next_due {
             return Some(self.next_due - now);
         }
         let byte = match self.pending.take() {
             Some(byte) => byte,
-            None => match self.reader.step() {
-                ReaderStep::Byte(byte) => byte,
-                ReaderStep::Idle | ReaderStep::Stopped(_) => return None,
-            },
+            None => {
+                let checkpoint = self.reader.position();
+                match self.reader.step() {
+                    ReaderStep::Byte(byte) => {
+                        self.checkpoint = Some(checkpoint);
+                        byte
+                    }
+                    ReaderStep::Idle | ReaderStep::Stopped(_) => return None,
+                }
+            }
         };
         match transmit(byte) {
-            FeedResult::Accepted => self.next_due = now + READER_FEED_INTERVAL,
+            FeedResult::Accepted => {
+                self.awaiting_confirmation = true;
+                self.next_due = now + READER_FEED_INTERVAL;
+            }
             FeedResult::Backpressured(byte) => {
                 self.pending = Some(byte);
                 return Some(Duration::from_millis(1));
@@ -101,6 +137,9 @@ mod tests {
                     FeedResult::Accepted
                 }
             });
+            if feed.awaiting_confirmation() {
+                feed.confirm_transmitted();
+            }
             assert!(feed.pending_count() <= 1);
             now += delay.unwrap_or(READER_FEED_INTERVAL);
         }
@@ -118,10 +157,12 @@ mod tests {
             emitted.push(byte);
             FeedResult::Accepted
         });
+        feed.confirm_transmitted();
         feed.tick(Duration::from_millis(3), |byte| {
             emitted.push(byte);
             FeedResult::Accepted
         });
+        feed.confirm_transmitted();
         feed.tick(Duration::from_millis(6), |byte| {
             emitted.push(byte);
             FeedResult::Accepted
@@ -151,5 +192,8 @@ mod tests {
         );
         assert_eq!(feed.pending_count(), 1);
         assert_eq!(feed.reader().position(), 1);
+        feed.rollback_unconfirmed();
+        assert_eq!(feed.pending_count(), 0);
+        assert_eq!(feed.reader().position(), 0);
     }
 }

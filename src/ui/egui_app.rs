@@ -5,7 +5,7 @@ use eframe::egui::{self, Align2, Color32, FontData, FontDefinitions, FontFamily,
 
 use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
-use crate::app::paper_tape::{FeedResult, ReaderFeed};
+use crate::app::paper_tape::{FeedResult, READER_FEED_INTERVAL, ReaderFeed};
 use crate::app::{
     AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, Scheduler,
     SystemScheduler,
@@ -129,8 +129,10 @@ impl EguiApp {
 
     fn disconnect(&mut self) {
         if self.options.communication_mode == CommunicationMode::Line
-            && self.reader.reader().state() == ReaderState::Running
+            && (self.reader.reader().state() == ReaderState::Running
+                || self.reader.pending_count() != 0)
         {
+            self.reader.rollback_unconfirmed();
             self.reader.reader_mut().stop();
             self.tape_error = Some(
                 "reader paused: serial disconnected; position retained and stale TX discarded"
@@ -291,6 +293,15 @@ impl EguiApp {
             }
         }
         self.collect_runtime_events();
+        let reader_route_available = self.options.communication_mode == CommunicationMode::Local
+            || self.runtime.connection_state() == &ConnectionState::Connected;
+        if self.reader.awaiting_confirmation()
+            && reader_route_available
+            && self.runtime.transmit_idle()
+        {
+            self.reader.confirm_transmitted();
+            context.request_repaint_after(READER_FEED_INTERVAL);
+        }
     }
 
     fn collect_runtime_events(&mut self) {
@@ -318,8 +329,10 @@ impl EguiApp {
 
     fn pause_line_reader_after_failure(&mut self) {
         if self.options.communication_mode == CommunicationMode::Line
-            && self.reader.reader().state() == ReaderState::Running
+            && (self.reader.reader().state() == ReaderState::Running
+                || self.reader.pending_count() != 0)
         {
+            self.reader.rollback_unconfirmed();
             self.reader.reader_mut().stop();
             self.tape_error = Some(
                 "reader paused after connection failure; position retained, external in-flight TX discarded"

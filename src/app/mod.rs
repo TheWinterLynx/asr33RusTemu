@@ -399,12 +399,16 @@ where
             Ok(()) => {
                 self.transport = Some(transport);
                 self.connection = ConnectionState::Connected;
-                if self.startup_cr_pending
-                    && !self.startup_cr_consumed
-                    && self.throttle.enqueue_tx(vec![b'\r']).is_ok()
-                {
-                    self.startup_cr_pending = false;
-                    self.startup_cr_consumed = true;
+                if self.startup_cr_pending && !self.startup_cr_consumed {
+                    if self.throttle.communication_mode() == CommunicationMode::Line {
+                        if self.throttle.enqueue_tx(vec![b'\r']).is_ok() {
+                            self.startup_cr_pending = false;
+                            self.startup_cr_consumed = true;
+                        }
+                    } else {
+                        self.startup_cr_pending = false;
+                        self.startup_cr_consumed = true;
+                    }
                 }
                 Ok(())
             }
@@ -450,6 +454,18 @@ where
         }
     }
 
+    /// Whether every accepted application TX has reached its destination
+    /// boundary: the transport adapter in LINE or Terminal in LOCAL.
+    #[must_use]
+    pub fn transmit_idle(&self) -> bool {
+        self.throttle.transmit_idle()
+            && self.pending_transport.is_empty()
+            && !self
+                .pending_application
+                .iter()
+                .any(|command| matches!(command, ApplicationCommand::Transmit(_)))
+    }
+
     fn require_running(&self) -> Result<(), RuntimeError<T::Error>> {
         if self.state == RuntimeState::Running {
             Ok(())
@@ -465,10 +481,17 @@ where
                 let Some(transport) = self.transport.as_mut() else {
                     return Ok(false);
                 };
-                let Some(event) = transport.try_recv().map_err(RuntimeError::Transport)? else {
-                    return Ok(false);
-                };
-                event
+                match transport.try_recv() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => return Ok(false),
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.events
+                            .push_back(RuntimeEvent::ConnectionFailed(message.clone()));
+                        self.fail_active_connection(message);
+                        return Ok(true);
+                    }
+                }
             }
         };
         match event {

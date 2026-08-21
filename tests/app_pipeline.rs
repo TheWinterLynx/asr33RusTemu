@@ -42,6 +42,7 @@ struct FakeTransport {
     joined: bool,
     lifecycle: Arc<(AtomicBool, AtomicBool)>,
     start_error: bool,
+    receive_error: bool,
 }
 
 impl FakeTransport {
@@ -89,6 +90,10 @@ impl Transport for FakeTransport {
     }
 
     fn try_recv(&mut self) -> Result<Option<TransportEvent>, Self::Error> {
+        if self.receive_error {
+            self.receive_error = false;
+            return Err(FakeTransportError("receive channel failed"));
+        }
         Ok(self.incoming.pop_front())
     }
 
@@ -322,19 +327,126 @@ fn disconnect_discards_throttled_and_transport_pending_tx_before_reconnect() {
 }
 
 #[test]
+fn paper_reader_rolls_back_unconfirmed_byte_and_resumes_without_loss() {
+    for capacity in [1, 8] {
+        let mut runtime = runtime_with_throttle(
+            true,
+            ThrottleConfig {
+                tx_rate_cps: 10,
+                rx_rate_cps: 10,
+                tx_queue_capacity: capacity,
+                rx_queue_capacity: 1,
+            },
+        );
+        let expected = b"ABCDE";
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            auto_stop: false,
+            set_msb: false,
+        });
+        reader.load(PaperTape::new(expected.to_vec()));
+        assert!(reader.start());
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+
+        assert_eq!(
+            feed.tick(Duration::ZERO, |byte| {
+                match runtime.try_transmit(vec![byte]).expect("connected") {
+                    ImmediateTransmit::Accepted => FeedResult::Accepted,
+                    ImmediateTransmit::Backpressured(data)
+                    | ImmediateTransmit::Disconnected(data) => FeedResult::Backpressured(data[0]),
+                }
+            }),
+            Some(Duration::from_millis(3))
+        );
+        assert_eq!(feed.reader().position(), 1);
+        assert_eq!(feed.pending_count(), 1);
+        for now in [3, 6, 9] {
+            assert_eq!(
+                feed.tick(Duration::from_millis(now), |_| FeedResult::Accepted),
+                None
+            );
+            assert_eq!(feed.reader().position(), 1);
+            assert_eq!(feed.pending_count(), 1);
+        }
+        runtime
+            .disconnect()
+            .expect("connection drops before TX is sent");
+        feed.rollback_unconfirmed();
+        feed.reader_mut().stop();
+        assert_eq!(feed.reader().position(), 0);
+        assert_eq!(feed.pending_count(), 0);
+
+        runtime
+            .connect(FakeTransport::default())
+            .expect("reconnect succeeds");
+        assert!(feed.reader_mut().start());
+        let mut now = Duration::from_secs(1);
+        while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
+            feed.tick(now, |byte| {
+                match runtime.try_transmit(vec![byte]).expect("connected") {
+                    ImmediateTransmit::Accepted => FeedResult::Accepted,
+                    ImmediateTransmit::Backpressured(data)
+                    | ImmediateTransmit::Disconnected(data) => FeedResult::Backpressured(data[0]),
+                }
+            });
+            runtime.scheduler_mut().now = now;
+            runtime.tick().expect("pipeline advances");
+            if feed.awaiting_confirmation() && runtime.transmit_idle() {
+                feed.confirm_transmitted();
+            }
+            assert!(feed.pending_count() <= 1);
+            now += Duration::from_millis(100);
+        }
+        runtime.pump().expect("pipeline drains");
+        let sent = connected(&runtime)
+            .sent
+            .iter()
+            .flat_map(|command| match command {
+                TransportCommand::Send(data) => data.iter().copied(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sent, expected, "capacity {capacity}");
+    }
+}
+
+#[test]
 fn startup_cr_is_session_scoped_and_only_armed_for_initial_line_mode() {
     let mut local = disconnected_runtime();
+    local.configure_startup_cr(true);
+    assert!(
+        local
+            .connect(FakeTransport {
+                start_error: true,
+                ..FakeTransport::default()
+            })
+            .is_err()
+    );
+    while local.pop_event().is_some() {}
     local
         .submit(ApplicationCommand::SetCommunicationMode(
             CommunicationMode::Local,
         ))
         .expect("LOCAL configured");
     local.tick().expect("mode applied");
-    local.configure_startup_cr(true);
     local
         .connect(FakeTransport::default())
         .expect("LOCAL connects");
     local.pump().expect("LOCAL startup settles");
+    assert!(connected(&local).sent.is_empty());
+    assert_eq!(line(&local, 0), "                ");
+    assert!(local.pop_event().is_none());
+    local.disconnect().expect("LOCAL connection closes");
+    local
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Line,
+        ))
+        .expect("LINE configured later");
+    local.tick().expect("LINE mode applies");
+    local
+        .connect(FakeTransport::default())
+        .expect("later LINE reconnect succeeds");
+    local.scheduler_mut().now = Duration::from_secs(1);
+    local.pump().expect("later LINE connection settles");
     assert!(connected(&local).sent.is_empty());
 
     let mut line = disconnected_runtime();
@@ -390,6 +502,9 @@ fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
             Err(error) => panic!("reader transmit failed: {error}"),
         });
         runtime.tick().expect("runtime tick succeeds");
+        if feed.awaiting_confirmation() && runtime.transmit_idle() {
+            feed.confirm_transmitted();
+        }
         assert!(feed.pending_count() <= 1);
         now += delay.unwrap_or(Duration::from_millis(3));
         runtime.scheduler_mut().now = now;
@@ -434,6 +549,9 @@ fn paper_reader_uses_local_loopback_without_reaching_transport() {
             Err(error) => panic!("reader transmit failed: {error}"),
         });
         runtime.tick().expect("loopback tick succeeds");
+        if feed.awaiting_confirmation() && runtime.transmit_idle() {
+            feed.confirm_transmitted();
+        }
         now += delay.unwrap_or(Duration::from_millis(3));
         runtime.scheduler_mut().now = now;
     }
@@ -771,6 +889,53 @@ fn transport_failure_disconnects_but_keeps_runtime_running() {
         .expect("offline loopback remains available");
     runtime.pump().expect("offline loopback drains");
     assert_eq!(&line(&runtime, 0)[..2], "OK");
+}
+
+#[test]
+fn direct_try_recv_error_fails_only_connection_and_allows_reconnect() {
+    let mut runtime = runtime(false);
+    let lifecycle = connected(&runtime).lifecycle.clone();
+    connected_mut(&mut runtime).receive_error = true;
+    assert_eq!(
+        runtime.tick().expect("connection error is handled"),
+        PumpStatus::Idle
+    );
+    assert_eq!(runtime.state(), RuntimeState::Running);
+    assert_eq!(
+        runtime.connection_state(),
+        &ConnectionState::Failed {
+            message: "receive channel failed".to_owned()
+        }
+    );
+    assert!(runtime.transport().is_none());
+    assert!(lifecycle.0.load(Ordering::SeqCst));
+    assert!(lifecycle.1.load(Ordering::SeqCst));
+    assert_eq!(
+        runtime.pop_event(),
+        Some(RuntimeEvent::ConnectionFailed(
+            "receive channel failed".to_owned()
+        ))
+    );
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL remains configurable");
+    runtime.tick().expect("LOCAL applies");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"LOCAL".to_vec()))
+        .expect("LOCAL works offline");
+    runtime.pump().expect("LOCAL drains");
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Line,
+        ))
+        .expect("LINE can be restored");
+    runtime.tick().expect("LINE applies");
+    runtime
+        .connect(FakeTransport::default())
+        .expect("reconnect succeeds");
+    assert_eq!(runtime.connection_state(), &ConnectionState::Connected);
 }
 
 #[test]

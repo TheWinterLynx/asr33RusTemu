@@ -138,6 +138,17 @@ impl TapeReader {
         }
     }
 
+    pub(crate) fn restore_position(&mut self, position: usize) {
+        if self
+            .tape
+            .as_ref()
+            .is_some_and(|tape| position <= tape.len())
+        {
+            self.position = position;
+            self.stop_cause = None;
+        }
+    }
+
     /// Advance the reader by one worker iteration without sleeping or I/O.
     #[must_use]
     pub fn step(&mut self) -> ReaderStep {

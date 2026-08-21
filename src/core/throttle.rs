@@ -119,6 +119,10 @@ impl FlowState {
         self.queue.clear();
         self.active = None;
     }
+
+    fn is_idle(&self) -> bool {
+        self.queue.is_empty() && self.active.is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -256,6 +260,11 @@ impl DataThrottle {
     /// RX, terminal history, and local loopback state are intentionally kept.
     pub fn clear_external_tx(&mut self) {
         self.tx.clear();
+    }
+
+    #[must_use]
+    pub fn transmit_idle(&self) -> bool {
+        self.tx.is_idle() && self.loopback.is_idle()
     }
 
     pub fn set_throttle_mode(&mut self, mode: ThrottleMode) {
