@@ -228,7 +228,7 @@ fn drain_reader(feed: &mut ReaderFeed, runtime: &mut Runtime, mut now: Duration)
 
 #[test]
 fn line_to_local_rolls_reader_back_before_switching_route() {
-    let mut runtime = runtime(false);
+    let mut runtime = runtime(true);
     let mut feed = reader_feed(b"ABC");
     offer_reader_byte(&mut feed, &mut runtime, Duration::ZERO);
     assert_eq!(feed.reader().position(), 1);
@@ -239,7 +239,9 @@ fn line_to_local_rolls_reader_back_before_switching_route() {
     assert_eq!(feed.reader().position(), 0);
     assert_eq!(feed.pending_count(), 0);
     runtime
-        .set_communication_mode(CommunicationMode::Local)
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
         .expect("LOCAL mode accepted");
     runtime.tick().expect("old LINE byte is dropped");
 
@@ -251,7 +253,7 @@ fn line_to_local_rolls_reader_back_before_switching_route() {
 
 #[test]
 fn local_to_line_rolls_reader_back_before_switching_route() {
-    let mut runtime = runtime(false);
+    let mut runtime = runtime(true);
     runtime
         .submit(ApplicationCommand::SetCommunicationMode(
             CommunicationMode::Local,
@@ -268,7 +270,9 @@ fn local_to_line_rolls_reader_back_before_switching_route() {
     assert_eq!(feed.reader().position(), 0);
     assert_eq!(feed.pending_count(), 0);
     runtime
-        .set_communication_mode(CommunicationMode::Line)
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Line,
+        ))
         .expect("LINE mode accepted");
     runtime.tick().expect("old LOCAL byte is dropped");
 
@@ -283,6 +287,68 @@ fn local_to_line_rolls_reader_back_before_switching_route() {
         .collect::<Vec<_>>();
     assert_eq!(sent, b"ABC");
     assert_eq!(line(&runtime, 0), "                ");
+}
+
+#[test]
+fn line_to_local_mode_command_preserves_fifo_transmit_order() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::Transmit(b"A".to_vec()))
+        .expect("LINE transmit accepted");
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL mode accepted");
+    runtime.pump().expect("queued LINE work drains");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"B".to_vec()))
+        .expect("LOCAL transmit accepted");
+    runtime.pump().expect("LOCAL work drains");
+
+    let sent = connected(&runtime)
+        .sent
+        .iter()
+        .flat_map(|command| match command {
+            TransportCommand::Send(data) => data.iter().copied(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent, b"A");
+    assert_eq!(&line(&runtime, 0)[..1], "B");
+}
+
+#[test]
+fn local_to_line_mode_command_preserves_fifo_transmit_order() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL mode accepted");
+    runtime.pump().expect("LOCAL mode applies");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"A".to_vec()))
+        .expect("LOCAL transmit accepted");
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Line,
+        ))
+        .expect("LINE mode accepted");
+    runtime.pump().expect("queued LOCAL work drains");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"B".to_vec()))
+        .expect("LINE transmit accepted");
+    runtime.pump().expect("LINE work drains");
+
+    let sent = connected(&runtime)
+        .sent
+        .iter()
+        .flat_map(|command| match command {
+            TransportCommand::Send(data) => data.iter().copied(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent, b"B");
+    assert_eq!(&line(&runtime, 0)[..1], "A");
 }
 
 #[test]

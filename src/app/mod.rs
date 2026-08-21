@@ -253,15 +253,6 @@ where
         Ok(())
     }
 
-    pub fn set_communication_mode(
-        &mut self,
-        mode: CommunicationMode,
-    ) -> Result<(), RuntimeError<T::Error>> {
-        self.require_running()?;
-        self.throttle.set_communication_mode(mode);
-        Ok(())
-    }
-
     pub fn try_transmit(
         &mut self,
         data: Vec<u8>,

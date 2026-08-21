@@ -158,7 +158,10 @@ impl EguiApp {
         if self.reader.pause_for_mode_change() {
             self.tape_error = Some("reader paused: communication mode changed".to_owned());
         }
-        match self.runtime.set_communication_mode(mode) {
+        match self
+            .runtime
+            .submit(ApplicationCommand::SetCommunicationMode(mode))
+        {
             Ok(()) => self.options.communication_mode = mode,
             Err(error) => self.transport_error = Some(error.to_string()),
         }
