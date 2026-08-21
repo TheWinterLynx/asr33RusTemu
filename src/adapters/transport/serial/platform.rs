@@ -6,7 +6,7 @@ mod implementation {
     use std::time::Duration;
 
     use serialport::{DataBits, FlowControl, Parity, StopBits};
-    use windows_sys::Win32::Devices::Communication::{DCB, GetCommState, SetCommState};
+    use windows_sys::Win32::Devices::Communication::{DCB, GetCommState, SetCommState, SetupComm};
     use windows_sys::Win32::Foundation::HANDLE;
 
     use super::super::settings::Win32DcbSettings;
@@ -56,6 +56,13 @@ mod implementation {
         }
         // SAFETY: the handle and DCB are valid for the duration of the call.
         if unsafe { SetCommState(handle, &dcb) } == 0 {
+            return Err(SerialAdapterError::Platform(io::Error::last_os_error()));
+        }
+        // Match pySerial's Windows-only `set_buffer_size(rx=8, tx=4096)`.
+        // Drivers may round these advisory sizes, but a rejected request is an
+        // explicit configuration error rather than a silent fallback.
+        // SAFETY: `handle` remains valid and SetupComm does not retain it.
+        if unsafe { SetupComm(handle, 8, 4096) } == 0 {
             return Err(SerialAdapterError::Platform(io::Error::last_os_error()));
         }
         Ok(())

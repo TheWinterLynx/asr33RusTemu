@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 
 use crate::adapters::transport::{Transport, TransportSendError, TransportSendFailure};
 use crate::core::events::{
-    ApplicationCommand, DataFlow, ThrottleOutput, TransportCommand, TransportOperation,
+    ApplicationCommand, DataFlow, ThrottleOutput, TransportCommand, TransportEvent,
+    TransportOperation,
 };
 use crate::core::terminal::{Terminal, TerminalError, TerminalOptions};
-use crate::core::throttle::{Backpressure, DataThrottle, ThrottleConfig, ThrottleStep};
+use crate::core::throttle::{DataThrottle, ThrottleConfig, ThrottleStep};
+
+const MAX_TICK_ROUNDS: usize = 32;
 
 pub trait Scheduler {
     fn now(&self) -> Duration;
@@ -70,6 +73,13 @@ pub enum PumpStatus {
     Backpressured,
     TransportFailed,
     Wait(Duration),
+    WorkRemaining,
+}
+
+enum FlushStatus {
+    Empty,
+    Sent,
+    Backpressured,
 }
 
 #[derive(Debug)]
@@ -80,7 +90,6 @@ pub enum RuntimeError<E> {
         failure: TransportSendFailure,
         message: String,
     },
-    Throttle(Backpressure),
     Terminal(TerminalError),
 }
 
@@ -95,11 +104,6 @@ where
             Self::TransportSend { failure, message } => {
                 write!(formatter, "transport send {failure:?}: {message}")
             }
-            Self::Throttle(error) => write!(
-                formatter,
-                "throttle {:?} queue reached {} chunks",
-                error.flow, error.capacity_chunks
-            ),
             Self::Terminal(error) => write!(formatter, "terminal error: {error}"),
         }
     }
@@ -113,7 +117,7 @@ where
         match self {
             Self::Transport(error) => Some(error),
             Self::Terminal(error) => Some(error),
-            Self::InvalidState(_) | Self::TransportSend { .. } | Self::Throttle(_) => None,
+            Self::InvalidState(_) | Self::TransportSend { .. } => None,
         }
     }
 }
@@ -127,6 +131,8 @@ where
     throttle: DataThrottle,
     transport: T,
     scheduler: S,
+    pending_application: VecDeque<ApplicationCommand>,
+    pending_transport_event: Option<TransportEvent>,
     pending_transport: VecDeque<TransportCommand>,
     events: VecDeque<RuntimeEvent>,
     state: RuntimeState,
@@ -150,6 +156,8 @@ where
             throttle: DataThrottle::new(throttle_config, initial_time),
             transport,
             scheduler,
+            pending_application: VecDeque::new(),
+            pending_transport_event: None,
             pending_transport: VecDeque::new(),
             events: VecDeque::new(),
             state: RuntimeState::Created,
@@ -170,17 +178,7 @@ where
 
     pub fn submit(&mut self, command: ApplicationCommand) -> Result<(), RuntimeError<T::Error>> {
         self.require_running()?;
-        if let ApplicationCommand::SetPrinterEnabled(enabled) = command {
-            if enabled {
-                self.terminal.enable_printing();
-            } else {
-                self.terminal.disable_printing();
-            }
-            return Ok(());
-        }
-        self.throttle
-            .handle_application_command(command)
-            .map_err(RuntimeError::Throttle)?;
+        self.pending_application.push_back(command);
         Ok(())
     }
 
@@ -188,6 +186,7 @@ where
         loop {
             match self.tick()? {
                 PumpStatus::Wait(duration) => self.scheduler.wait(duration),
+                PumpStatus::WorkRemaining => {}
                 status => return Ok(status),
             }
         }
@@ -197,12 +196,19 @@ where
     /// blocking. A caller may interleave commands before honoring `Wait`.
     pub fn tick(&mut self) -> Result<PumpStatus, RuntimeError<T::Error>> {
         self.require_running()?;
-        loop {
-            if !self.flush_transport()? {
-                return Ok(PumpStatus::Backpressured);
+        for _ in 0..MAX_TICK_ROUNDS {
+            let application_progressed = self.drain_one_application();
+            let defer_ingress = application_progressed && !self.pending_application.is_empty();
+            let mut progressed = application_progressed;
+            match self.flush_one_transport()? {
+                FlushStatus::Empty => {}
+                FlushStatus::Sent => progressed = true,
+                FlushStatus::Backpressured => return Ok(PumpStatus::Backpressured),
             }
 
-            let mut progressed = self.receive_one_transport_event()?;
+            if !defer_ingress {
+                progressed |= self.receive_one_transport_event()?;
+            }
             if self.state == RuntimeState::Failed {
                 return Ok(PumpStatus::TransportFailed);
             }
@@ -238,6 +244,7 @@ where
             }
             return Ok(PumpStatus::Idle);
         }
+        Ok(PumpStatus::WorkRemaining)
     }
 
     pub fn shutdown(&mut self) -> Result<(), RuntimeError<T::Error>> {
@@ -246,6 +253,8 @@ where
         }
         self.transport.shutdown().map_err(RuntimeError::Transport)?;
         self.pending_transport.clear();
+        self.pending_application.clear();
+        self.pending_transport_event = None;
         self.state = RuntimeState::Shutdown;
         Ok(())
     }
@@ -297,22 +306,54 @@ where
     }
 
     fn receive_one_transport_event(&mut self) -> Result<bool, RuntimeError<T::Error>> {
-        let Some(event) = self.transport.try_recv().map_err(RuntimeError::Transport)? else {
-            return Ok(false);
+        let event = match self.pending_transport_event.take() {
+            Some(event) => event,
+            None => {
+                let Some(event) = self.transport.try_recv().map_err(RuntimeError::Transport)?
+                else {
+                    return Ok(false);
+                };
+                event
+            }
         };
         match event {
-            crate::core::events::TransportEvent::Received(data) => {
-                self.throttle
-                    .enqueue_rx(data)
-                    .map_err(RuntimeError::Throttle)?;
+            TransportEvent::Received(data) => {
+                if let Err(rejected) = self.throttle.enqueue_rx(data) {
+                    self.pending_transport_event = Some(TransportEvent::Received(rejected.data));
+                    return Ok(false);
+                }
             }
-            crate::core::events::TransportEvent::Failed { operation, message } => {
+            TransportEvent::Failed { operation, message } => {
                 self.events
                     .push_back(RuntimeEvent::TransportFailed { operation, message });
                 self.state = RuntimeState::Failed;
             }
         }
         Ok(true)
+    }
+
+    fn drain_one_application(&mut self) -> bool {
+        let Some(command) = self.pending_application.pop_front() else {
+            return false;
+        };
+        match command {
+            ApplicationCommand::SetPrinterEnabled(enabled) => {
+                if enabled {
+                    self.terminal.enable_printing();
+                } else {
+                    self.terminal.disable_printing();
+                }
+                true
+            }
+            command => match self.throttle.handle_application_command(command) {
+                Ok(_) => true,
+                Err(rejected) => {
+                    self.pending_application
+                        .push_front(ApplicationCommand::Transmit(rejected.data));
+                    false
+                }
+            },
+        }
     }
 
     fn apply_output(&mut self, output: ThrottleOutput) -> Result<(), RuntimeError<T::Error>> {
@@ -329,27 +370,25 @@ where
         Ok(())
     }
 
-    fn flush_transport(&mut self) -> Result<bool, RuntimeError<T::Error>> {
-        while let Some(command) = self.pending_transport.pop_front() {
-            match self.transport.send(command) {
-                Ok(()) => {}
-                Err(TransportSendError {
-                    failure: TransportSendFailure::Backpressure,
-                    command,
-                    ..
-                }) => {
-                    self.pending_transport.push_front(command);
-                    return Ok(false);
-                }
-                Err(error) => {
-                    return Err(RuntimeError::TransportSend {
-                        failure: error.failure,
-                        message: error.message,
-                    });
-                }
+    fn flush_one_transport(&mut self) -> Result<FlushStatus, RuntimeError<T::Error>> {
+        let Some(command) = self.pending_transport.pop_front() else {
+            return Ok(FlushStatus::Empty);
+        };
+        match self.transport.send(command) {
+            Ok(()) => Ok(FlushStatus::Sent),
+            Err(TransportSendError {
+                failure: TransportSendFailure::Backpressure,
+                command,
+                ..
+            }) => {
+                self.pending_transport.push_front(command);
+                Ok(FlushStatus::Backpressured)
             }
+            Err(error) => Err(RuntimeError::TransportSend {
+                failure: error.failure,
+                message: error.message,
+            }),
         }
-        Ok(true)
     }
 }
 

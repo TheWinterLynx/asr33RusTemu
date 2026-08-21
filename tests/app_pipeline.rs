@@ -109,6 +109,18 @@ impl Scheduler for FakeScheduler {
 type Runtime = AppRuntime<FakeTransport, FakeScheduler>;
 
 fn runtime(throttled: bool) -> Runtime {
+    runtime_with_throttle(
+        throttled,
+        ThrottleConfig {
+            tx_rate_cps: 10,
+            rx_rate_cps: 10,
+            tx_queue_capacity: 8,
+            rx_queue_capacity: 8,
+        },
+    )
+}
+
+fn runtime_with_throttle(throttled: bool, throttle_config: ThrottleConfig) -> Runtime {
     let mut runtime = AppRuntime::new(
         FakeTransport::default(),
         FakeScheduler::default(),
@@ -118,12 +130,7 @@ fn runtime(throttled: bool) -> Runtime {
             scrollback: 4,
             autowrap: false,
         },
-        ThrottleConfig {
-            tx_rate_cps: 10,
-            rx_rate_cps: 10,
-            tx_queue_capacity: 8,
-            rx_queue_capacity: 8,
-        },
+        throttle_config,
     )
     .expect("valid runtime configuration");
     assert_eq!(runtime.state(), RuntimeState::Created);
@@ -136,6 +143,69 @@ fn runtime(throttled: bool) -> Runtime {
             .expect("runtime is running");
     }
     runtime
+}
+
+#[test]
+fn capacity_one_application_ingress_is_lossless_across_multiple_chunks() {
+    let mut runtime = runtime_with_throttle(
+        true,
+        ThrottleConfig {
+            tx_queue_capacity: 1,
+            rx_queue_capacity: 1,
+            ..ThrottleConfig::default()
+        },
+    );
+    for chunk in [b"A".to_vec(), b"BC".to_vec(), b"D".to_vec()] {
+        runtime
+            .submit(ApplicationCommand::Transmit(chunk))
+            .expect("application ingress owns rejected chunks");
+    }
+    runtime.pump().expect("all pending TX eventually drains");
+    let bytes = runtime
+        .transport()
+        .sent
+        .iter()
+        .flat_map(|command| match command {
+            TransportCommand::Send(data) => data.iter().copied(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, b"ABCD");
+}
+
+#[test]
+fn capacity_one_transport_ingress_is_lossless_across_multiple_chunks() {
+    let mut runtime = runtime_with_throttle(
+        true,
+        ThrottleConfig {
+            tx_queue_capacity: 1,
+            rx_queue_capacity: 1,
+            ..ThrottleConfig::default()
+        },
+    );
+    for chunk in [b"A".as_slice(), b"BC".as_slice(), b"D".as_slice()] {
+        runtime.transport_mut().receive(chunk);
+    }
+    assert_eq!(
+        runtime.tick().expect("bounded tick succeeds"),
+        PumpStatus::Wait(Duration::from_millis(100))
+    );
+    runtime.pump().expect("all pending RX eventually drains");
+    assert_eq!(&line(&runtime, 0)[..4], "ABCD");
+}
+
+#[test]
+fn tick_bounds_work_under_continuous_unthrottled_rx() {
+    let mut runtime = runtime(false);
+    for _ in 0..100 {
+        runtime.transport_mut().receive(b"X");
+    }
+    assert_eq!(
+        runtime.tick().expect("tick succeeds"),
+        PumpStatus::WorkRemaining
+    );
+    assert!(!runtime.transport().incoming.is_empty());
+    runtime.pump().expect("remaining finite input drains");
+    assert!(runtime.transport().incoming.is_empty());
 }
 
 fn line(runtime: &Runtime, row: usize) -> String {

@@ -242,8 +242,9 @@ fn bounded_queues_report_backpressure_in_chunks_without_reordering() {
     let error = throttle
         .enqueue_tx(vec![4])
         .expect_err("third chunk must backpressure");
-    assert_eq!(error.flow, DataFlow::Tx);
-    assert_eq!(error.capacity_chunks, 2);
+    assert_eq!(error.backpressure.flow, DataFlow::Tx);
+    assert_eq!(error.backpressure.capacity_chunks, 2);
+    assert_eq!(error.data, vec![4]);
 
     throttle.set_throttle_mode(ThrottleMode::Unthrottled);
     assert_eq!(

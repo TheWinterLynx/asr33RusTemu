@@ -15,6 +15,7 @@ use crate::core::config::{SerialConfig, SerialParity, StopBits};
 use crate::core::events::{TransportCommand, TransportEvent, TransportOperation};
 
 const DEFAULT_QUEUE_CAPACITY: usize = 8;
+const DEFAULT_RX_CAPACITY: usize = 8;
 const IO_TIMEOUT: Duration = Duration::from_millis(20);
 const READ_BUFFER_SIZE: usize = 4096;
 
@@ -63,10 +64,13 @@ impl Error for SerialAdapterError {
 }
 
 pub struct SerialTransport {
+    port: Option<Box<dyn PortIo>>,
     commands: Option<CommandSender>,
     shutdown: Option<mpsc::Sender<()>>,
-    events: Receiver<TransportEvent>,
+    events: Option<Receiver<TransportEvent>>,
     worker: Option<JoinHandle<()>>,
+    tx_capacity: usize,
+    rx_capacity: usize,
     info: String,
 }
 
@@ -84,46 +88,76 @@ impl SerialTransport {
         config: SerialConfig,
         queue_capacity: usize,
     ) -> Result<Self, SerialAdapterError> {
-        Self::open_with(config, queue_capacity, platform::open)
+        Self::open_with_capacities(config, queue_capacity, DEFAULT_RX_CAPACITY)
+    }
+
+    pub fn open_with_capacities(
+        config: SerialConfig,
+        tx_capacity: usize,
+        rx_capacity: usize,
+    ) -> Result<Self, SerialAdapterError> {
+        Self::open_with(config, tx_capacity, rx_capacity, platform::open)
     }
 
     fn open_with<F>(
         config: SerialConfig,
-        queue_capacity: usize,
+        tx_capacity: usize,
+        rx_capacity: usize,
         opener: F,
     ) -> Result<Self, SerialAdapterError>
     where
         F: FnOnce(&SerialConfig, Duration) -> Result<Box<dyn PortIo>, SerialAdapterError>,
     {
+        if rx_capacity == 0 {
+            return Err(SerialAdapterError::Unsupported(
+                "serial receive queue capacity must be greater than zero".to_owned(),
+            ));
+        }
         let port = opener(&config, IO_TIMEOUT)?;
-        Self::spawn_worker(port, &config, queue_capacity)
+        Ok(Self::with_port(port, &config, tx_capacity, rx_capacity))
     }
 
-    fn spawn_worker(
+    fn with_port(
         port: Box<dyn PortIo>,
         config: &SerialConfig,
-        queue_capacity: usize,
-    ) -> Result<Self, SerialAdapterError> {
-        let (command_tx, command_rx) = if queue_capacity == 0 {
+        tx_capacity: usize,
+        rx_capacity: usize,
+    ) -> Self {
+        Self {
+            port: Some(port),
+            commands: None,
+            shutdown: None,
+            events: None,
+            worker: None,
+            tx_capacity,
+            rx_capacity,
+            info: info_string(config),
+        }
+    }
+
+    pub fn start(&mut self) -> Result<(), SerialAdapterError> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        let port = self.port.take().ok_or(SerialAdapterError::Closed)?;
+        let (command_tx, command_rx) = if self.tx_capacity == 0 {
             let (sender, receiver) = mpsc::channel();
             (CommandSender::Unbounded(sender), receiver)
         } else {
-            let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+            let (sender, receiver) = mpsc::sync_channel(self.tx_capacity);
             (CommandSender::Bounded(sender), receiver)
         };
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::sync_channel(self.rx_capacity);
         let worker = thread::Builder::new()
             .name("asr33-serial".to_owned())
             .spawn(move || run_worker(port, command_rx, shutdown_rx, event_tx))
             .map_err(SerialAdapterError::Spawn)?;
-        Ok(Self {
-            commands: Some(command_tx),
-            shutdown: Some(shutdown_tx),
-            events: event_rx,
-            worker: Some(worker),
-            info: info_string(config),
-        })
+        self.commands = Some(command_tx);
+        self.shutdown = Some(shutdown_tx);
+        self.events = Some(event_rx);
+        self.worker = Some(worker);
+        Ok(())
     }
 
     pub fn send(&self, command: TransportCommand) -> Result<SendOutcome, SerialAdapterError> {
@@ -145,7 +179,8 @@ impl SerialTransport {
     }
 
     pub fn try_recv(&self) -> Result<Option<TransportEvent>, SerialAdapterError> {
-        match self.events.try_recv() {
+        let events = self.events.as_ref().ok_or(SerialAdapterError::Closed)?;
+        match events.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) if self.worker.is_none() => Ok(None),
@@ -157,7 +192,8 @@ impl SerialTransport {
         &self,
         timeout: Duration,
     ) -> Result<Option<TransportEvent>, SerialAdapterError> {
-        match self.events.recv_timeout(timeout) {
+        let events = self.events.as_ref().ok_or(SerialAdapterError::Closed)?;
+        match events.recv_timeout(timeout) {
             Ok(event) => Ok(Some(event)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) if self.worker.is_none() => Ok(None),
@@ -179,6 +215,7 @@ impl SerialTransport {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+        self.port.take();
         Ok(())
     }
 
@@ -196,11 +233,7 @@ impl Transport for SerialTransport {
     type Error = SerialAdapterError;
 
     fn start(&mut self) -> Result<(), Self::Error> {
-        if self.worker.is_some() {
-            Ok(())
-        } else {
-            Err(SerialAdapterError::Closed)
-        }
+        SerialTransport::start(self)
     }
 
     fn send(&mut self, command: TransportCommand) -> Result<(), TransportSendError> {
@@ -261,13 +294,22 @@ fn run_worker(
     mut port: Box<dyn PortIo>,
     commands: Receiver<TransportCommand>,
     shutdown: Receiver<()>,
-    events: mpsc::Sender<TransportEvent>,
+    events: SyncSender<TransportEvent>,
 ) {
     let mut buffer = [0_u8; READ_BUFFER_SIZE];
+    let mut pending_rx = None;
     loop {
         match shutdown.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
+        }
+
+        if let Some(event) = pending_rx.take() {
+            match events.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => pending_rx = Some(event),
+                Err(TrySendError::Disconnected(_)) => return,
+            }
         }
 
         // Process at most one TX chunk per turn so sustained output cannot
@@ -275,7 +317,7 @@ fn run_worker(
         match commands.try_recv() {
             Ok(TransportCommand::Send(data)) => {
                 if let Err(error) = port.write_all(&data) {
-                    report_error(&events, TransportOperation::Write, error);
+                    report_error(&events, &shutdown, TransportOperation::Write, error);
                     return;
                 }
             }
@@ -283,14 +325,21 @@ fn run_worker(
             Err(TryRecvError::Disconnected) => return,
         }
 
+        if pending_rx.is_some() {
+            match shutdown.recv_timeout(IO_TIMEOUT) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
+
         match port.read(&mut buffer) {
             Ok(0) => {}
             Ok(length) => {
-                if events
-                    .send(TransportEvent::Received(buffer[..length].to_vec()))
-                    .is_err()
-                {
-                    return;
+                let event = TransportEvent::Received(buffer[..length].to_vec());
+                match events.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(event)) => pending_rx = Some(event),
+                    Err(TrySendError::Disconnected(_)) => return,
                 }
             }
             Err(error)
@@ -301,7 +350,7 @@ fn run_worker(
                         | io::ErrorKind::Interrupted
                 ) => {}
             Err(error) => {
-                report_error(&events, TransportOperation::Read, error);
+                report_error(&events, &shutdown, TransportOperation::Read, error);
                 return;
             }
         }
@@ -309,14 +358,25 @@ fn run_worker(
 }
 
 fn report_error(
-    events: &mpsc::Sender<TransportEvent>,
+    events: &SyncSender<TransportEvent>,
+    shutdown: &Receiver<()>,
     operation: TransportOperation,
     error: io::Error,
 ) {
-    let _ = events.send(TransportEvent::Failed {
+    let mut event = TransportEvent::Failed {
         operation,
         message: error.to_string(),
-    });
+    };
+    loop {
+        match events.try_send(event) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => event = returned,
+        }
+        match shutdown.recv_timeout(IO_TIMEOUT) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 fn transport_send_error(
@@ -469,8 +529,9 @@ mod tests {
             writes: write_tx,
             pending: Vec::new(),
         };
-        let transport = SerialTransport::spawn_worker(Box::new(port), &config(), 8)
-            .expect("fake worker must start");
+        let mut transport = SerialTransport::with_port(Box::new(port), &config(), 8, 8);
+        assert!(transport.worker.is_none());
+        transport.start().expect("fake worker must start");
         (transport, read_tx, write_rx)
     }
 
@@ -506,6 +567,62 @@ mod tests {
             Some(TransportEvent::Received(b"RX".to_vec()))
         );
         transport.close().expect("worker must stop");
+    }
+
+    #[test]
+    fn created_transport_has_no_worker_until_start() {
+        let (_read_tx, read_rx) = mpsc::channel();
+        let (write_tx, _write_rx) = mpsc::channel();
+        let port = FakePort {
+            reads: read_rx,
+            writes: write_tx,
+            pending: Vec::new(),
+        };
+        let mut transport = SerialTransport::with_port(Box::new(port), &config(), 8, 1);
+        assert!(transport.worker.is_none());
+        assert!(matches!(
+            transport.send(TransportCommand::Send(vec![1])),
+            Err(SerialAdapterError::Closed)
+        ));
+        transport.start().expect("start creates worker");
+        assert!(transport.worker.is_some());
+        transport.close().expect("worker stops");
+    }
+
+    #[test]
+    fn bounded_rx_retains_pending_chunk_and_keeps_tx_live() {
+        let (read_tx, read_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
+        let port = FakePort {
+            reads: read_rx,
+            writes: write_tx,
+            pending: Vec::new(),
+        };
+        let mut transport = SerialTransport::with_port(Box::new(port), &config(), 8, 1);
+        transport.start().expect("fake worker starts");
+        for chunk in [b"A".to_vec(), b"BC".to_vec(), b"D".to_vec()] {
+            read_tx.send(Ok(chunk)).expect("worker is alive");
+        }
+        transport
+            .send(TransportCommand::Send(b"TX".to_vec()))
+            .expect("TX remains available while RX is full");
+        assert_eq!(
+            write_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(b"TX".to_vec())
+        );
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            match transport
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker remains connected")
+                .expect("RX event arrives")
+            {
+                TransportEvent::Received(data) => received.extend(data),
+                TransportEvent::Failed { message, .. } => panic!("unexpected failure: {message}"),
+            }
+        }
+        assert_eq!(received, b"ABCD");
+        transport.close().expect("worker stops");
     }
 
     #[test]
@@ -545,8 +662,8 @@ mod tests {
 
     #[test]
     fn worker_reports_write_errors_and_terminates() {
-        let mut transport = SerialTransport::spawn_worker(Box::new(WriteErrorPort), &config(), 8)
-            .expect("fake worker must start");
+        let mut transport = SerialTransport::with_port(Box::new(WriteErrorPort), &config(), 8, 8);
+        transport.start().expect("fake worker must start");
         transport
             .send(TransportCommand::Send(vec![1]))
             .expect("queue has capacity");
@@ -564,7 +681,7 @@ mod tests {
 
     #[test]
     fn opening_errors_are_returned_before_a_worker_is_started() {
-        let result = SerialTransport::open_with(config(), 8, |_config, _timeout| {
+        let result = SerialTransport::open_with(config(), 8, 8, |_config, _timeout| {
             Err(SerialAdapterError::Unsupported("open failed".to_owned()))
         });
         assert!(matches!(
@@ -581,8 +698,8 @@ mod tests {
             writes: write_tx,
             gate: gate_rx,
         };
-        let mut transport = SerialTransport::spawn_worker(Box::new(port), &config(), 1)
-            .expect("fake worker must start");
+        let mut transport = SerialTransport::with_port(Box::new(port), &config(), 1, 8);
+        transport.start().expect("fake worker must start");
         transport
             .send(TransportCommand::Send(vec![1]))
             .expect("first command starts writing");
@@ -615,8 +732,8 @@ mod tests {
             writes: write_tx,
             pending: Vec::new(),
         };
-        let mut transport = SerialTransport::spawn_worker(Box::new(port), &config(), 0)
-            .expect("fake worker must start");
+        let mut transport = SerialTransport::with_port(Box::new(port), &config(), 0, 8);
+        transport.start().expect("fake worker must start");
         for value in 0..100_u8 {
             assert_eq!(
                 transport

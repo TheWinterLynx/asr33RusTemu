@@ -6,6 +6,10 @@ This repository implements an ASR-33 Teletype emulator in Python. The project is
 
 The existing Python implementation is the executable behavioural specification until the Rust migration is complete. Preserve observable behaviour unless a task explicitly requests a behaviour change.
 
+Windows is the primary target platform for the Rust migration. Linux support is
+best-effort: preserve it where practical, but do not create additional Linux
+work unless it is trivial or a task explicitly requests it.
+
 Do not perform a mechanical line-by-line Python-to-Rust translation. Prefer an idiomatic Rust design with clear ownership, explicit state, narrow interfaces, and testable components.
 
 ## Current application architecture

@@ -50,6 +50,12 @@ pub struct Backpressure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedData {
+    pub backpressure: Backpressure,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThrottleStep {
     Idle,
     Wait {
@@ -84,12 +90,15 @@ impl FlowState {
         }
     }
 
-    fn enqueue(&mut self, flow: DataFlow, data: Vec<u8>) -> Result<(), Backpressure> {
+    fn enqueue(&mut self, flow: DataFlow, data: Vec<u8>) -> Result<(), RejectedData> {
         // `queue.Queue(maxsize=0)` is unbounded in Python.
         if self.capacity > 0 && self.queue.len() >= self.capacity {
-            return Err(Backpressure {
-                flow,
-                capacity_chunks: self.capacity,
+            return Err(RejectedData {
+                backpressure: Backpressure {
+                    flow,
+                    capacity_chunks: self.capacity,
+                },
+                data,
             });
         }
         self.queue.push_back(data);
@@ -167,7 +176,7 @@ impl DataThrottle {
     pub fn handle_application_command(
         &mut self,
         command: ApplicationCommand,
-    ) -> Result<EnqueueOutcome, Backpressure> {
+    ) -> Result<EnqueueOutcome, RejectedData> {
         match command {
             ApplicationCommand::Transmit(data) => self.enqueue_tx(data),
             ApplicationCommand::SetCommunicationMode(mode) => {
@@ -193,14 +202,14 @@ impl DataThrottle {
     pub fn handle_transport_event(
         &mut self,
         event: TransportEvent,
-    ) -> Result<EnqueueOutcome, Backpressure> {
+    ) -> Result<EnqueueOutcome, RejectedData> {
         match event {
             TransportEvent::Received(data) => self.enqueue_rx(data),
             TransportEvent::Failed { .. } => Ok(EnqueueOutcome::IgnoredTransportFailure),
         }
     }
 
-    pub fn enqueue_tx(&mut self, data: Vec<u8>) -> Result<EnqueueOutcome, Backpressure> {
+    pub fn enqueue_tx(&mut self, data: Vec<u8>) -> Result<EnqueueOutcome, RejectedData> {
         if data.is_empty() {
             return Ok(EnqueueOutcome::IgnoredEmpty);
         }
@@ -212,7 +221,7 @@ impl DataThrottle {
         Ok(EnqueueOutcome::Queued)
     }
 
-    pub fn enqueue_rx(&mut self, data: Vec<u8>) -> Result<EnqueueOutcome, Backpressure> {
+    pub fn enqueue_rx(&mut self, data: Vec<u8>) -> Result<EnqueueOutcome, RejectedData> {
         if data.is_empty() {
             return Ok(EnqueueOutcome::IgnoredEmpty);
         }
