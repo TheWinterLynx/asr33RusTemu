@@ -143,6 +143,11 @@ mod tests {
         );
         settings.parity = KeyboardParityMode::Mark;
         assert_eq!(
+            encode_input(&KeyboardInput::Return, settings).expect("CR encodes"),
+            b"\x8d",
+            "interactive Return still uses keyboard parity"
+        );
+        assert_eq!(
             encode_input(&KeyboardInput::Text("A".into()), settings).expect("ASCII encodes"),
             b"\xc1"
         );

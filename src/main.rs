@@ -11,7 +11,7 @@ use asr33emu::core::config::{
 use asr33emu::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use asr33emu::core::terminal::TerminalOptions;
 use asr33emu::core::throttle::ThrottleConfig;
-use asr33emu::ui::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
+use asr33emu::ui::keyboard::KeyboardOptions;
 use asr33emu::ui::{EguiApp, UiOptions};
 use clap::Parser;
 
@@ -53,6 +53,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "serial: {} @ {} baud",
         config.backend.serial_config.port, config.backend.serial_config.baudrate
     );
+    let initial_commands =
+        initial_commands(&config, communication_mode, throttle_mode, printer_enabled);
 
     let transport = SerialTransport::open(config.backend.serial_config)?;
     let mut runtime = AppRuntime::new(
@@ -61,20 +63,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         terminal_options,
         throttle_config,
     )?;
-    let mut initial_commands = Vec::new();
-    if terminal_config.send_cr_at_startup {
-        initial_commands.push(ApplicationCommand::Transmit(encode_input(
-            &KeyboardInput::Return,
-            keyboard,
-        )?));
-    }
-    initial_commands.extend([
-        ApplicationCommand::SetCommunicationMode(communication_mode),
-        ApplicationCommand::SetThrottleMode(throttle_mode),
-        ApplicationCommand::SetTxRate(config.data_throttle.config.send_rate_cps),
-        ApplicationCommand::SetRxRate(config.data_throttle.config.receive_rate_cps),
-        ApplicationCommand::SetPrinterEnabled(printer_enabled),
-    ]);
     runtime.start_with_initial_commands(initial_commands)?;
 
     let ui_options = UiOptions {
@@ -126,11 +114,33 @@ fn configured_modes(config: &AppConfig) -> (CommunicationMode, ThrottleMode) {
     (communication, throttle)
 }
 
+fn initial_commands(
+    config: &AppConfig,
+    communication_mode: CommunicationMode,
+    throttle_mode: ThrottleMode,
+    printer_enabled: bool,
+) -> Vec<ApplicationCommand> {
+    let mut commands = Vec::new();
+    if config.terminal.config.send_cr_at_startup {
+        // Legacy frontend construction sends a literal CR before keyboard
+        // parity and the configured runtime state are applied.
+        commands.push(ApplicationCommand::Transmit(vec![b'\r']));
+    }
+    commands.extend([
+        ApplicationCommand::SetCommunicationMode(communication_mode),
+        ApplicationCommand::SetThrottleMode(throttle_mode),
+        ApplicationCommand::SetTxRate(config.data_throttle.config.send_rate_cps),
+        ApplicationCommand::SetRxRate(config.data_throttle.config.receive_rate_cps),
+        ApplicationCommand::SetPrinterEnabled(printer_enabled),
+    ]);
+    commands
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{configured_modes, terminal_options, throttle_config};
-    use asr33emu::core::config::AppConfig;
-    use asr33emu::core::events::{CommunicationMode, ThrottleMode};
+    use super::{configured_modes, initial_commands, terminal_options, throttle_config};
+    use asr33emu::core::config::{AppConfig, KeyboardParityMode};
+    use asr33emu::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 
     #[test]
     fn default_yaml_maps_to_runtime_dimensions_rates_and_modes() {
@@ -148,5 +158,37 @@ mod tests {
             configured_modes(&config),
             (CommunicationMode::Line, ThrottleMode::Throttled)
         );
+    }
+
+    #[test]
+    fn startup_cr_is_literal_for_every_keyboard_parity_and_precedes_runtime_state() {
+        for parity in [
+            KeyboardParityMode::Space,
+            KeyboardParityMode::Mark,
+            KeyboardParityMode::Even,
+        ] {
+            let mut config = AppConfig::from_yaml_str(include_str!("../asr33_config.yaml"))
+                .expect("bundled YAML remains valid");
+            config.terminal.config.send_cr_at_startup = true;
+            config.terminal.config.keyboard_parity_mode = parity;
+            let commands = initial_commands(
+                &config,
+                CommunicationMode::Local,
+                ThrottleMode::Unthrottled,
+                false,
+            );
+            assert_eq!(
+                commands,
+                [
+                    ApplicationCommand::Transmit(vec![0x0d]),
+                    ApplicationCommand::SetCommunicationMode(CommunicationMode::Local),
+                    ApplicationCommand::SetThrottleMode(ThrottleMode::Unthrottled),
+                    ApplicationCommand::SetTxRate(10),
+                    ApplicationCommand::SetRxRate(10),
+                    ApplicationCommand::SetPrinterEnabled(false),
+                ],
+                "startup ordering and literal CR are independent of {parity:?}"
+            );
+        }
     }
 }
