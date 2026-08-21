@@ -48,6 +48,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         uppercase_only: terminal_config.keyboard_uppercase_only,
         parity: terminal_config.keyboard_parity_mode,
     };
+    let tape_reader = config.tape_reader.config.clone();
+    let tape_punch = config.tape_punch.config.clone();
     let font_size = terminal_config.font_size as f32;
     let backend_label = format!(
         "serial: {} @ {} baud",
@@ -73,6 +75,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         communication_mode,
         throttle_mode,
         printer_enabled,
+        tape_reader,
+        tape_punch,
     };
     let title = ui_options.title.clone();
     eframe::run_native(

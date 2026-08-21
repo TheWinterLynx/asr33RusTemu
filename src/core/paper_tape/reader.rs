@@ -100,6 +100,14 @@ impl TapeReader {
         self.options.auto_stop = enabled;
     }
 
+    pub fn set_skip_leading_nulls(&mut self, enabled: bool) {
+        self.options.skip_leading_nulls = enabled;
+    }
+
+    pub fn set_msb(&mut self, enabled: bool) {
+        self.options.set_msb = enabled;
+    }
+
     pub fn start(&mut self) -> bool {
         let Some(tape) = self.tape.as_ref() else {
             return false;

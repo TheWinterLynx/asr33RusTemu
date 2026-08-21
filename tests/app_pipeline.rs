@@ -4,11 +4,15 @@ use std::fmt;
 use std::time::Duration;
 
 use asr33emu::adapters::transport::{Transport, TransportSendError, TransportSendFailure};
-use asr33emu::app::{AppRuntime, PumpStatus, RuntimeEvent, RuntimeState, Scheduler};
+use asr33emu::app::paper_tape::{FeedResult, ReaderFeed};
+use asr33emu::app::{
+    AppRuntime, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState, Scheduler,
+};
 use asr33emu::core::events::{
     ApplicationCommand, CommunicationMode, ThrottleMode, TransportCommand, TransportEvent,
     TransportOperation,
 };
+use asr33emu::core::paper_tape::{PaperTape, ReaderOptions, ReaderState, TapeReader};
 use asr33emu::core::terminal::TerminalOptions;
 use asr33emu::core::throttle::ThrottleConfig;
 
@@ -143,6 +147,93 @@ fn runtime_with_throttle(throttled: bool, throttle_config: ThrottleConfig) -> Ru
             .expect("runtime is running");
     }
     runtime
+}
+
+#[test]
+fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
+    let mut runtime = runtime_with_throttle(
+        false,
+        ThrottleConfig {
+            tx_queue_capacity: 1,
+            rx_queue_capacity: 1,
+            ..ThrottleConfig::default()
+        },
+    );
+    let expected = (1_u8..=24).collect::<Vec<_>>();
+    let mut reader = TapeReader::new(ReaderOptions {
+        skip_leading_nulls: false,
+        auto_stop: false,
+        set_msb: false,
+    });
+    reader.load(PaperTape::new(expected.clone()));
+    assert!(reader.start());
+    let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+    let mut now = Duration::ZERO;
+
+    while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
+        let delay = feed.tick(now, |byte| match runtime.try_transmit(vec![byte]) {
+            Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
+            Ok(ImmediateTransmit::Backpressured(data)) => {
+                FeedResult::Backpressured(data.first().copied().map_or(byte, |value| value))
+            }
+            Err(error) => panic!("reader transmit failed: {error}"),
+        });
+        runtime.tick().expect("runtime tick succeeds");
+        assert!(feed.pending_count() <= 1);
+        now += delay.unwrap_or(Duration::from_millis(3));
+        runtime.scheduler_mut().now = now;
+    }
+    runtime.pump().expect("pipeline drains");
+
+    let sent = runtime
+        .transport()
+        .sent
+        .iter()
+        .flat_map(|command| match command {
+            TransportCommand::Send(data) => data.iter().copied(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent, expected);
+}
+
+#[test]
+fn paper_reader_uses_local_loopback_without_reaching_transport() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("mode accepted");
+    runtime.tick().expect("mode applied");
+    let mut reader = TapeReader::new(ReaderOptions {
+        skip_leading_nulls: false,
+        auto_stop: false,
+        set_msb: false,
+    });
+    reader.load(PaperTape::new(b"LOCAL".to_vec()));
+    assert!(reader.start());
+    let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+    let mut now = Duration::ZERO;
+    while feed.reader().state() == ReaderState::Running {
+        let delay = feed.tick(now, |byte| match runtime.try_transmit(vec![byte]) {
+            Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
+            Ok(ImmediateTransmit::Backpressured(data)) => {
+                FeedResult::Backpressured(data.first().copied().map_or(byte, |value| value))
+            }
+            Err(error) => panic!("reader transmit failed: {error}"),
+        });
+        runtime.tick().expect("loopback tick succeeds");
+        now += delay.unwrap_or(Duration::from_millis(3));
+        runtime.scheduler_mut().now = now;
+    }
+    runtime.pump().expect("loopback drains");
+
+    assert!(runtime.transport().sent.is_empty());
+    let line = &runtime.terminal().line_history().lines()[0];
+    let rendered = (0..line.width())
+        .filter_map(|column| line.strike_stack(column).last())
+        .collect::<String>();
+    assert_eq!(rendered, "LOCAL");
 }
 
 #[test]
@@ -458,6 +549,41 @@ fn transport_failure_becomes_application_event_and_failed_state() {
     assert_eq!(runtime.state(), RuntimeState::Joined);
     assert!(runtime.transport().shutdown);
     assert!(runtime.transport().joined);
+}
+
+#[test]
+fn terminal_forwarding_event_preserves_raw_bytes_when_printer_is_off() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::SetPrinterEnabled(false))
+        .expect("runtime running");
+    let original = b"\xc1\x1b[31mX\x1b[0m";
+    runtime.transport_mut().receive(original);
+    runtime.pump().expect("RX drains");
+    assert_eq!(
+        runtime.pop_event(),
+        Some(RuntimeEvent::TerminalForwarded(original.to_vec()))
+    );
+    assert_eq!(line(&runtime, 0), "                ");
+}
+
+#[test]
+fn local_loopback_produces_raw_terminal_forwarding_event() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("runtime running");
+    runtime.pump().expect("mode applies");
+    runtime
+        .try_transmit(b"LOCAL\x80".to_vec())
+        .expect("immediate submission succeeds");
+    runtime.pump().expect("loopback drains");
+    assert_eq!(
+        runtime.pop_event(),
+        Some(RuntimeEvent::TerminalForwarded(b"LOCAL\x80".to_vec()))
+    );
 }
 
 #[test]

@@ -1,10 +1,18 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui::{self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId};
 
+use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
-use crate::app::{AppRuntime, PumpStatus, RuntimeEvent, RuntimeState, SystemScheduler};
+use crate::app::paper_tape::{FeedResult, ReaderFeed};
+use crate::app::{
+    AppRuntime, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState, Scheduler,
+    SystemScheduler,
+};
+use crate::core::config::{BitLabelBase, PunchConfigMode, TapePunchConfig, TapeReaderConfig};
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
+use crate::core::paper_tape::{PunchMode, ReaderOptions, ReaderState, TapeReader};
 
 use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 
@@ -21,6 +29,8 @@ pub struct UiOptions {
     pub communication_mode: CommunicationMode,
     pub throttle_mode: ThrottleMode,
     pub printer_enabled: bool,
+    pub tape_reader: TapeReaderConfig,
+    pub tape_punch: TapePunchConfig,
 }
 
 #[must_use]
@@ -39,6 +49,15 @@ pub struct EguiApp {
     options: UiOptions,
     transport_error: Option<String>,
     shutdown_complete: bool,
+    reader: ReaderFeed,
+    reader_path: Option<PathBuf>,
+    punch: Option<PunchFile>,
+    punch_mode: PunchMode,
+    reader_visible: bool,
+    punch_visible: bool,
+    tape_error: Option<String>,
+    scroll_top: Option<usize>,
+    scroll_request: bool,
 }
 
 impl EguiApp {
@@ -49,11 +68,29 @@ impl EguiApp {
         options: UiOptions,
     ) -> Self {
         install_font(&creation_context.egui_ctx);
+        let reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: options.tape_reader.skip_leading_nulls,
+            set_msb: options.tape_reader.set_msb,
+            auto_stop: options.tape_reader.auto_stop,
+        });
+        let punch_mode = match options.tape_punch.mode {
+            PunchConfigMode::Append => PunchMode::Append,
+            PunchConfigMode::Overwrite => PunchMode::Overwrite,
+        };
         Self {
             runtime,
             options,
             transport_error: None,
             shutdown_complete: false,
+            reader: ReaderFeed::new(reader, Duration::ZERO),
+            reader_path: None,
+            punch: None,
+            punch_mode,
+            reader_visible: false,
+            punch_visible: false,
+            tape_error: None,
+            scroll_top: None,
+            scroll_request: false,
         }
     }
 
@@ -67,6 +104,9 @@ impl EguiApp {
     fn handle_keyboard(&mut self, context: &egui::Context) {
         let events = context.input(|input| input.events.clone());
         for event in &events {
+            if self.handle_shortcut(context, event) {
+                continue;
+            }
             let logical = keyboard_input_for_event(event);
             if let Some(input) = logical {
                 match encode_input(&input, self.options.keyboard) {
@@ -83,11 +123,104 @@ impl EguiApp {
         }
     }
 
+    fn handle_shortcut(&mut self, context: &egui::Context, event: &egui::Event) -> bool {
+        let egui::Event::Key {
+            key, pressed: true, ..
+        } = event
+        else {
+            return false;
+        };
+        match key {
+            egui::Key::F1 => self.reader_visible = true,
+            egui::Key::F2 => self.reader_visible = false,
+            egui::Key::F3 => self.punch_visible = true,
+            egui::Key::F4 => self.punch_visible = false,
+            egui::Key::F5 => {
+                self.options.throttle_mode = match self.options.throttle_mode {
+                    ThrottleMode::Throttled => ThrottleMode::Unthrottled,
+                    ThrottleMode::Unthrottled => ThrottleMode::Throttled,
+                };
+                self.submit(
+                    context,
+                    ApplicationCommand::SetThrottleMode(self.options.throttle_mode),
+                );
+            }
+            // F6/F7 are reserved for the future audio slice.
+            egui::Key::F8 => {
+                self.options.communication_mode = match self.options.communication_mode {
+                    CommunicationMode::Line => CommunicationMode::Local,
+                    CommunicationMode::Local => CommunicationMode::Line,
+                };
+                self.submit(
+                    context,
+                    ApplicationCommand::SetCommunicationMode(self.options.communication_mode),
+                );
+            }
+            egui::Key::F9 => {
+                self.options.printer_enabled = !self.options.printer_enabled;
+                self.submit(
+                    context,
+                    ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
+                );
+            }
+            egui::Key::PageUp => {
+                let bottom = self
+                    .runtime
+                    .terminal()
+                    .line_history()
+                    .len()
+                    .saturating_sub(self.runtime.terminal().height());
+                self.scroll_top = Some(self.scroll_top.unwrap_or(bottom).saturating_sub(12));
+                self.scroll_request = true;
+            }
+            egui::Key::PageDown => {
+                let bottom = self
+                    .runtime
+                    .terminal()
+                    .line_history()
+                    .len()
+                    .saturating_sub(self.runtime.terminal().height());
+                let next = self
+                    .scroll_top
+                    .unwrap_or(bottom)
+                    .saturating_add(12)
+                    .min(bottom);
+                self.scroll_top = (next < bottom).then_some(next);
+                self.scroll_request = true;
+            }
+            egui::Key::Home => {
+                self.scroll_top = Some(0);
+                self.scroll_request = true;
+            }
+            egui::Key::End => {
+                self.scroll_top = None;
+                self.scroll_request = true;
+            }
+            _ => return false,
+        }
+        context.request_repaint();
+        true
+    }
+
     fn drive_runtime(&mut self, context: &egui::Context) {
         if self.runtime.state() == RuntimeState::Failed {
             context.request_repaint_after(IDLE_POLL);
             self.collect_runtime_events();
             return;
+        }
+        let now = self.runtime.scheduler().now();
+        let runtime = &mut self.runtime;
+        if let Some(delay) = self
+            .reader
+            .tick(now, |byte| match runtime.try_transmit(vec![byte]) {
+                Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
+                Ok(ImmediateTransmit::Backpressured(data)) => {
+                    FeedResult::Backpressured(data.first().copied().map_or(byte, |pending| pending))
+                }
+                Err(_) => FeedResult::Backpressured(byte),
+            })
+        {
+            context.request_repaint_after(delay);
         }
         match self.runtime.tick() {
             Ok(status) => {
@@ -109,8 +242,19 @@ impl EguiApp {
 
     fn collect_runtime_events(&mut self) {
         while let Some(event) = self.runtime.pop_event() {
-            let RuntimeEvent::TransportFailed { operation, message } = event;
-            self.transport_error = Some(format!("{operation:?}: {message}"));
+            match event {
+                RuntimeEvent::TransportFailed { operation, message } => {
+                    self.transport_error = Some(format!("{operation:?}: {message}"));
+                }
+                RuntimeEvent::TerminalForwarded(data) => {
+                    if let Some(punch) = self.punch.as_mut()
+                        && let Err(error) = punch.punch(&data)
+                    {
+                        punch.stop();
+                        self.tape_error = Some(format!("paper punch write failed: {error}"));
+                    }
+                }
+            }
         }
     }
 
@@ -191,9 +335,15 @@ impl EguiApp {
         if let Some(error) = &self.transport_error {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
+        if let Some(error) = &self.tape_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
     }
 
-    fn terminal(&self, ui: &mut egui::Ui) {
+    fn terminal(&mut self, ui: &mut egui::Ui) {
+        let scroll_top = self.scroll_top;
+        let scroll_request = self.scroll_request;
+        self.scroll_request = false;
         let terminal = self.runtime.terminal();
         let history = terminal.line_history();
         let (cursor_column, cursor_line) = terminal.cursor_position();
@@ -207,10 +357,18 @@ impl EguiApp {
         );
 
         egui::ScrollArea::both()
-            .stick_to_bottom(true)
+            .stick_to_bottom(scroll_top.is_none())
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(grid_size, egui::Sense::hover());
+                if scroll_request {
+                    let row = scroll_top.unwrap_or_else(|| history.len().saturating_sub(1));
+                    let target = egui::Rect::from_min_size(
+                        egui::pos2(rect.left(), rect.top() + row as f32 * row_height),
+                        egui::vec2(cell_width, row_height),
+                    );
+                    ui.scroll_to_rect(target, Some(egui::Align::TOP));
+                }
                 let painter = ui.painter_at(rect);
                 for (row, line) in history.lines().iter().enumerate() {
                     let y = rect.top() + row as f32 * row_height;
@@ -242,10 +400,215 @@ impl EguiApp {
             });
     }
 
+    fn paper_tape_windows(&mut self, context: &egui::Context) {
+        let mut reader_open = self.reader_visible;
+        egui::Window::new("Paper Tape Reader")
+            .open(&mut reader_open)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Load").clicked()
+                        && let Some(path) =
+                            reader_dialog(&self.options.tape_reader.initial_file_path)
+                    {
+                        match load_reader_file(&path) {
+                            Ok(tape) => {
+                                self.reader.reader_mut().load(tape);
+                                self.reader_path = Some(path);
+                                self.tape_error = None;
+                            }
+                            Err(error) => {
+                                self.tape_error = Some(format!("reader load failed: {error}"))
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.reader.reader().tape().is_some(),
+                            egui::Button::new("Unload"),
+                        )
+                        .clicked()
+                    {
+                        self.reader.reader_mut().unload();
+                        self.reader_path = None;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.reader.reader().state() == ReaderState::Stopped,
+                            egui::Button::new("ON"),
+                        )
+                        .clicked()
+                    {
+                        self.reader.reader_mut().start();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.reader.reader().state() == ReaderState::Running,
+                            egui::Button::new("OFF"),
+                        )
+                        .clicked()
+                    {
+                        self.reader.reader_mut().stop();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.reader.reader().state() == ReaderState::Stopped
+                                && self.reader.reader().position() > 0,
+                            egui::Button::new("Rewind"),
+                        )
+                        .clicked()
+                    {
+                        self.reader.reader_mut().rewind();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.options.tape_reader.auto_stop, "Auto-stop")
+                        .changed()
+                    {
+                        self.reader
+                            .reader_mut()
+                            .set_auto_stop(self.options.tape_reader.auto_stop);
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.options.tape_reader.skip_leading_nulls,
+                            "Skip leading nulls",
+                        )
+                        .changed()
+                    {
+                        self.reader
+                            .reader_mut()
+                            .set_skip_leading_nulls(self.options.tape_reader.skip_leading_nulls);
+                    }
+                    if ui
+                        .checkbox(&mut self.options.tape_reader.set_msb, "Set MSB")
+                        .changed()
+                    {
+                        self.reader
+                            .reader_mut()
+                            .set_msb(self.options.tape_reader.set_msb);
+                    }
+                });
+                let length = self.reader.reader().tape().map_or(0, |tape| tape.len());
+                let percent = if length == 0 {
+                    0.0
+                } else {
+                    100.0 * self.reader.reader().position() as f32 / length as f32
+                };
+                ui.label(format!(
+                    "File: {}",
+                    display_path(self.reader_path.as_deref())
+                ));
+                ui.label(format!(
+                    "{} bytes, position {}, {:.1}%, {:?}",
+                    length,
+                    self.reader.reader().position(),
+                    percent,
+                    self.reader.reader().stop_cause()
+                ));
+                if let Some(tape) = self.reader.reader().tape() {
+                    tape_view(
+                        ui,
+                        tape.bytes(),
+                        self.reader.reader().position(),
+                        self.options.tape_reader.max_rows,
+                        self.options.tape_reader.ghost_outline,
+                        self.options.tape_reader.bit_label_base,
+                        self.options.tape_reader.ascii_char_mask_msb,
+                    );
+                }
+            });
+        self.reader_visible = reader_open;
+
+        let mut punch_open = self.punch_visible;
+        egui::Window::new("Paper Tape Punch")
+            .open(&mut punch_open)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Select/Load").clicked()
+                        && let Some(path) = punch_dialog(&self.options.tape_punch.initial_file_path)
+                    {
+                        match PunchFile::open(&path, self.punch_mode) {
+                            Ok(punch) => {
+                                self.punch = Some(punch);
+                                self.tape_error = None;
+                            }
+                            Err(error) => {
+                                self.tape_error = Some(format!("punch open failed: {error}"))
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.punch.is_some(), egui::Button::new("Unload"))
+                        .clicked()
+                    {
+                        self.punch = None;
+                    }
+                    let stopped = self
+                        .punch
+                        .as_ref()
+                        .is_some_and(|p| p.state() != crate::core::paper_tape::PunchState::Running);
+                    if ui.add_enabled(stopped, egui::Button::new("ON")).clicked()
+                        && let Some(punch) = self.punch.as_mut()
+                    {
+                        punch.start();
+                    }
+                    let running = self
+                        .punch
+                        .as_ref()
+                        .is_some_and(|p| p.state() == crate::core::paper_tape::PunchState::Running);
+                    if ui.add_enabled(running, egui::Button::new("OFF")).clicked()
+                        && let Some(punch) = self.punch.as_mut()
+                    {
+                        punch.stop();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for (mode, label) in [
+                        (PunchMode::Append, "Append"),
+                        (PunchMode::Overwrite, "Overwrite"),
+                    ] {
+                        if ui
+                            .selectable_label(self.punch_mode == mode, label)
+                            .clicked()
+                        {
+                            self.punch_mode = mode;
+                            if let Some(punch) = self.punch.as_mut() {
+                                punch.set_mode(mode);
+                            }
+                        }
+                    }
+                });
+                let (path, bytes) = self
+                    .punch
+                    .as_ref()
+                    .map_or((None, &[][..]), |p| (Some(p.path()), p.bytes()));
+                ui.label(format!("File: {}", display_path(path)));
+                ui.label(format!(
+                    "{} bytes, {:?}",
+                    bytes.len(),
+                    self.punch.as_ref().map(PunchFile::state)
+                ));
+                tape_view(
+                    ui,
+                    bytes,
+                    bytes.len(),
+                    self.options.tape_punch.max_rows,
+                    self.options.tape_punch.ghost_outline,
+                    self.options.tape_punch.bit_label_base,
+                    self.options.tape_punch.ascii_char_mask_msb,
+                );
+            });
+        self.punch_visible = punch_open;
+    }
+
     fn shutdown(&mut self) {
         if self.shutdown_complete {
             return;
         }
+        self.reader.reader_mut().stop();
+        self.reader.reader_mut().unload();
+        self.punch = None;
         if let Err(error) = self.runtime.shutdown().and_then(|()| self.runtime.join()) {
             self.transport_error = Some(error.to_string());
         }
@@ -266,6 +629,7 @@ impl eframe::App for EguiApp {
         self.handle_keyboard(ui.ctx());
         egui::Panel::top("status").show(ui, |ui| self.controls(ui));
         egui::CentralPanel::default().show(ui, |ui| self.terminal(ui));
+        self.paper_tape_windows(ui.ctx());
     }
 
     fn on_exit(&mut self) {
@@ -291,6 +655,103 @@ fn install_font(context: &egui::Context) {
         .or_default()
         .push(FONT_NAME.to_owned());
     context.set_fonts(fonts);
+}
+
+fn display_path(path: Option<&Path>) -> String {
+    path.map_or_else(|| "(none)".to_owned(), |path| path.display().to_string())
+}
+
+#[cfg(windows)]
+fn reader_dialog(initial_directory: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_directory(initial_directory)
+        .add_filter("Paper tape", &["pt", "bin"])
+        .pick_file()
+}
+
+#[cfg(not(windows))]
+fn reader_dialog(_initial_directory: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn punch_dialog(initial_directory: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_directory(initial_directory)
+        .set_file_name("tape.pt")
+        .save_file()
+}
+
+#[cfg(not(windows))]
+fn punch_dialog(_initial_directory: &Path) -> Option<PathBuf> {
+    None
+}
+
+fn visible_tape_rows(bytes: &[u8], max_rows: usize) -> (usize, &[u8]) {
+    let start = bytes.len().saturating_sub(max_rows);
+    (start, &bytes[start..])
+}
+
+fn tape_view(
+    ui: &mut egui::Ui,
+    bytes: &[u8],
+    position: usize,
+    max_rows: usize,
+    ghost_outline: bool,
+    bit_label_base: BitLabelBase,
+    ascii_char_mask_msb: bool,
+) {
+    let (start, visible) = visible_tape_rows(bytes, max_rows);
+    let labels = match bit_label_base {
+        BitLabelBase::Zero => ["7", "6", "5", "4", "3", "2", "1", "0"],
+        BitLabelBase::One => ["8", "7", "6", "5", "4", "3", "2", "1"],
+    };
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("");
+                    ui.label("offset");
+                    for label in labels {
+                        ui.label(label);
+                    }
+                    ui.label("feed");
+                    ui.label("ASCII");
+                    ui.end_row();
+                    for (relative, byte) in visible.iter().copied().enumerate() {
+                        let offset = start + relative;
+                        ui.label(if offset == position { "▶" } else { "" });
+                        ui.monospace(format!("{offset:06}"));
+                        for bit in (0..8).rev() {
+                            let punched = byte & (1 << bit) != 0;
+                            let mark = if punched {
+                                "●"
+                            } else if ghost_outline {
+                                "○"
+                            } else {
+                                " "
+                            };
+                            ui.monospace(mark);
+                        }
+                        ui.monospace("•");
+                        let character = if ascii_char_mask_msb {
+                            byte & 0x7f
+                        } else {
+                            byte
+                        };
+                        let display = if character.is_ascii_graphic() || character == b' ' {
+                            char::from(character).to_string()
+                        } else {
+                            "·".to_owned()
+                        };
+                        ui.monospace(display);
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 fn keyboard_input_for_event(event: &egui::Event) -> Option<KeyboardInput> {
@@ -349,7 +810,7 @@ fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyboardInput> 
 
 #[cfg(test)]
 mod tests {
-    use super::{keyboard_input_for_event, repaint_delay};
+    use super::{keyboard_input_for_event, repaint_delay, visible_tape_rows};
     use crate::app::PumpStatus;
     use crate::ui::keyboard::KeyboardInput;
     use eframe::egui::{Event, Key, Modifiers};
@@ -432,5 +893,38 @@ mod tests {
         assert_eq!(keyboard_input_for_event(&Event::Copy), None);
         assert_eq!(keyboard_input_for_event(&Event::Cut), None);
         assert_eq!(keyboard_input_for_event(&Event::Paste("x".into())), None);
+    }
+
+    #[test]
+    fn paper_tape_and_legacy_shortcuts_never_become_terminal_input() {
+        for key in [
+            Key::F1,
+            Key::F2,
+            Key::F3,
+            Key::F4,
+            Key::F5,
+            Key::F6,
+            Key::F7,
+            Key::F8,
+            Key::F9,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::End,
+        ] {
+            assert_eq!(
+                keyboard_input_for_event(&key_event(key, Modifiers::NONE)),
+                None,
+                "{key:?} must not transmit bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn tape_visualization_keeps_only_the_configured_tail() {
+        let bytes = [0, 1, 2, 3, 4];
+        assert_eq!(visible_tape_rows(&bytes, 3), (2, &bytes[2..]));
+        assert_eq!(visible_tape_rows(&bytes, 0), (5, &bytes[5..]));
+        assert_eq!(visible_tape_rows(&bytes, 99), (0, &bytes[..]));
     }
 }

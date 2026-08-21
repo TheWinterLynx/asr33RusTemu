@@ -7,6 +7,9 @@ import unittest
 from unittest.mock import patch
 
 from asr33_papertape import PapertapePunch, PapertapeReader
+from asr33_shim_throttle import DataThrottle
+from asr33_terminal import Terminal
+from tests.helpers import ConfigStub, SendSink
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "paper_tape_leader_data_trailers.bin"
@@ -171,6 +174,20 @@ class PaperTapeReaderCharacterizationTests(unittest.TestCase):
 
 
 class PaperTapePunchCharacterizationTests(unittest.TestCase):
+    def make_loaded_punch(self, name, mode="overwrite"):
+        punch = PapertapePunch.__new__(PapertapePunch)
+        punch.master = None
+        punch.tape_loaded = False
+        punch.active = False
+        punch.tape_file = None
+        punch.pt_name_path = None
+        punch.init_name_path = None
+        punch.file_write_mode = mode
+        punch.papertape_viewer = ViewerStub()
+        with patch("asr33_papertape.get_reader_file_selection", return_value=name):
+            self.assertEqual(punch.load_tape(), "loaded")
+        return punch
+
     def test_append_preview_reads_existing_bytes_and_appends_new_bytes(self):
         punch = PapertapePunch.__new__(PapertapePunch)
         viewer = ViewerStub()
@@ -190,22 +207,11 @@ class PaperTapePunchCharacterizationTests(unittest.TestCase):
         self.assertEqual(viewer.bytes_added, [b"OLD"])
 
     def test_overwrite_mode_truncates_on_load_and_only_punches_while_active(self):
-        punch = PapertapePunch.__new__(PapertapePunch)
-        punch.master = None
-        punch.tape_loaded = False
-        punch.active = False
-        punch.tape_file = None
-        punch.pt_name_path = None
-        punch.init_name_path = None
-        punch.file_write_mode = "overwrite"
-        punch.papertape_viewer = ViewerStub()
-
         with tempfile.NamedTemporaryFile(delete=False) as tape:
             tape.write(b"OLD")
             name = tape.name
         try:
-            with patch("asr33_papertape.get_reader_file_selection", return_value=name):
-                self.assertEqual(punch.load_tape(), "loaded")
+            punch = self.make_loaded_punch(name)
             self.assertFalse(punch.active)
             punch.punch_bytes(b"IGNORED")
             self.assertTrue(punch.on())
@@ -214,6 +220,56 @@ class PaperTapePunchCharacterizationTests(unittest.TestCase):
             punch.tape_file = None
             with open(name, "rb") as result:
                 self.assertEqual(result.read(), b"NEW")
+        finally:
+            os.unlink(name)
+
+    def test_unload_closes_file_and_mode_change_does_not_reopen_loaded_tape(self):
+        with tempfile.NamedTemporaryFile(delete=False) as tape:
+            tape.write(b"OLD")
+            name = tape.name
+        try:
+            punch = self.make_loaded_punch(name, "append")
+            handle = punch.tape_file
+            punch.toggle_file_write_mode()
+            self.assertIs(punch.tape_file, handle)
+            self.assertEqual(Path(name).read_bytes(), b"OLD")
+            self.assertTrue(punch.unload_tape())
+            self.assertTrue(handle.closed)
+        finally:
+            os.unlink(name)
+
+    def test_terminal_forwards_original_msb_ansi_and_printer_off_bytes_to_punch(self):
+        with tempfile.NamedTemporaryFile(delete=False) as tape:
+            name = tape.name
+        try:
+            punch = self.make_loaded_punch(name)
+            self.assertTrue(punch.on())
+            frontend = type("Frontend", (), {"receive_data": lambda _, data: punch.punch_bytes(data)})()
+            terminal = Terminal(None, frontend, ConfigStub())
+            terminal.disable_printing()
+            original = b"\xc1\x1b[31mX\x1b[0m"
+            terminal.receive_data(original)
+            punch.unload_tape()
+            self.assertEqual(Path(name).read_bytes(), original)
+        finally:
+            os.unlink(name)
+
+    def test_local_loopback_terminal_data_is_available_to_punch(self):
+        with tempfile.NamedTemporaryFile(delete=False) as tape:
+            name = tape.name
+        try:
+            punch = self.make_loaded_punch(name)
+            punch.on()
+            frontend = type("Frontend", (), {"receive_data": lambda _, data: punch.punch_bytes(data)})()
+            terminal = Terminal(None, frontend, ConfigStub())
+            throttle = DataThrottle(SendSink(), terminal, ConfigStub({"send_rate_cps": 0}))
+            throttle.enable_loopback()
+            throttle.send_data(b"LOCAL\x80")
+            throttle._process_queue_item(
+                throttle._loopback_queue, 0, throttle._send_loopback_to_upper_layer, 0.0
+            )
+            punch.unload_tape()
+            self.assertEqual(Path(name).read_bytes(), b"LOCAL\x80")
         finally:
             os.unlink(name)
 

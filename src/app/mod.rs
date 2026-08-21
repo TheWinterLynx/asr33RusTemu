@@ -1,5 +1,7 @@
 //! Minimal synchronous composition of transport, throttle, and terminal.
 
+pub mod paper_tape;
+
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -65,6 +67,13 @@ pub enum RuntimeEvent {
         operation: TransportOperation,
         message: String,
     },
+    TerminalForwarded(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImmediateTransmit {
+    Accepted,
+    Backpressured(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +204,17 @@ where
         self.require_running()?;
         self.pending_application.push_back(command);
         Ok(())
+    }
+
+    pub fn try_transmit(
+        &mut self,
+        data: Vec<u8>,
+    ) -> Result<ImmediateTransmit, RuntimeError<T::Error>> {
+        self.require_running()?;
+        match self.throttle.enqueue_tx(data) {
+            Ok(_) => Ok(ImmediateTransmit::Accepted),
+            Err(rejected) => Ok(ImmediateTransmit::Backpressured(rejected.data)),
+        }
     }
 
     pub fn pump(&mut self) -> Result<PumpStatus, RuntimeError<T::Error>> {
@@ -386,9 +406,14 @@ where
                 self.pending_transport.push_back(command);
             }
             ThrottleOutput::ToApplication(data) => {
-                self.terminal
+                let effects = self
+                    .terminal
                     .receive_data(&data)
                     .map_err(RuntimeError::Terminal)?;
+                if !effects.forwarded_bytes.is_empty() {
+                    self.events
+                        .push_back(RuntimeEvent::TerminalForwarded(effects.forwarded_bytes));
+                }
             }
         }
         Ok(())
