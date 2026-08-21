@@ -1,0 +1,56 @@
+[
+  {
+    "name": "tx_throttled",
+    "direction": "tx",
+    "rate_cps": 10,
+    "throttled": true,
+    "chunks_hex": ["4142"],
+    "emissions_hex": ["41", "42"],
+    "waits_ms": [100, 100]
+  },
+  {
+    "name": "rx_throttled_different_rate",
+    "direction": "rx",
+    "rate_cps": 5,
+    "throttled": true,
+    "chunks_hex": ["4344"],
+    "emissions_hex": ["43", "44"],
+    "waits_ms": [200, 200]
+  },
+  {
+    "name": "tx_unthrottled",
+    "direction": "tx",
+    "rate_cps": 10,
+    "throttled": false,
+    "chunks_hex": ["414243"],
+    "emissions_hex": ["414243"],
+    "waits_ms": []
+  },
+  {
+    "name": "rx_zero_rate",
+    "direction": "rx",
+    "rate_cps": 0,
+    "throttled": true,
+    "chunks_hex": ["000102"],
+    "emissions_hex": ["000102"],
+    "waits_ms": []
+  },
+  {
+    "name": "threshold_exactly_twenty_ms",
+    "direction": "tx",
+    "rate_cps": 50,
+    "throttled": true,
+    "chunks_hex": ["4142"],
+    "emissions_hex": ["41", "42"],
+    "waits_ms": []
+  },
+  {
+    "name": "multiple_chunks_preserve_order",
+    "direction": "tx",
+    "rate_cps": 10,
+    "throttled": true,
+    "chunks_hex": ["4142", "4344"],
+    "emissions_hex": ["41", "42", "43", "44"],
+    "waits_ms": [100, 100, 100, 100]
+  }
+]
