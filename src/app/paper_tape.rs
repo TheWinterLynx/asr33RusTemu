@@ -67,6 +67,17 @@ impl ReaderFeed {
         self.awaiting_confirmation = false;
     }
 
+    /// Roll back the one in-flight byte and stop before changing its route.
+    pub fn pause_for_mode_change(&mut self) -> bool {
+        if self.reader.state() == ReaderState::Running || self.pending_count() != 0 {
+            self.rollback_unconfirmed();
+            self.reader.stop();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn tick<F>(&mut self, now: Duration, mut transmit: F) -> Option<Duration>
     where
         F: FnMut(u8) -> FeedResult,

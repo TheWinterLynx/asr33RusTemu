@@ -151,6 +151,20 @@ impl EguiApp {
         context.request_repaint();
     }
 
+    fn change_communication_mode(&mut self, context: &egui::Context, mode: CommunicationMode) {
+        if self.options.communication_mode == mode {
+            return;
+        }
+        if self.reader.pause_for_mode_change() {
+            self.tape_error = Some("reader paused: communication mode changed".to_owned());
+        }
+        match self.runtime.set_communication_mode(mode) {
+            Ok(()) => self.options.communication_mode = mode,
+            Err(error) => self.transport_error = Some(error.to_string()),
+        }
+        context.request_repaint();
+    }
+
     fn handle_keyboard(&mut self, context: &egui::Context) {
         let events = context.input(|input| input.events.clone());
         for event in &events {
@@ -197,14 +211,11 @@ impl EguiApp {
             }
             // F6/F7 are reserved for the future audio slice.
             egui::Key::F8 => {
-                self.options.communication_mode = match self.options.communication_mode {
+                let mode = match self.options.communication_mode {
                     CommunicationMode::Line => CommunicationMode::Local,
                     CommunicationMode::Local => CommunicationMode::Line,
                 };
-                self.submit(
-                    context,
-                    ApplicationCommand::SetCommunicationMode(self.options.communication_mode),
-                );
+                self.change_communication_mode(context, mode);
             }
             egui::Key::F9 => {
                 self.options.printer_enabled = !self.options.printer_enabled;
@@ -398,11 +409,7 @@ impl EguiApp {
                 )
                 .clicked()
             {
-                self.options.communication_mode = CommunicationMode::Line;
-                self.submit(
-                    ui.ctx(),
-                    ApplicationCommand::SetCommunicationMode(CommunicationMode::Line),
-                );
+                self.change_communication_mode(ui.ctx(), CommunicationMode::Line);
             }
             if ui
                 .selectable_label(
@@ -411,11 +418,7 @@ impl EguiApp {
                 )
                 .clicked()
             {
-                self.options.communication_mode = CommunicationMode::Local;
-                self.submit(
-                    ui.ctx(),
-                    ApplicationCommand::SetCommunicationMode(CommunicationMode::Local),
-                );
+                self.change_communication_mode(ui.ctx(), CommunicationMode::Local);
             }
             ui.separator();
             if ui

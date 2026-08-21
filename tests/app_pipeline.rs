@@ -190,6 +190,101 @@ fn disconnected_runtime() -> Runtime {
     runtime
 }
 
+fn reader_feed(data: &[u8]) -> ReaderFeed {
+    let mut reader = TapeReader::new(ReaderOptions {
+        skip_leading_nulls: false,
+        auto_stop: false,
+        set_msb: false,
+    });
+    reader.load(PaperTape::new(data.to_vec()));
+    assert!(reader.start());
+    ReaderFeed::new(reader, Duration::ZERO)
+}
+
+fn offer_reader_byte(feed: &mut ReaderFeed, runtime: &mut Runtime, now: Duration) {
+    feed.tick(now, |byte| {
+        match runtime.try_transmit(vec![byte]).expect("runtime running") {
+            ImmediateTransmit::Accepted => FeedResult::Accepted,
+            ImmediateTransmit::Backpressured(data) | ImmediateTransmit::Disconnected(data) => {
+                FeedResult::Backpressured(data[0])
+            }
+        }
+    });
+}
+
+fn drain_reader(feed: &mut ReaderFeed, runtime: &mut Runtime, mut now: Duration) {
+    while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
+        offer_reader_byte(feed, runtime, now);
+        runtime.scheduler_mut().now = now;
+        runtime.tick().expect("reader pipeline advances");
+        if feed.awaiting_confirmation() && runtime.transmit_idle() {
+            feed.confirm_transmitted();
+        }
+        assert!(feed.pending_count() <= 1);
+        now += Duration::from_millis(3);
+    }
+    runtime.pump().expect("reader pipeline drains");
+}
+
+#[test]
+fn line_to_local_rolls_reader_back_before_switching_route() {
+    let mut runtime = runtime(false);
+    let mut feed = reader_feed(b"ABC");
+    offer_reader_byte(&mut feed, &mut runtime, Duration::ZERO);
+    assert_eq!(feed.reader().position(), 1);
+    assert_eq!(feed.pending_count(), 1);
+
+    assert!(feed.pause_for_mode_change());
+    assert_eq!(feed.reader().state(), ReaderState::Stopped);
+    assert_eq!(feed.reader().position(), 0);
+    assert_eq!(feed.pending_count(), 0);
+    runtime
+        .set_communication_mode(CommunicationMode::Local)
+        .expect("LOCAL mode accepted");
+    runtime.tick().expect("old LINE byte is dropped");
+
+    assert!(feed.reader_mut().start());
+    drain_reader(&mut feed, &mut runtime, Duration::from_millis(3));
+    assert_eq!(&line(&runtime, 0)[..3], "ABC");
+    assert!(connected(&runtime).sent.is_empty());
+}
+
+#[test]
+fn local_to_line_rolls_reader_back_before_switching_route() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL mode accepted");
+    runtime.tick().expect("LOCAL mode applies");
+    let mut feed = reader_feed(b"ABC");
+    offer_reader_byte(&mut feed, &mut runtime, Duration::ZERO);
+    assert_eq!(feed.reader().position(), 1);
+    assert_eq!(feed.pending_count(), 1);
+
+    assert!(feed.pause_for_mode_change());
+    assert_eq!(feed.reader().state(), ReaderState::Stopped);
+    assert_eq!(feed.reader().position(), 0);
+    assert_eq!(feed.pending_count(), 0);
+    runtime
+        .set_communication_mode(CommunicationMode::Line)
+        .expect("LINE mode accepted");
+    runtime.tick().expect("old LOCAL byte is dropped");
+
+    assert!(feed.reader_mut().start());
+    drain_reader(&mut feed, &mut runtime, Duration::from_millis(3));
+    let sent = connected(&runtime)
+        .sent
+        .iter()
+        .flat_map(|command| match command {
+            TransportCommand::Send(data) => data.iter().copied(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent, b"ABC");
+    assert_eq!(line(&runtime, 0), "                ");
+}
+
 #[test]
 fn runtime_starts_and_local_loopback_operates_without_transport() {
     let mut runtime = disconnected_runtime();
