@@ -8,3 +8,6 @@ pub mod adapters;
 
 /// Application composition and lifecycle.
 pub mod app;
+
+/// Native egui frontend and UI-independent keyboard adaptation.
+pub mod ui;
