@@ -1,20 +1,25 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use asr33emu::adapters::paper_tape::PunchFile;
 use asr33emu::adapters::transport::{Transport, TransportSendError, TransportSendFailure};
 use asr33emu::app::paper_tape::{FeedResult, ReaderFeed};
 use asr33emu::app::{
-    AppRuntime, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState, Scheduler,
+    AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState,
+    Scheduler,
 };
 use asr33emu::core::events::{
     ApplicationCommand, CommunicationMode, ThrottleMode, TransportCommand, TransportEvent,
     TransportOperation,
 };
-use asr33emu::core::paper_tape::{PaperTape, ReaderOptions, ReaderState, TapeReader};
+use asr33emu::core::paper_tape::{PaperTape, PunchMode, ReaderOptions, ReaderState, TapeReader};
 use asr33emu::core::terminal::TerminalOptions;
 use asr33emu::core::throttle::ThrottleConfig;
+use tempfile::tempdir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FakeTransportError(&'static str);
@@ -35,6 +40,8 @@ struct FakeTransport {
     blocked: bool,
     shutdown: bool,
     joined: bool,
+    lifecycle: Arc<(AtomicBool, AtomicBool)>,
+    start_error: bool,
 }
 
 impl FakeTransport {
@@ -55,6 +62,9 @@ impl Transport for FakeTransport {
     type Error = FakeTransportError;
 
     fn start(&mut self) -> Result<(), Self::Error> {
+        if self.start_error {
+            return Err(FakeTransportError("start failed"));
+        }
         self.started = true;
         Ok(())
     }
@@ -84,11 +94,13 @@ impl Transport for FakeTransport {
 
     fn shutdown(&mut self) -> Result<(), Self::Error> {
         self.shutdown = true;
+        self.lifecycle.0.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn join(&mut self) -> Result<(), Self::Error> {
         self.joined = true;
+        self.lifecycle.1.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -111,6 +123,14 @@ impl Scheduler for FakeScheduler {
 }
 
 type Runtime = AppRuntime<FakeTransport, FakeScheduler>;
+
+fn connected(runtime: &Runtime) -> &FakeTransport {
+    runtime.transport().expect("test runtime is connected")
+}
+
+fn connected_mut(runtime: &mut Runtime) -> &mut FakeTransport {
+    runtime.transport_mut().expect("test runtime is connected")
+}
 
 fn runtime(throttled: bool) -> Runtime {
     runtime_with_throttle(
@@ -149,6 +169,196 @@ fn runtime_with_throttle(throttled: bool, throttle_config: ThrottleConfig) -> Ru
     runtime
 }
 
+fn disconnected_runtime() -> Runtime {
+    let mut runtime = AppRuntime::new_disconnected(
+        FakeScheduler::default(),
+        TerminalOptions {
+            columns: 16,
+            rows: 4,
+            scrollback: 4,
+            autowrap: false,
+        },
+        ThrottleConfig::default(),
+    )
+    .expect("valid disconnected runtime");
+    runtime.start().expect("runtime starts without transport");
+    runtime
+}
+
+#[test]
+fn runtime_starts_and_local_loopback_operates_without_transport() {
+    let mut runtime = disconnected_runtime();
+    assert_eq!(runtime.state(), RuntimeState::Running);
+    assert_eq!(runtime.connection_state(), &ConnectionState::Disconnected);
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("configuration works offline");
+    runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("throttle configuration works offline");
+    runtime
+        .submit(ApplicationCommand::SetPrinterEnabled(true))
+        .expect("printer configuration works offline");
+    runtime.tick().expect("offline configuration applies");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"OFFLINE".to_vec()))
+        .expect("LOCAL accepts bytes offline");
+    runtime.pump().expect("offline pipeline drains");
+    assert_eq!(&line(&runtime, 0)[..7], "OFFLINE");
+}
+
+#[test]
+fn offline_local_loopback_can_feed_an_active_punch() {
+    let directory = tempdir().expect("temporary directory");
+    let path = directory.path().join("offline.pt");
+    let mut punch = PunchFile::open(&path, PunchMode::Overwrite).expect("punch opens");
+    assert!(punch.start());
+    let mut runtime = disconnected_runtime();
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL configured");
+    runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled configured");
+    runtime.tick().expect("offline configuration applies");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"PUNCH\x80".to_vec()))
+        .expect("offline bytes accepted");
+    runtime.pump().expect("loopback drains");
+    while let Some(event) = runtime.pop_event() {
+        if let RuntimeEvent::TerminalForwarded(data) = event {
+            punch.punch(&data).expect("punch write succeeds");
+        }
+    }
+    drop(punch);
+    assert_eq!(
+        std::fs::read(path).expect("punch file readable"),
+        b"PUNCH\x80"
+    );
+}
+
+#[test]
+fn line_rejects_disconnected_transmit_without_replaying_it_on_connect() {
+    let mut runtime = disconnected_runtime();
+    for _ in 0..100 {
+        assert!(matches!(
+            runtime.submit(ApplicationCommand::Transmit(b"STALE".to_vec())),
+            Err(asr33emu::app::RuntimeError::Disconnected)
+        ));
+    }
+    assert_eq!(
+        runtime
+            .try_transmit(b"READER".to_vec())
+            .expect("typed rejection"),
+        ImmediateTransmit::Disconnected(b"READER".to_vec())
+    );
+    runtime
+        .connect(FakeTransport::default())
+        .expect("later connection works");
+    runtime.pump().expect("nothing stale remains");
+    assert!(connected(&runtime).sent.is_empty());
+}
+
+#[test]
+fn connect_failure_disconnect_and_reconnect_do_not_stop_runtime() {
+    let mut runtime = disconnected_runtime();
+    let failed = FakeTransport {
+        start_error: true,
+        ..FakeTransport::default()
+    };
+    let failed_lifecycle = failed.lifecycle.clone();
+    assert!(runtime.connect(failed).is_err());
+    assert_eq!(runtime.state(), RuntimeState::Running);
+    assert!(matches!(
+        runtime.connection_state(),
+        ConnectionState::Failed { .. }
+    ));
+    assert!(failed_lifecycle.0.load(Ordering::SeqCst));
+    assert!(failed_lifecycle.1.load(Ordering::SeqCst));
+
+    runtime
+        .connect(FakeTransport::default())
+        .expect("retry connects");
+    assert_eq!(runtime.connection_state(), &ConnectionState::Connected);
+    let first_lifecycle = connected(&runtime).lifecycle.clone();
+    runtime.disconnect().expect("disconnect joins transport");
+    assert_eq!(runtime.state(), RuntimeState::Running);
+    assert_eq!(runtime.connection_state(), &ConnectionState::Disconnected);
+    assert!(first_lifecycle.0.load(Ordering::SeqCst));
+    assert!(first_lifecycle.1.load(Ordering::SeqCst));
+    runtime
+        .connect(FakeTransport::default())
+        .expect("reconnect works");
+    assert_eq!(runtime.connection_state(), &ConnectionState::Connected);
+}
+
+#[test]
+fn disconnect_discards_throttled_and_transport_pending_tx_before_reconnect() {
+    let mut runtime = runtime(true);
+    connected_mut(&mut runtime).blocked = true;
+    runtime
+        .submit(ApplicationCommand::Transmit(b"OLD".to_vec()))
+        .expect("connected TX accepted");
+    runtime.scheduler_mut().now = Duration::from_secs(1);
+    assert_eq!(
+        runtime.tick().expect("TX reaches transport"),
+        PumpStatus::Backpressured
+    );
+    runtime.disconnect().expect("disconnect clears external TX");
+    runtime
+        .connect(FakeTransport::default())
+        .expect("new transport connects");
+    runtime.scheduler_mut().now = Duration::from_secs(10);
+    runtime.pump().expect("new connection is idle");
+    assert!(connected(&runtime).sent.is_empty());
+}
+
+#[test]
+fn startup_cr_is_session_scoped_and_only_armed_for_initial_line_mode() {
+    let mut local = disconnected_runtime();
+    local
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL configured");
+    local.tick().expect("mode applied");
+    local.configure_startup_cr(true);
+    local
+        .connect(FakeTransport::default())
+        .expect("LOCAL connects");
+    local.pump().expect("LOCAL startup settles");
+    assert!(connected(&local).sent.is_empty());
+
+    let mut line = disconnected_runtime();
+    line.configure_startup_cr(true);
+    assert!(
+        line.connect(FakeTransport {
+            start_error: true,
+            ..FakeTransport::default()
+        })
+        .is_err()
+    );
+    line.connect(FakeTransport::default())
+        .expect("first LINE connection succeeds");
+    line.scheduler_mut().now = Duration::from_secs(1);
+    line.pump().expect("startup CR drains");
+    assert_eq!(connected(&line).sent, [TransportCommand::Send(vec![0x0d])]);
+    line.disconnect().expect("first connection closes");
+    line.connect(FakeTransport::default())
+        .expect("reconnect succeeds");
+    line.scheduler_mut().now = Duration::from_secs(2);
+    line.pump().expect("reconnect settles");
+    assert!(connected(&line).sent.is_empty());
+}
+
 #[test]
 fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
     let mut runtime = runtime_with_throttle(
@@ -176,6 +386,7 @@ fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
             Ok(ImmediateTransmit::Backpressured(data)) => {
                 FeedResult::Backpressured(data.first().copied().map_or(byte, |value| value))
             }
+            Ok(ImmediateTransmit::Disconnected(_)) => panic!("test transport disconnected"),
             Err(error) => panic!("reader transmit failed: {error}"),
         });
         runtime.tick().expect("runtime tick succeeds");
@@ -185,8 +396,7 @@ fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
     }
     runtime.pump().expect("pipeline drains");
 
-    let sent = runtime
-        .transport()
+    let sent = connected(&runtime)
         .sent
         .iter()
         .flat_map(|command| match command {
@@ -198,7 +408,7 @@ fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
 
 #[test]
 fn paper_reader_uses_local_loopback_without_reaching_transport() {
-    let mut runtime = runtime(false);
+    let mut runtime = disconnected_runtime();
     runtime
         .submit(ApplicationCommand::SetCommunicationMode(
             CommunicationMode::Local,
@@ -220,6 +430,7 @@ fn paper_reader_uses_local_loopback_without_reaching_transport() {
             Ok(ImmediateTransmit::Backpressured(data)) => {
                 FeedResult::Backpressured(data.first().copied().map_or(byte, |value| value))
             }
+            Ok(ImmediateTransmit::Disconnected(_)) => panic!("test transport disconnected"),
             Err(error) => panic!("reader transmit failed: {error}"),
         });
         runtime.tick().expect("loopback tick succeeds");
@@ -228,7 +439,7 @@ fn paper_reader_uses_local_loopback_without_reaching_transport() {
     }
     runtime.pump().expect("loopback drains");
 
-    assert!(runtime.transport().sent.is_empty());
+    assert!(runtime.transport().is_none());
     let line = &runtime.terminal().line_history().lines()[0];
     let rendered = (0..line.width())
         .filter_map(|column| line.strike_stack(column).last())
@@ -252,8 +463,7 @@ fn capacity_one_application_ingress_is_lossless_across_multiple_chunks() {
             .expect("application ingress owns rejected chunks");
     }
     runtime.pump().expect("all pending TX eventually drains");
-    let bytes = runtime
-        .transport()
+    let bytes = connected(&runtime)
         .sent
         .iter()
         .flat_map(|command| match command {
@@ -288,8 +498,7 @@ fn startup_cr_uses_legacy_pre_configuration_line_queue_semantics() {
             ])
             .expect("startup succeeds");
         runtime.pump().expect("startup queue drains");
-        let sent = runtime
-            .transport()
+        let sent = connected(&runtime)
             .sent
             .iter()
             .flat_map(|command| match command {
@@ -312,7 +521,7 @@ fn capacity_one_transport_ingress_is_lossless_across_multiple_chunks() {
         },
     );
     for chunk in [b"A".as_slice(), b"BC".as_slice(), b"D".as_slice()] {
-        runtime.transport_mut().receive(chunk);
+        connected_mut(&mut runtime).receive(chunk);
     }
     assert_eq!(
         runtime.tick().expect("bounded tick succeeds"),
@@ -326,15 +535,15 @@ fn capacity_one_transport_ingress_is_lossless_across_multiple_chunks() {
 fn tick_bounds_work_under_continuous_unthrottled_rx() {
     let mut runtime = runtime(false);
     for _ in 0..100 {
-        runtime.transport_mut().receive(b"X");
+        connected_mut(&mut runtime).receive(b"X");
     }
     assert_eq!(
         runtime.tick().expect("tick succeeds"),
         PumpStatus::WorkRemaining
     );
-    assert!(!runtime.transport().incoming.is_empty());
+    assert!(!connected(&runtime).incoming.is_empty());
     runtime.pump().expect("remaining finite input drains");
-    assert!(runtime.transport().incoming.is_empty());
+    assert!(connected(&runtime).incoming.is_empty());
 }
 
 fn line(runtime: &Runtime, row: usize) -> String {
@@ -349,7 +558,7 @@ fn line(runtime: &Runtime, row: usize) -> String {
 #[test]
 fn rx_bytes_flow_through_throttle_into_terminal() {
     let mut runtime = runtime(false);
-    runtime.transport_mut().receive(b"HELLO");
+    connected_mut(&mut runtime).receive(b"HELLO");
     assert_eq!(runtime.pump().expect("pipeline succeeds"), PumpStatus::Idle);
     assert_eq!(&line(&runtime, 0)[..5], "HELLO");
     assert_eq!(runtime.terminal().cursor_position(), (5, 0));
@@ -358,8 +567,8 @@ fn rx_bytes_flow_through_throttle_into_terminal() {
 #[test]
 fn rx_cr_lf_and_multiple_chunks_update_terminal_in_order() {
     let mut runtime = runtime(false);
-    runtime.transport_mut().receive(b"AB\r");
-    runtime.transport_mut().receive(b"\nCD");
+    connected_mut(&mut runtime).receive(b"AB\r");
+    connected_mut(&mut runtime).receive(b"\nCD");
     runtime.pump().expect("pipeline succeeds");
     assert_eq!(&line(&runtime, 0)[..2], "AB");
     assert_eq!(&line(&runtime, 1)[..2], "CD");
@@ -377,7 +586,7 @@ fn tx_bytes_reach_transport_in_chunk_order_when_unthrottled() {
         .expect("TX queued");
     runtime.pump().expect("pipeline succeeds");
     assert_eq!(
-        runtime.transport().sent,
+        connected(&runtime).sent,
         [
             TransportCommand::Send(b"AB".to_vec()),
             TransportCommand::Send(b"CD".to_vec())
@@ -393,7 +602,7 @@ fn throttled_tx_uses_scheduler_and_preserves_byte_order() {
         .expect("TX queued");
     runtime.pump().expect("pipeline succeeds");
     assert_eq!(
-        runtime.transport().sent,
+        connected(&runtime).sent,
         [
             TransportCommand::Send(vec![b'A']),
             TransportCommand::Send(vec![b'B'])
@@ -421,7 +630,7 @@ fn nonblocking_tick_allows_throttle_change_mid_chunk() {
         PumpStatus::Wait(Duration::from_millis(100))
     );
     assert_eq!(
-        runtime.transport().sent,
+        connected(&runtime).sent,
         [TransportCommand::Send(vec![b'A'])]
     );
     runtime
@@ -434,7 +643,7 @@ fn nonblocking_tick_allows_throttle_change_mid_chunk() {
         PumpStatus::Idle
     );
     assert_eq!(
-        runtime.transport().sent,
+        connected(&runtime).sent,
         [
             TransportCommand::Send(vec![b'A']),
             TransportCommand::Send(vec![b'B'])
@@ -454,7 +663,7 @@ fn local_loopback_never_sends_to_transport_and_line_mode_resumes_tx() {
         .submit(ApplicationCommand::Transmit(b"LOCAL".to_vec()))
         .expect("loopback queued");
     runtime.pump().expect("pipeline succeeds");
-    assert!(runtime.transport().sent.is_empty());
+    assert!(connected(&runtime).sent.is_empty());
     assert_eq!(&line(&runtime, 0)[..5], "LOCAL");
 
     runtime
@@ -467,7 +676,7 @@ fn local_loopback_never_sends_to_transport_and_line_mode_resumes_tx() {
         .expect("TX queued");
     runtime.pump().expect("pipeline succeeds");
     assert_eq!(
-        runtime.transport().sent,
+        connected(&runtime).sent,
         [TransportCommand::Send(b"LINE".to_vec())]
     );
 }
@@ -480,7 +689,7 @@ fn remote_rx_is_ignored_in_local_mode() {
             CommunicationMode::Local,
         ))
         .expect("mode changes");
-    runtime.transport_mut().receive(b"REMOTE");
+    connected_mut(&mut runtime).receive(b"REMOTE");
     runtime.pump().expect("pipeline succeeds");
     assert_eq!(line(&runtime, 0), "                ");
 }
@@ -491,7 +700,7 @@ fn printer_state_controls_terminal_without_affecting_transport_boundaries() {
     runtime
         .submit(ApplicationCommand::SetPrinterEnabled(false))
         .expect("printer disables");
-    runtime.transport_mut().receive(b"HIDDEN");
+    connected_mut(&mut runtime).receive(b"HIDDEN");
     runtime.pump().expect("pipeline succeeds");
     assert!(!runtime.terminal().printing_enabled());
     assert_eq!(line(&runtime, 0), "                ");
@@ -499,7 +708,7 @@ fn printer_state_controls_terminal_without_affecting_transport_boundaries() {
     runtime
         .submit(ApplicationCommand::SetPrinterEnabled(true))
         .expect("printer enables");
-    runtime.transport_mut().receive(b"VISIBLE");
+    connected_mut(&mut runtime).receive(b"VISIBLE");
     runtime.pump().expect("pipeline succeeds");
     assert_eq!(&line(&runtime, 0)[..7], "VISIBLE");
 }
@@ -507,7 +716,7 @@ fn printer_state_controls_terminal_without_affecting_transport_boundaries() {
 #[test]
 fn transport_backpressure_retains_pending_command_for_retry() {
     let mut runtime = runtime(false);
-    runtime.transport_mut().blocked = true;
+    connected_mut(&mut runtime).blocked = true;
     runtime
         .submit(ApplicationCommand::Transmit(b"AB".to_vec()))
         .expect("TX queued");
@@ -515,27 +724,32 @@ fn transport_backpressure_retains_pending_command_for_retry() {
         runtime.pump().expect("backpressure is observable"),
         PumpStatus::Backpressured
     );
-    assert!(runtime.transport().sent.is_empty());
+    assert!(connected(&runtime).sent.is_empty());
 
-    runtime.transport_mut().blocked = false;
+    connected_mut(&mut runtime).blocked = false;
     assert_eq!(runtime.pump().expect("retry succeeds"), PumpStatus::Idle);
     assert_eq!(
-        runtime.transport().sent,
+        connected(&runtime).sent,
         [TransportCommand::Send(b"AB".to_vec())]
     );
 }
 
 #[test]
-fn transport_failure_becomes_application_event_and_failed_state() {
+fn transport_failure_disconnects_but_keeps_runtime_running() {
     let mut runtime = runtime(false);
-    runtime
-        .transport_mut()
-        .fail(TransportOperation::Read, "device removed");
+    let lifecycle = connected(&runtime).lifecycle.clone();
+    connected_mut(&mut runtime).fail(TransportOperation::Read, "device removed");
     assert_eq!(
         runtime.pump().expect("failure is an event"),
-        PumpStatus::TransportFailed
+        PumpStatus::Idle
     );
-    assert_eq!(runtime.state(), RuntimeState::Failed);
+    assert_eq!(runtime.state(), RuntimeState::Running);
+    assert_eq!(
+        runtime.connection_state(),
+        &ConnectionState::Failed {
+            message: "device removed".to_owned()
+        }
+    );
     assert_eq!(
         runtime.pop_event(),
         Some(RuntimeEvent::TransportFailed {
@@ -543,12 +757,20 @@ fn transport_failure_becomes_application_event_and_failed_state() {
             message: "device removed".to_owned()
         })
     );
+    assert!(runtime.transport().is_none());
+    assert!(lifecycle.0.load(Ordering::SeqCst));
+    assert!(lifecycle.1.load(Ordering::SeqCst));
     runtime
-        .join()
-        .expect("failed transport shuts down and joins");
-    assert_eq!(runtime.state(), RuntimeState::Joined);
-    assert!(runtime.transport().shutdown);
-    assert!(runtime.transport().joined);
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL remains available");
+    runtime.tick().expect("LOCAL mode applies");
+    runtime
+        .submit(ApplicationCommand::Transmit(b"OK".to_vec()))
+        .expect("offline loopback remains available");
+    runtime.pump().expect("offline loopback drains");
+    assert_eq!(&line(&runtime, 0)[..2], "OK");
 }
 
 #[test]
@@ -558,7 +780,7 @@ fn terminal_forwarding_event_preserves_raw_bytes_when_printer_is_off() {
         .submit(ApplicationCommand::SetPrinterEnabled(false))
         .expect("runtime running");
     let original = b"\xc1\x1b[31mX\x1b[0m";
-    runtime.transport_mut().receive(original);
+    connected_mut(&mut runtime).receive(original);
     runtime.pump().expect("RX drains");
     assert_eq!(
         runtime.pop_event(),
@@ -589,21 +811,21 @@ fn local_loopback_produces_raw_terminal_forwarding_event() {
 #[test]
 fn shutdown_and_join_are_idempotent_and_reject_later_bytes() {
     let mut runtime = runtime(false);
+    let lifecycle = connected(&runtime).lifecycle.clone();
     runtime.shutdown().expect("shutdown succeeds");
     runtime.shutdown().expect("shutdown is idempotent");
-    assert!(runtime.transport().shutdown);
+    assert!(lifecycle.0.load(Ordering::SeqCst));
     assert!(
         runtime
             .submit(ApplicationCommand::Transmit(vec![1]))
             .is_err()
     );
-    runtime.transport_mut().receive(b"AFTER");
     assert!(runtime.pump().is_err());
-    assert!(runtime.transport().sent.is_empty());
+    assert!(runtime.transport().is_none());
     assert_eq!(line(&runtime, 0), "                ");
 
     runtime.join().expect("join succeeds");
     runtime.join().expect("join is idempotent");
     assert_eq!(runtime.state(), RuntimeState::Joined);
-    assert!(runtime.transport().joined);
+    assert!(lifecycle.1.load(Ordering::SeqCst));
 }

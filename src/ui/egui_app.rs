@@ -7,10 +7,12 @@ use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
 use crate::app::paper_tape::{FeedResult, ReaderFeed};
 use crate::app::{
-    AppRuntime, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState, Scheduler,
+    AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, Scheduler,
     SystemScheduler,
 };
-use crate::core::config::{BitLabelBase, PunchConfigMode, TapePunchConfig, TapeReaderConfig};
+use crate::core::config::{
+    BitLabelBase, PunchConfigMode, SerialConfig, TapePunchConfig, TapeReaderConfig,
+};
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use crate::core::paper_tape::{PunchMode, ReaderOptions, ReaderState, TapeReader};
 
@@ -31,6 +33,7 @@ pub struct UiOptions {
     pub printer_enabled: bool,
     pub tape_reader: TapeReaderConfig,
     pub tape_punch: TapePunchConfig,
+    pub serial_config: SerialConfig,
 }
 
 #[must_use]
@@ -40,7 +43,6 @@ pub const fn repaint_delay(status: PumpStatus) -> Option<Duration> {
         PumpStatus::Wait(duration) => Some(duration),
         PumpStatus::Idle => Some(IDLE_POLL),
         PumpStatus::Backpressured => Some(BACKPRESSURE_RETRY),
-        PumpStatus::TransportFailed => Some(IDLE_POLL),
     }
 }
 
@@ -58,6 +60,8 @@ pub struct EguiApp {
     tape_error: Option<String>,
     scroll_top: Option<usize>,
     scroll_request: bool,
+    available_ports: Vec<String>,
+    port_error: Option<String>,
 }
 
 impl EguiApp {
@@ -77,7 +81,7 @@ impl EguiApp {
             PunchConfigMode::Append => PunchMode::Append,
             PunchConfigMode::Overwrite => PunchMode::Overwrite,
         };
-        Self {
+        let mut application = Self {
             runtime,
             options,
             transport_error: None,
@@ -91,6 +95,50 @@ impl EguiApp {
             tape_error: None,
             scroll_top: None,
             scroll_request: false,
+            available_ports: Vec::new(),
+            port_error: None,
+        };
+        application.refresh_ports();
+        application.connect_selected();
+        application
+    }
+
+    fn refresh_ports(&mut self) {
+        match serialport::available_ports() {
+            Ok(ports) => {
+                self.available_ports = ports.into_iter().map(|port| port.port_name).collect();
+                self.port_error = None;
+            }
+            Err(error) => self.port_error = Some(format!("port enumeration failed: {error}")),
+        }
+    }
+
+    fn connect_selected(&mut self) {
+        match SerialTransport::open(self.options.serial_config.clone()) {
+            Ok(transport) => match self.runtime.connect(transport) {
+                Ok(()) => self.transport_error = None,
+                Err(error) => self.transport_error = Some(error.to_string()),
+            },
+            Err(error) => {
+                let message = error.to_string();
+                self.runtime.record_connection_failure(message.clone());
+                self.transport_error = Some(message);
+            }
+        }
+    }
+
+    fn disconnect(&mut self) {
+        if self.options.communication_mode == CommunicationMode::Line
+            && self.reader.reader().state() == ReaderState::Running
+        {
+            self.reader.reader_mut().stop();
+            self.tape_error = Some(
+                "reader paused: serial disconnected; position retained and stale TX discarded"
+                    .to_owned(),
+            );
+        }
+        if let Err(error) = self.runtime.disconnect() {
+            self.transport_error = Some(error.to_string());
         }
     }
 
@@ -203,13 +251,9 @@ impl EguiApp {
     }
 
     fn drive_runtime(&mut self, context: &egui::Context) {
-        if self.runtime.state() == RuntimeState::Failed {
-            context.request_repaint_after(IDLE_POLL);
-            self.collect_runtime_events();
-            return;
-        }
         let now = self.runtime.scheduler().now();
         let runtime = &mut self.runtime;
+        let mut reader_disconnected = false;
         if let Some(delay) = self
             .reader
             .tick(now, |byte| match runtime.try_transmit(vec![byte]) {
@@ -217,10 +261,19 @@ impl EguiApp {
                 Ok(ImmediateTransmit::Backpressured(data)) => {
                     FeedResult::Backpressured(data.first().copied().map_or(byte, |pending| pending))
                 }
+                Ok(ImmediateTransmit::Disconnected(data)) => {
+                    reader_disconnected = true;
+                    FeedResult::Backpressured(data.first().copied().map_or(byte, |pending| pending))
+                }
                 Err(_) => FeedResult::Backpressured(byte),
             })
         {
             context.request_repaint_after(delay);
+        }
+        if reader_disconnected {
+            self.reader.reader_mut().stop();
+            self.tape_error =
+                Some("reader paused: LINE mode requires an active serial connection".to_owned());
         }
         match self.runtime.tick() {
             Ok(status) => {
@@ -243,8 +296,13 @@ impl EguiApp {
     fn collect_runtime_events(&mut self) {
         while let Some(event) = self.runtime.pop_event() {
             match event {
+                RuntimeEvent::ConnectionFailed(message) => {
+                    self.transport_error = Some(message);
+                    self.pause_line_reader_after_failure();
+                }
                 RuntimeEvent::TransportFailed { operation, message } => {
                     self.transport_error = Some(format!("{operation:?}: {message}"));
+                    self.pause_line_reader_after_failure();
                 }
                 RuntimeEvent::TerminalForwarded(data) => {
                     if let Some(punch) = self.punch.as_mut()
@@ -258,7 +316,62 @@ impl EguiApp {
         }
     }
 
+    fn pause_line_reader_after_failure(&mut self) {
+        if self.options.communication_mode == CommunicationMode::Line
+            && self.reader.reader().state() == ReaderState::Running
+        {
+            self.reader.reader_mut().stop();
+            self.tape_error = Some(
+                "reader paused after connection failure; position retained, external in-flight TX discarded"
+                    .to_owned(),
+            );
+        }
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
+        let connection = self.runtime.connection_state().clone();
+        ui.horizontal(|ui| {
+            ui.label(format!("Connection: {connection:?}"));
+            ui.separator();
+            ui.label("Port:");
+            ui.text_edit_singleline(&mut self.options.serial_config.port);
+            egui::ComboBox::from_id_salt("serial-port-list")
+                .selected_text("available")
+                .show_ui(ui, |ui| {
+                    for port in &self.available_ports {
+                        ui.selectable_value(
+                            &mut self.options.serial_config.port,
+                            port.clone(),
+                            port,
+                        );
+                    }
+                });
+            if ui.button("Refresh ports").clicked() {
+                self.refresh_ports();
+            }
+            if connection != ConnectionState::Connected && ui.button("Connect").clicked() {
+                self.connect_selected();
+            }
+            if connection == ConnectionState::Connected && ui.button("Disconnect").clicked() {
+                self.disconnect();
+            }
+        });
+        ui.label(format!(
+            "{} baud, {:?} data bits, {:?} parity, {:?} stop bits",
+            self.options.serial_config.baudrate,
+            self.options.serial_config.databits,
+            self.options.serial_config.parity,
+            self.options.serial_config.stopbits
+        ));
+        if let ConnectionState::Failed { message } = &connection {
+            ui.colored_label(
+                Color32::LIGHT_RED,
+                format!("Last connection error: {message}"),
+            );
+        }
+        if let Some(error) = &self.port_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
         ui.horizontal(|ui| {
             ui.label(&self.options.backend_label);
             ui.separator();
@@ -412,6 +525,7 @@ impl EguiApp {
                     {
                         match load_reader_file(&path) {
                             Ok(tape) => {
+                                self.reader.clear_pending();
                                 self.reader.reader_mut().load(tape);
                                 self.reader_path = Some(path);
                                 self.tape_error = None;
@@ -428,6 +542,7 @@ impl EguiApp {
                         )
                         .clicked()
                     {
+                        self.reader.clear_pending();
                         self.reader.reader_mut().unload();
                         self.reader_path = None;
                     }
@@ -438,7 +553,16 @@ impl EguiApp {
                         )
                         .clicked()
                     {
-                        self.reader.reader_mut().start();
+                        let offline_line = self.options.communication_mode
+                            == CommunicationMode::Line
+                            && self.runtime.connection_state() != &ConnectionState::Connected;
+                        if offline_line {
+                            self.tape_error =
+                                Some("reader cannot start: LINE mode is disconnected".to_owned());
+                        } else {
+                            self.reader.reader_mut().start();
+                            self.tape_error = None;
+                        }
                     }
                     if ui
                         .add_enabled(
@@ -457,6 +581,7 @@ impl EguiApp {
                         )
                         .clicked()
                     {
+                        self.reader.clear_pending();
                         self.reader.reader_mut().rewind();
                     }
                 });
@@ -843,10 +968,6 @@ mod tests {
         assert_eq!(
             repaint_delay(PumpStatus::Backpressured),
             Some(Duration::from_millis(10))
-        );
-        assert_eq!(
-            repaint_delay(PumpStatus::TransportFailed),
-            Some(Duration::from_millis(16))
         );
     }
 

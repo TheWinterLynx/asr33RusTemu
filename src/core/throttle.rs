@@ -114,6 +114,11 @@ impl FlowState {
         }
         self.active.is_some()
     }
+
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.active = None;
+    }
 }
 
 #[derive(Debug)]
@@ -239,6 +244,18 @@ impl DataThrottle {
             self.loopback.queue.clear();
         }
         self.communication = mode;
+    }
+
+    #[must_use]
+    pub fn communication_mode(&self) -> CommunicationMode {
+        self.communication
+    }
+
+    /// Discard only bytes destined for an external transport.
+    ///
+    /// RX, terminal history, and local loopback state are intentionally kept.
+    pub fn clear_external_tx(&mut self) {
+        self.tx.clear();
     }
 
     pub fn set_throttle_mode(&mut self, mode: ThrottleMode) {

@@ -51,21 +51,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     let tape_reader = config.tape_reader.config.clone();
     let tape_punch = config.tape_punch.config.clone();
     let font_size = terminal_config.font_size as f32;
-    let backend_label = format!(
-        "serial: {} @ {} baud",
-        config.backend.serial_config.port, config.backend.serial_config.baudrate
-    );
+    let backend_label = "serial".to_owned();
     let initial_commands =
         initial_commands(&config, communication_mode, throttle_mode, printer_enabled);
 
-    let transport = SerialTransport::open(config.backend.serial_config)?;
-    let mut runtime = AppRuntime::new(
-        transport,
+    let serial_config = config.backend.serial_config.clone();
+    let mut runtime = AppRuntime::<SerialTransport, _>::new_disconnected(
         SystemScheduler::new(),
         terminal_options,
         throttle_config,
     )?;
     runtime.start_with_initial_commands(initial_commands)?;
+    runtime.configure_startup_cr(config.terminal.config.send_cr_at_startup);
 
     let ui_options = UiOptions {
         title: "ASR-33 Teletype Emulator".to_owned(),
@@ -77,6 +74,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         printer_enabled,
         tape_reader,
         tape_punch,
+        serial_config,
     };
     let title = ui_options.title.clone();
     eframe::run_native(
@@ -125,11 +123,6 @@ fn initial_commands(
     printer_enabled: bool,
 ) -> Vec<ApplicationCommand> {
     let mut commands = Vec::new();
-    if config.terminal.config.send_cr_at_startup {
-        // Legacy frontend construction sends a literal CR before keyboard
-        // parity and the configured runtime state are applied.
-        commands.push(ApplicationCommand::Transmit(vec![b'\r']));
-    }
     commands.extend([
         ApplicationCommand::SetCommunicationMode(communication_mode),
         ApplicationCommand::SetThrottleMode(throttle_mode),
@@ -165,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_cr_is_literal_for_every_keyboard_parity_and_precedes_runtime_state() {
+    fn startup_cr_is_not_encoded_or_buffered_as_an_initial_keyboard_command() {
         for parity in [
             KeyboardParityMode::Space,
             KeyboardParityMode::Mark,
@@ -184,14 +177,13 @@ mod tests {
             assert_eq!(
                 commands,
                 [
-                    ApplicationCommand::Transmit(vec![0x0d]),
                     ApplicationCommand::SetCommunicationMode(CommunicationMode::Local),
                     ApplicationCommand::SetThrottleMode(ThrottleMode::Unthrottled),
                     ApplicationCommand::SetTxRate(10),
                     ApplicationCommand::SetRxRate(10),
                     ApplicationCommand::SetPrinterEnabled(false),
                 ],
-                "startup ordering and literal CR are independent of {parity:?}"
+                "startup CR is now a session-scoped connection action, independent of {parity:?}"
             );
         }
     }

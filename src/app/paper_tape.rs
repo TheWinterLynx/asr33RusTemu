@@ -39,13 +39,15 @@ impl ReaderFeed {
     pub fn pending_count(&self) -> usize {
         usize::from(self.pending.is_some())
     }
+    pub fn clear_pending(&mut self) {
+        self.pending = None;
+    }
 
     pub fn tick<F>(&mut self, now: Duration, mut transmit: F) -> Option<Duration>
     where
         F: FnMut(u8) -> FeedResult,
     {
         if self.reader.state() != ReaderState::Running {
-            self.pending = None;
             return None;
         }
         if now < self.next_due {
@@ -126,5 +128,28 @@ mod tests {
         });
         assert_eq!(emitted, b"A\x80");
         assert_eq!(feed.reader().state(), ReaderState::Stopped);
+    }
+
+    #[test]
+    fn disconnected_pause_retains_exactly_one_pending_byte_without_busy_loop() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            auto_stop: false,
+            set_msb: false,
+        });
+        reader.load(PaperTape::new(b"ABC".to_vec()));
+        assert!(reader.start());
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        assert_eq!(
+            feed.tick(Duration::ZERO, FeedResult::Backpressured),
+            Some(Duration::from_millis(1))
+        );
+        feed.reader_mut().stop();
+        assert_eq!(
+            feed.tick(Duration::from_millis(1), |_| FeedResult::Accepted),
+            None
+        );
+        assert_eq!(feed.pending_count(), 1);
+        assert_eq!(feed.reader().position(), 1);
     }
 }

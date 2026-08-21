@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use crate::adapters::transport::{Transport, TransportSendError, TransportSendFailure};
 use crate::core::events::{
-    ApplicationCommand, DataFlow, ThrottleOutput, TransportCommand, TransportEvent,
-    TransportOperation,
+    ApplicationCommand, CommunicationMode, DataFlow, ThrottleOutput, TransportCommand,
+    TransportEvent, TransportOperation,
 };
 use crate::core::terminal::{Terminal, TerminalError, TerminalOptions};
 use crate::core::throttle::{DataThrottle, ThrottleConfig, ThrottleStep};
@@ -56,13 +56,20 @@ impl Scheduler for SystemScheduler {
 pub enum RuntimeState {
     Created,
     Running,
-    Failed,
     Shutdown,
     Joined,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionState {
+    Disconnected,
+    Connected,
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
+    ConnectionFailed(String),
     TransportFailed {
         operation: TransportOperation,
         message: String,
@@ -74,13 +81,13 @@ pub enum RuntimeEvent {
 pub enum ImmediateTransmit {
     Accepted,
     Backpressured(Vec<u8>),
+    Disconnected(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PumpStatus {
     Idle,
     Backpressured,
-    TransportFailed,
     Wait(Duration),
     WorkRemaining,
 }
@@ -100,6 +107,7 @@ pub enum RuntimeError<E> {
         message: String,
     },
     Terminal(TerminalError),
+    Disconnected,
 }
 
 impl<E> fmt::Display for RuntimeError<E>
@@ -114,6 +122,7 @@ where
                 write!(formatter, "transport send {failure:?}: {message}")
             }
             Self::Terminal(error) => write!(formatter, "terminal error: {error}"),
+            Self::Disconnected => formatter.write_str("serial connection is disconnected"),
         }
     }
 }
@@ -126,7 +135,7 @@ where
         match self {
             Self::Transport(error) => Some(error),
             Self::Terminal(error) => Some(error),
-            Self::InvalidState(_) | Self::TransportSend { .. } => None,
+            Self::InvalidState(_) | Self::TransportSend { .. } | Self::Disconnected => None,
         }
     }
 }
@@ -138,13 +147,16 @@ where
 {
     terminal: Terminal,
     throttle: DataThrottle,
-    transport: T,
+    transport: Option<T>,
     scheduler: S,
     pending_application: VecDeque<ApplicationCommand>,
     pending_transport_event: Option<TransportEvent>,
     pending_transport: VecDeque<TransportCommand>,
     events: VecDeque<RuntimeEvent>,
     state: RuntimeState,
+    connection: ConnectionState,
+    startup_cr_pending: bool,
+    startup_cr_consumed: bool,
 }
 
 impl<T, S> AppRuntime<T, S>
@@ -163,13 +175,39 @@ where
         Ok(Self {
             terminal,
             throttle: DataThrottle::new(throttle_config, initial_time),
-            transport,
+            transport: Some(transport),
             scheduler,
             pending_application: VecDeque::new(),
             pending_transport_event: None,
             pending_transport: VecDeque::new(),
             events: VecDeque::new(),
             state: RuntimeState::Created,
+            connection: ConnectionState::Disconnected,
+            startup_cr_pending: false,
+            startup_cr_consumed: false,
+        })
+    }
+
+    pub fn new_disconnected(
+        scheduler: S,
+        terminal_options: TerminalOptions,
+        throttle_config: ThrottleConfig,
+    ) -> Result<Self, RuntimeError<T::Error>> {
+        let terminal = Terminal::new(terminal_options).map_err(RuntimeError::Terminal)?;
+        let initial_time = scheduler.now();
+        Ok(Self {
+            terminal,
+            throttle: DataThrottle::new(throttle_config, initial_time),
+            transport: None,
+            scheduler,
+            pending_application: VecDeque::new(),
+            pending_transport_event: None,
+            pending_transport: VecDeque::new(),
+            events: VecDeque::new(),
+            state: RuntimeState::Created,
+            connection: ConnectionState::Disconnected,
+            startup_cr_pending: false,
+            startup_cr_consumed: false,
         })
     }
 
@@ -191,9 +229,12 @@ where
                         self.pending_application.push_back(rejected);
                     }
                 }
-                self.transport.start().map_err(RuntimeError::Transport)?;
                 self.state = RuntimeState::Running;
-                Ok(())
+                if let Some(transport) = self.transport.take() {
+                    self.connect(transport)
+                } else {
+                    Ok(())
+                }
             }
             RuntimeState::Running => Ok(()),
             state => Err(RuntimeError::InvalidState(state)),
@@ -202,6 +243,12 @@ where
 
     pub fn submit(&mut self, command: ApplicationCommand) -> Result<(), RuntimeError<T::Error>> {
         self.require_running()?;
+        if matches!(command, ApplicationCommand::Transmit(_))
+            && self.throttle.communication_mode() == CommunicationMode::Line
+            && self.connection != ConnectionState::Connected
+        {
+            return Err(RuntimeError::Disconnected);
+        }
         self.pending_application.push_back(command);
         Ok(())
     }
@@ -211,6 +258,11 @@ where
         data: Vec<u8>,
     ) -> Result<ImmediateTransmit, RuntimeError<T::Error>> {
         self.require_running()?;
+        if self.throttle.communication_mode() == CommunicationMode::Line
+            && self.connection != ConnectionState::Connected
+        {
+            return Ok(ImmediateTransmit::Disconnected(data));
+        }
         match self.throttle.enqueue_tx(data) {
             Ok(_) => Ok(ImmediateTransmit::Accepted),
             Err(rejected) => Ok(ImmediateTransmit::Backpressured(rejected.data)),
@@ -244,10 +296,6 @@ where
             if !defer_ingress {
                 progressed |= self.receive_one_transport_event()?;
             }
-            if self.state == RuntimeState::Failed {
-                return Ok(PumpStatus::TransportFailed);
-            }
-
             let now = self.scheduler.now();
             let mut next_wait = None;
             for flow in [DataFlow::Tx, DataFlow::Loopback, DataFlow::Rx] {
@@ -286,7 +334,7 @@ where
         if matches!(self.state, RuntimeState::Shutdown | RuntimeState::Joined) {
             return Ok(());
         }
-        self.transport.shutdown().map_err(RuntimeError::Transport)?;
+        self.disconnect()?;
         self.pending_transport.clear();
         self.pending_application.clear();
         self.pending_transport_event = None;
@@ -299,7 +347,6 @@ where
             return Ok(());
         }
         self.shutdown()?;
-        self.transport.join().map_err(RuntimeError::Transport)?;
         self.state = RuntimeState::Joined;
         Ok(())
     }
@@ -316,12 +363,12 @@ where
         self.events.pop_front()
     }
 
-    pub fn transport(&self) -> &T {
-        &self.transport
+    pub fn transport(&self) -> Option<&T> {
+        self.transport.as_ref()
     }
 
-    pub fn transport_mut(&mut self) -> &mut T {
-        &mut self.transport
+    pub fn transport_mut(&mut self) -> Option<&mut T> {
+        self.transport.as_mut()
     }
 
     pub fn scheduler(&self) -> &S {
@@ -330,6 +377,77 @@ where
 
     pub fn scheduler_mut(&mut self) -> &mut S {
         &mut self.scheduler
+    }
+
+    #[must_use]
+    pub fn connection_state(&self) -> &ConnectionState {
+        &self.connection
+    }
+
+    pub fn configure_startup_cr(&mut self, enabled: bool) {
+        self.startup_cr_pending = enabled
+            && !self.startup_cr_consumed
+            && self.throttle.communication_mode() == CommunicationMode::Line;
+    }
+
+    pub fn connect(&mut self, mut transport: T) -> Result<(), RuntimeError<T::Error>> {
+        self.require_running()?;
+        if self.connection == ConnectionState::Connected {
+            return Ok(());
+        }
+        match transport.start() {
+            Ok(()) => {
+                self.transport = Some(transport);
+                self.connection = ConnectionState::Connected;
+                if self.startup_cr_pending
+                    && !self.startup_cr_consumed
+                    && self.throttle.enqueue_tx(vec![b'\r']).is_ok()
+                {
+                    self.startup_cr_pending = false;
+                    self.startup_cr_consumed = true;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = transport.shutdown();
+                let _ = transport.join();
+                self.record_connection_failure(message);
+                Err(RuntimeError::Transport(error))
+            }
+        }
+    }
+
+    pub fn record_connection_failure(&mut self, message: String) {
+        self.clear_external_work();
+        self.connection = ConnectionState::Failed {
+            message: message.clone(),
+        };
+        self.events
+            .push_back(RuntimeEvent::ConnectionFailed(message));
+    }
+
+    pub fn disconnect(&mut self) -> Result<(), RuntimeError<T::Error>> {
+        self.clear_external_work();
+        let result = if let Some(mut transport) = self.transport.take() {
+            let shutdown = transport.shutdown();
+            let join = transport.join();
+            shutdown.and(join).map_err(RuntimeError::Transport)
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(()) => {
+                self.connection = ConnectionState::Disconnected;
+                Ok(())
+            }
+            Err(error) => {
+                self.connection = ConnectionState::Failed {
+                    message: error.to_string(),
+                };
+                Err(error)
+            }
+        }
     }
 
     fn require_running(&self) -> Result<(), RuntimeError<T::Error>> {
@@ -344,8 +462,10 @@ where
         let event = match self.pending_transport_event.take() {
             Some(event) => event,
             None => {
-                let Some(event) = self.transport.try_recv().map_err(RuntimeError::Transport)?
-                else {
+                let Some(transport) = self.transport.as_mut() else {
+                    return Ok(false);
+                };
+                let Some(event) = transport.try_recv().map_err(RuntimeError::Transport)? else {
                     return Ok(false);
                 };
                 event
@@ -359,9 +479,11 @@ where
                 }
             }
             TransportEvent::Failed { operation, message } => {
-                self.events
-                    .push_back(RuntimeEvent::TransportFailed { operation, message });
-                self.state = RuntimeState::Failed;
+                self.events.push_back(RuntimeEvent::TransportFailed {
+                    operation,
+                    message: message.clone(),
+                });
+                self.fail_active_connection(message);
             }
         }
         Ok(true)
@@ -423,7 +545,10 @@ where
         let Some(command) = self.pending_transport.pop_front() else {
             return Ok(FlushStatus::Empty);
         };
-        match self.transport.send(command) {
+        let Some(transport) = self.transport.as_mut() else {
+            return Ok(FlushStatus::Empty);
+        };
+        match transport.send(command) {
             Ok(()) => Ok(FlushStatus::Sent),
             Err(TransportSendError {
                 failure: TransportSendFailure::Backpressure,
@@ -433,11 +558,30 @@ where
                 self.pending_transport.push_front(command);
                 Ok(FlushStatus::Backpressured)
             }
-            Err(error) => Err(RuntimeError::TransportSend {
-                failure: error.failure,
-                message: error.message,
-            }),
+            Err(error) => {
+                let failure = error.failure;
+                let message = error.message;
+                self.fail_active_connection(message.clone());
+                Err(RuntimeError::TransportSend { failure, message })
+            }
         }
+    }
+
+    fn clear_external_work(&mut self) {
+        self.throttle.clear_external_tx();
+        self.pending_transport.clear();
+        self.pending_transport_event = None;
+        self.pending_application
+            .retain(|command| !matches!(command, ApplicationCommand::Transmit(_)));
+    }
+
+    fn fail_active_connection(&mut self, message: String) {
+        self.clear_external_work();
+        if let Some(mut transport) = self.transport.take() {
+            let _ = transport.shutdown();
+            let _ = transport.join();
+        }
+        self.connection = ConnectionState::Failed { message };
     }
 }
 
@@ -447,9 +591,11 @@ where
     S: Scheduler,
 {
     fn drop(&mut self) {
-        if self.state != RuntimeState::Joined {
-            let _ = self.transport.shutdown();
-            let _ = self.transport.join();
+        if self.state != RuntimeState::Joined
+            && let Some(mut transport) = self.transport.take()
+        {
+            let _ = transport.shutdown();
+            let _ = transport.join();
         }
     }
 }
