@@ -25,8 +25,46 @@ pub struct TapeRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedTape {
-    pub start: usize,
     pub rows: Vec<TapeRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapeSourceOrder {
+    NewestFirst,
+    OldestFirst,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapeViewHistory {
+    bytes: Vec<u8>,
+    max_rows: usize,
+}
+
+impl TapeViewHistory {
+    #[must_use]
+    pub fn new(max_rows: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_rows,
+        }
+    }
+
+    pub fn push_confirmed(&mut self, byte: u8) {
+        if self.max_rows == 0 {
+            return;
+        }
+        self.bytes.insert(0, byte);
+        self.bytes.truncate(self.max_rows);
+    }
+
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[must_use]
@@ -66,26 +104,26 @@ pub fn tape_ascii(byte: u8, mask_msb: bool) -> char {
 #[must_use]
 pub fn prepare_tape(
     bytes: &[u8],
-    position: usize,
     max_rows: usize,
     mask_msb: bool,
+    order: TapeSourceOrder,
+    mark_newest: bool,
 ) -> PreparedTape {
-    let start = bytes.len().saturating_sub(max_rows);
-    let rows = bytes[start..]
-        .iter()
-        .copied()
+    let values: Box<dyn Iterator<Item = (usize, u8)> + '_> = match order {
+        TapeSourceOrder::NewestFirst => Box::new(bytes.iter().copied().enumerate()),
+        TapeSourceOrder::OldestFirst => Box::new(bytes.iter().copied().enumerate().rev()),
+    };
+    let rows = values
+        .take(max_rows)
         .enumerate()
-        .map(|(relative, byte)| {
-            let offset = start + relative;
-            TapeRow {
-                offset,
-                byte,
-                ascii: tape_ascii(byte, mask_msb),
-                marker: offset == position,
-            }
+        .map(|(visual_index, (offset, byte))| TapeRow {
+            offset,
+            byte,
+            ascii: tape_ascii(byte, mask_msb),
+            marker: mark_newest && visual_index == 0,
         })
         .collect();
-    PreparedTape { start, rows }
+    PreparedTape { rows }
 }
 
 pub struct TapeRendererOptions {
@@ -93,15 +131,18 @@ pub struct TapeRendererOptions {
     pub ghost_outline: bool,
     pub bit_label_base: BitLabelBase,
     pub ascii_char_mask_msb: bool,
+    pub source_order: TapeSourceOrder,
+    pub mark_newest: bool,
     pub palette: ThemePalette,
 }
 
-pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], position: usize, options: TapeRendererOptions) {
+pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions) {
     let prepared = prepare_tape(
         bytes,
-        position,
         options.max_rows,
         options.ascii_char_mask_msb,
+        options.source_order,
+        options.mark_newest,
     );
     let columns = tape_columns(options.bit_label_base);
     let tape_width = PITCH * 9.0;
@@ -196,6 +237,15 @@ pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], position: usize, options: Ta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::paper_tape::{FeedResult, ReaderFeed};
+    use crate::core::paper_tape::{PaperTape, ReaderOptions, TapeReader};
+    use std::time::Duration;
+
+    fn confirm_next(feed: &mut ReaderFeed, history: &mut TapeViewHistory, now: Duration) {
+        feed.tick(now, |_| FeedResult::Accepted);
+        let confirmed = feed.confirm_transmitted().expect("byte reaches boundary");
+        history.push_confirmed(confirmed.byte);
+    }
 
     #[test]
     fn physical_columns_match_legacy_and_have_one_small_sprocket() {
@@ -247,10 +297,81 @@ mod tests {
         assert_eq!(tape_ascii(0xc1, true), 'A');
         assert_eq!(tape_ascii(0xc1, false), '·');
         let bytes = [0, 1, 2, 3];
-        let prepared = prepare_tape(&bytes, 2, 2, false);
-        assert_eq!(prepared.start, 2);
+        let prepared = prepare_tape(&bytes, 2, false, TapeSourceOrder::OldestFirst, true);
         assert_eq!(prepared.rows.len(), 2);
         assert!(prepared.rows[0].marker);
+        assert_eq!(
+            prepared.rows.iter().map(|row| row.byte).collect::<Vec<_>>(),
+            [3, 2]
+        );
         assert_eq!(bytes, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn history_is_bounded_and_punch_preview_is_newest_first() {
+        let mut history = TapeViewHistory::new(3);
+        for byte in b"ABCDE" {
+            history.push_confirmed(*byte);
+        }
+        assert_eq!(history.bytes(), b"EDC");
+        history.clear();
+        assert!(history.bytes().is_empty());
+        let punch = prepare_tape(b"ABCDE", 3, false, TapeSourceOrder::OldestFirst, false);
+        assert_eq!(
+            punch.rows.iter().map(|row| row.byte).collect::<Vec<_>>(),
+            b"EDC"
+        );
+        let appended = prepare_tape(b"ABCDEF", 3, false, TapeSourceOrder::OldestFirst, false);
+        assert_eq!(
+            appended.rows.iter().map(|row| row.byte).collect::<Vec<_>>(),
+            b"FED"
+        );
+    }
+
+    #[test]
+    fn reader_history_tracks_only_confirmed_progress_and_msb_at_emission() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: true,
+            auto_stop: false,
+            set_msb: false,
+        });
+        reader.load(PaperTape::new(b"\0\0ABC".to_vec()));
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut history = TapeViewHistory::new(3);
+        assert!(
+            history.bytes().is_empty(),
+            "load does not visualize source bytes"
+        );
+        assert!(feed.reader_mut().start());
+        confirm_next(&mut feed, &mut history, Duration::ZERO);
+        assert_eq!(history.bytes(), b"A");
+        feed.reader_mut().set_msb(true);
+        confirm_next(&mut feed, &mut history, Duration::from_millis(3));
+        confirm_next(&mut feed, &mut history, Duration::from_millis(6));
+        assert_eq!(history.bytes(), &[0xc3, 0xc2, b'A']);
+    }
+
+    #[test]
+    fn rollback_rewind_and_unload_never_leave_visual_rows() {
+        let mut reader = TapeReader::new(ReaderOptions::default());
+        reader.load(PaperTape::new(b"AB".to_vec()));
+        assert!(reader.start());
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut history = TapeViewHistory::new(4);
+        feed.tick(Duration::ZERO, |_| FeedResult::Accepted);
+        feed.rollback_unconfirmed();
+        assert!(history.bytes().is_empty());
+        assert_eq!(feed.reader().position(), 0);
+        confirm_next(&mut feed, &mut history, Duration::from_millis(3));
+        assert_eq!(history.bytes(), b"A");
+        feed.reader_mut().stop();
+        assert!(feed.reader_mut().rewind());
+        history.clear();
+        assert_eq!(feed.reader().position(), 0);
+        assert!(feed.reader().tape().is_some());
+        assert!(history.bytes().is_empty());
+        feed.reader_mut().unload();
+        history.clear();
+        assert!(history.bytes().is_empty());
     }
 }

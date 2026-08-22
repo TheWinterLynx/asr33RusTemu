@@ -12,12 +12,24 @@ pub enum FeedResult {
     Backpressured(u8),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmedReaderByte {
+    pub byte: u8,
+    pub source_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightReaderByte {
+    byte: u8,
+    source_offset: usize,
+}
+
 #[derive(Debug)]
 pub struct ReaderFeed {
     reader: TapeReader,
     pending: Option<u8>,
     checkpoint: Option<usize>,
-    awaiting_confirmation: bool,
+    in_flight: Option<InFlightReaderByte>,
     next_due: Duration,
 }
 
@@ -28,7 +40,7 @@ impl ReaderFeed {
             reader,
             pending: None,
             checkpoint: None,
-            awaiting_confirmation: false,
+            in_flight: None,
             next_due: now,
         }
     }
@@ -41,22 +53,26 @@ impl ReaderFeed {
     }
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        usize::from(self.pending.is_some() || self.awaiting_confirmation)
+        usize::from(self.pending.is_some() || self.in_flight.is_some())
     }
     pub fn clear_pending(&mut self) {
         self.pending = None;
         self.checkpoint = None;
-        self.awaiting_confirmation = false;
+        self.in_flight = None;
     }
     #[must_use]
     pub fn awaiting_confirmation(&self) -> bool {
-        self.awaiting_confirmation
+        self.in_flight.is_some()
     }
     /// Commit the current reader position after its byte reaches the runtime's
     /// transport/terminal boundary.
-    pub fn confirm_transmitted(&mut self) {
-        self.awaiting_confirmation = false;
+    pub fn confirm_transmitted(&mut self) -> Option<ConfirmedReaderByte> {
+        let confirmed = self.in_flight.take().map(|in_flight| ConfirmedReaderByte {
+            byte: in_flight.byte,
+            source_offset: in_flight.source_offset,
+        });
         self.checkpoint = None;
+        confirmed
     }
     /// Restore the position captured before the single unconfirmed byte.
     pub fn rollback_unconfirmed(&mut self) {
@@ -64,7 +80,7 @@ impl ReaderFeed {
             self.reader.restore_position(position);
         }
         self.pending = None;
-        self.awaiting_confirmation = false;
+        self.in_flight = None;
     }
 
     /// Roll back the one in-flight byte and stop before changing its route.
@@ -85,7 +101,7 @@ impl ReaderFeed {
         if self.reader.state() != ReaderState::Running {
             return None;
         }
-        if self.awaiting_confirmation {
+        if self.in_flight.is_some() {
             return None;
         }
         if now < self.next_due {
@@ -106,7 +122,13 @@ impl ReaderFeed {
         };
         match transmit(byte) {
             FeedResult::Accepted => {
-                self.awaiting_confirmation = true;
+                let source_offset = self
+                    .checkpoint
+                    .unwrap_or_else(|| self.reader.position().saturating_sub(1));
+                self.in_flight = Some(InFlightReaderByte {
+                    byte,
+                    source_offset,
+                });
                 self.next_due = now + READER_FEED_INTERVAL;
             }
             FeedResult::Backpressured(byte) => {
@@ -205,6 +227,33 @@ mod tests {
         assert_eq!(feed.reader().position(), 1);
         feed.rollback_unconfirmed();
         assert_eq!(feed.pending_count(), 0);
+        assert_eq!(feed.reader().position(), 0);
+    }
+
+    #[test]
+    fn confirmation_returns_emitted_byte_and_rollback_returns_nothing() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            set_msb: true,
+            ..ReaderOptions::default()
+        });
+        reader.load(PaperTape::new(b"A".to_vec()));
+        assert!(reader.start());
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        feed.tick(Duration::ZERO, |_| FeedResult::Accepted);
+        assert_eq!(
+            feed.confirm_transmitted(),
+            Some(super::ConfirmedReaderByte {
+                byte: 0xc1,
+                source_offset: 0
+            })
+        );
+
+        feed.reader_mut().stop();
+        assert!(feed.reader_mut().rewind());
+        assert!(feed.reader_mut().start());
+        feed.tick(READER_FEED_INTERVAL, |_| FeedResult::Accepted);
+        feed.rollback_unconfirmed();
+        assert_eq!(feed.confirm_transmitted(), None);
         assert_eq!(feed.reader().position(), 0);
     }
 }

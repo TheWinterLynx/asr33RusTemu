@@ -18,12 +18,18 @@ use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 use super::layout::{
     DockSplitState, DockWidthState, PanelPlacement, PanelPresentation, TerminalMetrics,
 };
-use super::tape_view::{TapeRendererOptions, render_tape};
+use super::tape_view::{TapeRendererOptions, TapeSourceOrder, TapeViewHistory, render_tape};
 use super::theme::ThemeKind;
 
 const FONT_NAME: &str = "teletype-33";
 const IDLE_POLL: Duration = Duration::from_millis(16);
 const BACKPRESSURE_RETRY: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardTarget {
+    Terminal,
+    UiText,
+}
 
 #[derive(Clone, Debug)]
 pub struct UiOptions {
@@ -63,6 +69,8 @@ pub struct EguiApp {
     theme: ThemeKind,
     dock_split: DockSplitState,
     dock_width: DockWidthState,
+    reader_view: TapeViewHistory,
+    keyboard_target: KeyboardTarget,
     tape_error: Option<String>,
     scroll_top: Option<usize>,
     scroll_request: bool,
@@ -87,6 +95,7 @@ impl EguiApp {
             PunchConfigMode::Append => PunchMode::Append,
             PunchConfigMode::Overwrite => PunchMode::Overwrite,
         };
+        let reader_view = TapeViewHistory::new(options.tape_reader.max_rows);
         let mut application = Self {
             runtime,
             options,
@@ -101,6 +110,8 @@ impl EguiApp {
             theme: ThemeKind::Light,
             dock_split: DockSplitState::default(),
             dock_width: DockWidthState::default(),
+            reader_view,
+            keyboard_target: KeyboardTarget::Terminal,
             tape_error: None,
             scroll_top: None,
             scroll_request: false,
@@ -180,15 +191,11 @@ impl EguiApp {
 
     fn handle_keyboard(&mut self, context: &egui::Context) {
         let events = context.input(|input| input.events.clone());
-        let text_editor_owns_input = context.egui_wants_keyboard_input();
         for event in &events {
             if self.handle_shortcut(context, event) {
                 continue;
             }
-            if suppress_terminal_input(text_editor_owns_input) {
-                continue;
-            }
-            let logical = keyboard_input_for_event(event);
+            let logical = keyboard_input_for_target(self.keyboard_target, event);
             if let Some(input) = logical {
                 match encode_input(&input, self.options.keyboard) {
                     Ok(bytes) if !bytes.is_empty() => {
@@ -327,7 +334,9 @@ impl EguiApp {
             && reader_route_available
             && self.runtime.transmit_idle()
         {
-            self.reader.confirm_transmitted();
+            if let Some(confirmed) = self.reader.confirm_transmitted() {
+                self.reader_view.push_confirmed(confirmed.byte);
+            }
             context.request_repaint_after(READER_FEED_INTERVAL);
         }
     }
@@ -432,10 +441,13 @@ impl EguiApp {
             } else {
                 "○ Disconnected"
             });
-            ui.add(
+            let port_response = ui.add(
                 egui::TextEdit::singleline(&mut self.options.serial_config.port)
                     .desired_width(70.0),
             );
+            if port_response.has_focus() {
+                self.keyboard_target = KeyboardTarget::UiText;
+            }
             egui::ComboBox::from_id_salt("serial-port-list")
                 .selected_text("Ports")
                 .show_ui(ui, |ui| {
@@ -501,6 +513,15 @@ impl EguiApp {
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
+        let focus_response = ui.interact(
+            ui.available_rect_before_wrap(),
+            ui.id().with("terminal-keyboard-target"),
+            egui::Sense::click(),
+        );
+        if focus_response.clicked() {
+            focus_response.request_focus();
+            self.keyboard_target = KeyboardTarget::Terminal;
+        }
         let wheel = ui.ctx().input(|input| input.smooth_scroll_delta.y);
         if ui.rect_contains_pointer(ui.max_rect()) && wheel != 0.0 {
             let bottom = self
@@ -609,6 +630,7 @@ impl EguiApp {
                     Ok(tape) => {
                         self.reader.clear_pending();
                         self.reader.reader_mut().load(tape);
+                        self.reader_view.clear();
                         self.reader_path = Some(path);
                         self.tape_error = None;
                     }
@@ -624,6 +646,7 @@ impl EguiApp {
             {
                 self.reader.clear_pending();
                 self.reader.reader_mut().unload();
+                self.reader_view.clear();
                 self.reader_path = None;
             }
             if ui
@@ -662,6 +685,7 @@ impl EguiApp {
             {
                 self.reader.clear_pending();
                 self.reader.reader_mut().rewind();
+                self.reader_view.clear();
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -710,16 +734,17 @@ impl EguiApp {
             percent,
             self.reader.reader().stop_cause()
         ));
-        if let Some(tape) = self.reader.reader().tape() {
+        if self.reader.reader().tape().is_some() {
             render_tape(
                 ui,
-                tape.bytes(),
-                self.reader.reader().position(),
+                self.reader_view.bytes(),
                 TapeRendererOptions {
                     max_rows: self.options.tape_reader.max_rows,
                     ghost_outline: self.options.tape_reader.ghost_outline,
                     bit_label_base: self.options.tape_reader.bit_label_base,
                     ascii_char_mask_msb: self.options.tape_reader.ascii_char_mask_msb,
+                    source_order: TapeSourceOrder::NewestFirst,
+                    mark_newest: true,
                     palette: self.theme.palette(),
                 },
             );
@@ -793,12 +818,13 @@ impl EguiApp {
         render_tape(
             ui,
             bytes,
-            bytes.len(),
             TapeRendererOptions {
                 max_rows: self.options.tape_punch.max_rows,
                 ghost_outline: self.options.tape_punch.ghost_outline,
                 bit_label_base: self.options.tape_punch.bit_label_base,
                 ascii_char_mask_msb: self.options.tape_punch.ascii_char_mask_msb,
+                source_order: TapeSourceOrder::OldestFirst,
+                mark_newest: false,
                 palette: self.theme.palette(),
             },
         );
@@ -941,7 +967,6 @@ impl eframe::App for EguiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.handle_keyboard(ui.ctx());
         let title = match self.runtime.connection_state() {
             ConnectionState::Connected => format!(
                 "ASR-33 Emulator using {}:{}",
@@ -977,6 +1002,7 @@ impl eframe::App for EguiApp {
             .frame(egui::Frame::new().fill(self.theme.palette().app_background))
             .show(ui, |ui| self.terminal(ui));
         self.undocked_tapes(ui.ctx());
+        self.handle_keyboard(ui.ctx());
     }
 
     fn on_exit(&mut self) {
@@ -1071,8 +1097,14 @@ fn keyboard_input_for_event(event: &egui::Event) -> Option<KeyboardInput> {
 }
 
 #[must_use]
-const fn suppress_terminal_input(text_editor_owns_input: bool) -> bool {
-    text_editor_owns_input
+const fn should_send_to_terminal(target: KeyboardTarget) -> bool {
+    matches!(target, KeyboardTarget::Terminal)
+}
+
+fn keyboard_input_for_target(target: KeyboardTarget, event: &egui::Event) -> Option<KeyboardInput> {
+    should_send_to_terminal(target)
+        .then(|| keyboard_input_for_event(event))
+        .flatten()
 }
 
 fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyboardInput> {
@@ -1134,8 +1166,8 @@ fn apply_tape_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_tape_shortcut, history_scroll_target, keyboard_input_for_event, repaint_delay,
-        suppress_terminal_input,
+        KeyboardTarget, apply_tape_shortcut, history_scroll_target, keyboard_input_for_event,
+        keyboard_input_for_target, repaint_delay, should_send_to_terminal,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
@@ -1246,9 +1278,22 @@ mod tests {
     }
 
     #[test]
-    fn focused_text_editor_suppresses_terminal_input() {
-        assert!(suppress_terminal_input(true));
-        assert!(!suppress_terminal_input(false));
+    fn explicit_keyboard_target_routes_text_and_releases_after_terminal_click() {
+        assert!(!should_send_to_terminal(KeyboardTarget::UiText));
+        assert!(should_send_to_terminal(KeyboardTarget::Terminal));
+        for character in "COM5".chars() {
+            assert_eq!(
+                keyboard_input_for_target(
+                    KeyboardTarget::UiText,
+                    &Event::Text(character.to_string())
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            keyboard_input_for_target(KeyboardTarget::Terminal, &Event::Text("A".to_owned())),
+            Some(KeyboardInput::Text("A".to_owned()))
+        );
     }
 
     #[test]
