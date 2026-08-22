@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use eframe::egui::{self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId};
+use eframe::egui::{self, Align2, FontData, FontDefinitions, FontFamily, FontId};
 
 use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
@@ -17,6 +17,8 @@ use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use crate::core::paper_tape::{PunchMode, ReaderOptions, ReaderState, TapeReader};
 
 use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
+use super::layout::{PanelPlacement, PanelPresentation, TerminalMetrics, clamped_dock_width};
+use super::theme::{ThemeKind, ThemePalette};
 
 const FONT_NAME: &str = "teletype-33";
 const IDLE_POLL: Duration = Duration::from_millis(16);
@@ -55,8 +57,9 @@ pub struct EguiApp {
     reader_path: Option<PathBuf>,
     punch: Option<PunchFile>,
     punch_mode: PunchMode,
-    reader_visible: bool,
-    punch_visible: bool,
+    reader_panel: PanelPresentation,
+    punch_panel: PanelPresentation,
+    theme: ThemeKind,
     tape_error: Option<String>,
     scroll_top: Option<usize>,
     scroll_request: bool,
@@ -90,8 +93,9 @@ impl EguiApp {
             reader_path: None,
             punch: None,
             punch_mode,
-            reader_visible: false,
-            punch_visible: false,
+            reader_panel: PanelPresentation::docked(),
+            punch_panel: PanelPresentation::docked(),
+            theme: ThemeKind::Light,
             tape_error: None,
             scroll_top: None,
             scroll_request: false,
@@ -100,6 +104,7 @@ impl EguiApp {
         };
         application.refresh_ports();
         application.connect_selected();
+        application.theme.apply(&creation_context.egui_ctx);
         application
     }
 
@@ -197,11 +202,11 @@ impl EguiApp {
         else {
             return false;
         };
+        if apply_tape_shortcut(*key, &mut self.reader_panel, &mut self.punch_panel) {
+            context.request_repaint();
+            return true;
+        }
         match key {
-            egui::Key::F1 => self.reader_visible = true,
-            egui::Key::F2 => self.reader_visible = false,
-            egui::Key::F3 => self.punch_visible = true,
-            egui::Key::F4 => self.punch_visible = false,
             egui::Key::F5 => {
                 self.options.throttle_mode = match self.options.throttle_mode {
                     ThrottleMode::Throttled => ThrottleMode::Unthrottled,
@@ -357,393 +362,506 @@ impl EguiApp {
 
     fn controls(&mut self, ui: &mut egui::Ui) {
         let connection = self.runtime.connection_state().clone();
-        ui.horizontal(|ui| {
-            ui.label(format!("Connection: {connection:?}"));
-            ui.separator();
-            ui.label("Port:");
-            ui.text_edit_singleline(&mut self.options.serial_config.port);
-            egui::ComboBox::from_id_salt("serial-port-list")
-                .selected_text("available")
-                .show_ui(ui, |ui| {
-                    for port in &self.available_ports {
-                        ui.selectable_value(
-                            &mut self.options.serial_config.port,
-                            port.clone(),
-                            port,
-                        );
+        let palette = self.theme.palette();
+        ui.horizontal_wrapped(|ui| {
+            ui.group(|ui| {
+                ui.label("Data Rate");
+                for (mode, label) in [
+                    (ThrottleMode::Throttled, "Throttled"),
+                    (ThrottleMode::Unthrottled, "Unthrottled"),
+                ] {
+                    if ui
+                        .selectable_label(self.options.throttle_mode == mode, label)
+                        .clicked()
+                    {
+                        self.options.throttle_mode = mode;
+                        self.submit(ui.ctx(), ApplicationCommand::SetThrottleMode(mode));
                     }
+                }
+            });
+            ui.add_enabled_ui(false, |ui| {
+                ui.group(|ui| {
+                    ui.label("Sound");
+                    ui.button("Unavailable")
+                        .on_disabled_hover_text("Audio not migrated yet");
                 });
-            if ui.button("Refresh ports").clicked() {
-                self.refresh_ports();
-            }
-            if connection != ConnectionState::Connected && ui.button("Connect").clicked() {
-                self.connect_selected();
-            }
-            if connection == ConnectionState::Connected && ui.button("Disconnect").clicked() {
-                self.disconnect();
+                ui.group(|ui| {
+                    ui.label("Lid");
+                    ui.button("Unavailable")
+                        .on_disabled_hover_text("Audio not migrated yet");
+                });
+            });
+            ui.group(|ui| {
+                ui.label("Comm Status");
+                if ui
+                    .selectable_label(
+                        self.options.communication_mode == CommunicationMode::Line,
+                        "LINE",
+                    )
+                    .clicked()
+                {
+                    self.change_communication_mode(ui.ctx(), CommunicationMode::Line);
+                }
+                if ui
+                    .selectable_label(
+                        self.options.communication_mode == CommunicationMode::Local,
+                        "LOCAL",
+                    )
+                    .clicked()
+                {
+                    self.change_communication_mode(ui.ctx(), CommunicationMode::Local);
+                }
+            });
+            ui.group(|ui| {
+                ui.label("Printer");
+                let printer_label = if self.options.printer_enabled {
+                    "ON"
+                } else {
+                    "OFF"
+                };
+                if ui.button(printer_label).clicked() {
+                    self.options.printer_enabled = !self.options.printer_enabled;
+                    self.submit(
+                        ui.ctx(),
+                        ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
+                    );
+                }
+            });
+            ui.group(|ui| {
+                let connected = connection == ConnectionState::Connected;
+                ui.label(if connected {
+                    "● Connected"
+                } else {
+                    "○ Disconnected"
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.options.serial_config.port)
+                        .desired_width(70.0),
+                );
+                egui::ComboBox::from_id_salt("serial-port-list")
+                    .selected_text("Ports")
+                    .show_ui(ui, |ui| {
+                        for port in &self.available_ports {
+                            ui.selectable_value(
+                                &mut self.options.serial_config.port,
+                                port.clone(),
+                                port,
+                            );
+                        }
+                    });
+                if ui
+                    .small_button("↻")
+                    .on_hover_text("Refresh serial ports")
+                    .clicked()
+                {
+                    self.refresh_ports();
+                }
+                if !connected && ui.button("Connect").clicked() {
+                    self.connect_selected();
+                }
+                if connected && ui.button("Disconnect").clicked() {
+                    self.disconnect();
+                }
+            });
+            ui.separator();
+            ui.label("Theme");
+            for (theme, label) in [(ThemeKind::Light, "Light"), (ThemeKind::Dark, "Dark")] {
+                if ui.selectable_label(self.theme == theme, label).clicked() {
+                    self.theme = theme;
+                    theme.apply(ui.ctx());
+                    ui.ctx().request_repaint();
+                }
             }
         });
-        ui.label(format!(
-            "{} baud, {:?} data bits, {:?} parity, {:?} stop bits",
-            self.options.serial_config.baudrate,
-            self.options.serial_config.databits,
-            self.options.serial_config.parity,
-            self.options.serial_config.stopbits
-        ));
-        if let ConnectionState::Failed { message } = &connection {
-            ui.colored_label(
-                Color32::LIGHT_RED,
-                format!("Last connection error: {message}"),
-            );
-        }
-        if let Some(error) = &self.port_error {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        }
-        ui.horizontal(|ui| {
-            ui.label(&self.options.backend_label);
-            ui.separator();
-            ui.label(format!("runtime: {:?}", self.runtime.state()));
-            ui.separator();
-
-            if ui
-                .selectable_label(
-                    self.options.communication_mode == CommunicationMode::Line,
-                    "LINE",
-                )
-                .clicked()
-            {
-                self.change_communication_mode(ui.ctx(), CommunicationMode::Line);
-            }
-            if ui
-                .selectable_label(
-                    self.options.communication_mode == CommunicationMode::Local,
-                    "LOCAL",
-                )
-                .clicked()
-            {
-                self.change_communication_mode(ui.ctx(), CommunicationMode::Local);
-            }
-            ui.separator();
-            if ui
-                .selectable_label(
-                    self.options.throttle_mode == ThrottleMode::Throttled,
-                    "THROTTLED",
-                )
-                .clicked()
-            {
-                self.options.throttle_mode = ThrottleMode::Throttled;
-                self.submit(
-                    ui.ctx(),
-                    ApplicationCommand::SetThrottleMode(ThrottleMode::Throttled),
-                );
-            }
-            if ui
-                .selectable_label(
-                    self.options.throttle_mode == ThrottleMode::Unthrottled,
-                    "UNTHROTTLED",
-                )
-                .clicked()
-            {
-                self.options.throttle_mode = ThrottleMode::Unthrottled;
-                self.submit(
-                    ui.ctx(),
-                    ApplicationCommand::SetThrottleMode(ThrottleMode::Unthrottled),
-                );
-            }
-            ui.separator();
-            let printer_label = if self.options.printer_enabled {
-                "PRINTER ON"
-            } else {
-                "PRINTER OFF"
-            };
-            if ui.button(printer_label).clicked() {
-                self.options.printer_enabled = !self.options.printer_enabled;
-                self.submit(
-                    ui.ctx(),
-                    ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
-                );
-            }
-        });
-        if let Some(error) = &self.transport_error {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        }
-        if let Some(error) = &self.tape_error {
-            ui.colored_label(Color32::LIGHT_RED, error);
+        let error = self
+            .transport_error
+            .as_ref()
+            .or(self.port_error.as_ref())
+            .or(self.tape_error.as_ref())
+            .cloned();
+        if let Some(error) = error {
+            ui.horizontal(|ui| {
+                ui.colored_label(palette.error, error);
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Dismiss message")
+                    .clicked()
+                {
+                    self.transport_error = None;
+                    self.port_error = None;
+                    self.tape_error = None;
+                }
+            });
         }
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
+        let wheel = ui.ctx().input(|input| input.smooth_scroll_delta.y);
+        if ui.rect_contains_pointer(ui.max_rect()) && wheel != 0.0 {
+            let bottom = self
+                .runtime
+                .terminal()
+                .line_history()
+                .len()
+                .saturating_sub(self.runtime.terminal().height());
+            self.scroll_top = history_scroll_target(self.scroll_top, bottom, wheel);
+            self.scroll_request = true;
+        }
         let scroll_top = self.scroll_top;
         let scroll_request = self.scroll_request;
         self.scroll_request = false;
         let terminal = self.runtime.terminal();
         let history = terminal.line_history();
         let (cursor_column, cursor_line) = terminal.cursor_position();
+        let palette = self.theme.palette();
         let font = FontId::new(self.options.font_size, FontFamily::Name(FONT_NAME.into()));
-        let row_height = self.options.font_size * 1.25;
-        let cell_width = self.options.font_size * 0.62;
+        let measured_width = ui.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap("M".to_owned(), font.clone(), palette.text)
+                .size()
+                .x
+        });
+        let metrics = TerminalMetrics::from_measured_width(measured_width, 1.0);
+        let row_height = metrics.cell_height;
+        let cell_width = metrics.cell_width;
         let rendered_rows = history.len().max(terminal.height());
         let grid_size = egui::vec2(
             cell_width * terminal.width() as f32,
             row_height * rendered_rows as f32,
         );
 
-        egui::ScrollArea::both()
-            .stick_to_bottom(scroll_top.is_none())
-            .auto_shrink([false, false])
+        egui::Frame::new()
+            .fill(palette.paper)
+            .inner_margin(metrics.margin)
             .show(ui, |ui| {
-                let (rect, _) = ui.allocate_exact_size(grid_size, egui::Sense::hover());
-                if scroll_request {
-                    let row = scroll_top.unwrap_or_else(|| history.len().saturating_sub(1));
-                    let target = egui::Rect::from_min_size(
-                        egui::pos2(rect.left(), rect.top() + row as f32 * row_height),
-                        egui::vec2(cell_width, row_height),
-                    );
-                    ui.scroll_to_rect(target, Some(egui::Align::TOP));
-                }
-                let painter = ui.painter_at(rect);
-                for (row, line) in history.lines().iter().enumerate() {
-                    let y = rect.top() + row as f32 * row_height;
-                    for column in 0..line.width() {
-                        let position = egui::pos2(rect.left() + column as f32 * cell_width, y);
-                        for character in line.strike_stack(column) {
-                            painter.text(
-                                position,
-                                Align2::LEFT_TOP,
-                                character,
-                                font.clone(),
-                                Color32::LIGHT_GRAY,
+                egui::ScrollArea::both()
+                    .stick_to_bottom(scroll_top.is_none())
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let (rect, _) = ui.allocate_exact_size(grid_size, egui::Sense::hover());
+                        if scroll_request {
+                            let row = scroll_top.unwrap_or_else(|| history.len().saturating_sub(1));
+                            let target = egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), rect.top() + row as f32 * row_height),
+                                egui::vec2(cell_width, row_height),
                             );
+                            ui.scroll_to_rect(target, Some(egui::Align::TOP));
                         }
-                    }
-                    if line.logical_number() == cursor_line {
-                        let cursor = egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + cursor_column as f32 * cell_width, y),
-                            egui::vec2(cell_width, row_height),
-                        );
-                        painter.rect_stroke(
-                            cursor,
-                            0.0,
-                            egui::Stroke::new(1.0, Color32::LIGHT_GREEN),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                }
+                        let painter = ui.painter_at(rect);
+                        for (row, line) in history.lines().iter().enumerate() {
+                            let y = rect.top() + row as f32 * row_height;
+                            for column in 0..line.width() {
+                                let position =
+                                    egui::pos2(rect.left() + column as f32 * cell_width, y);
+                                for character in line.strike_stack(column) {
+                                    painter.text(
+                                        position,
+                                        Align2::LEFT_TOP,
+                                        character,
+                                        font.clone(),
+                                        palette.text,
+                                    );
+                                }
+                            }
+                            if line.logical_number() == cursor_line {
+                                let cursor = egui::Rect::from_min_size(
+                                    egui::pos2(rect.left() + cursor_column as f32 * cell_width, y),
+                                    egui::vec2(cell_width, row_height),
+                                );
+                                painter.rect_stroke(
+                                    cursor,
+                                    0.0,
+                                    egui::Stroke::new(1.0, palette.cursor),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                        }
+                    });
             });
+        if self.scroll_top.is_some() {
+            let rect = ui.max_rect();
+            let badge = egui::Rect::from_min_size(
+                rect.right_top() + egui::vec2(-142.0, 8.0),
+                egui::vec2(134.0, 24.0),
+            );
+            ui.painter().rect_filled(badge, 3.0, palette.text);
+            ui.painter().text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                "VIEWING HISTORY",
+                FontId::proportional(12.0),
+                palette.paper,
+            );
+        }
     }
 
-    fn paper_tape_windows(&mut self, context: &egui::Context) {
-        let mut reader_open = self.reader_visible;
-        egui::Window::new("Paper Tape Reader")
-            .open(&mut reader_open)
-            .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Load").clicked()
-                        && let Some(path) =
-                            reader_dialog(&self.options.tape_reader.initial_file_path)
-                    {
-                        match load_reader_file(&path) {
-                            Ok(tape) => {
-                                self.reader.clear_pending();
-                                self.reader.reader_mut().load(tape);
-                                self.reader_path = Some(path);
-                                self.tape_error = None;
-                            }
-                            Err(error) => {
-                                self.tape_error = Some(format!("reader load failed: {error}"))
-                            }
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            self.reader.reader().tape().is_some(),
-                            egui::Button::new("Unload"),
-                        )
-                        .clicked()
-                    {
+    fn reader_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Load").clicked()
+                && let Some(path) = reader_dialog(&self.options.tape_reader.initial_file_path)
+            {
+                match load_reader_file(&path) {
+                    Ok(tape) => {
                         self.reader.clear_pending();
-                        self.reader.reader_mut().unload();
-                        self.reader_path = None;
+                        self.reader.reader_mut().load(tape);
+                        self.reader_path = Some(path);
+                        self.tape_error = None;
                     }
-                    if ui
-                        .add_enabled(
-                            self.reader.reader().state() == ReaderState::Stopped,
-                            egui::Button::new("ON"),
-                        )
-                        .clicked()
-                    {
-                        let offline_line = self.options.communication_mode
-                            == CommunicationMode::Line
-                            && self.runtime.connection_state() != &ConnectionState::Connected;
-                        if offline_line {
-                            self.tape_error =
-                                Some("reader cannot start: LINE mode is disconnected".to_owned());
-                        } else {
-                            self.reader.reader_mut().start();
-                            self.tape_error = None;
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            self.reader.reader().state() == ReaderState::Running,
-                            egui::Button::new("OFF"),
-                        )
-                        .clicked()
-                    {
-                        self.reader.reader_mut().stop();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.reader.reader().state() == ReaderState::Stopped
-                                && self.reader.reader().position() > 0,
-                            egui::Button::new("Rewind"),
-                        )
-                        .clicked()
-                    {
-                        self.reader.clear_pending();
-                        self.reader.reader_mut().rewind();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut self.options.tape_reader.auto_stop, "Auto-stop")
-                        .changed()
-                    {
-                        self.reader
-                            .reader_mut()
-                            .set_auto_stop(self.options.tape_reader.auto_stop);
-                    }
-                    if ui
-                        .checkbox(
-                            &mut self.options.tape_reader.skip_leading_nulls,
-                            "Skip leading nulls",
-                        )
-                        .changed()
-                    {
-                        self.reader
-                            .reader_mut()
-                            .set_skip_leading_nulls(self.options.tape_reader.skip_leading_nulls);
-                    }
-                    if ui
-                        .checkbox(&mut self.options.tape_reader.set_msb, "Set MSB")
-                        .changed()
-                    {
-                        self.reader
-                            .reader_mut()
-                            .set_msb(self.options.tape_reader.set_msb);
-                    }
-                });
-                let length = self.reader.reader().tape().map_or(0, |tape| tape.len());
-                let percent = if length == 0 {
-                    0.0
-                } else {
-                    100.0 * self.reader.reader().position() as f32 / length as f32
-                };
-                ui.label(format!(
-                    "File: {}",
-                    display_path(self.reader_path.as_deref())
-                ));
-                ui.label(format!(
-                    "{} bytes, position {}, {:.1}%, {:?}",
-                    length,
-                    self.reader.reader().position(),
-                    percent,
-                    self.reader.reader().stop_cause()
-                ));
-                if let Some(tape) = self.reader.reader().tape() {
-                    tape_view(
-                        ui,
-                        tape.bytes(),
-                        self.reader.reader().position(),
-                        self.options.tape_reader.max_rows,
-                        self.options.tape_reader.ghost_outline,
-                        self.options.tape_reader.bit_label_base,
-                        self.options.tape_reader.ascii_char_mask_msb,
-                    );
+                    Err(error) => self.tape_error = Some(format!("reader load failed: {error}")),
                 }
-            });
-        self.reader_visible = reader_open;
+            }
+            if ui
+                .add_enabled(
+                    self.reader.reader().tape().is_some(),
+                    egui::Button::new("Unload"),
+                )
+                .clicked()
+            {
+                self.reader.clear_pending();
+                self.reader.reader_mut().unload();
+                self.reader_path = None;
+            }
+            if ui
+                .add_enabled(
+                    self.reader.reader().state() == ReaderState::Stopped,
+                    egui::Button::new("ON"),
+                )
+                .clicked()
+            {
+                let offline_line = self.options.communication_mode == CommunicationMode::Line
+                    && self.runtime.connection_state() != &ConnectionState::Connected;
+                if offline_line {
+                    self.tape_error =
+                        Some("reader cannot start: LINE mode is disconnected".to_owned());
+                } else {
+                    self.reader.reader_mut().start();
+                    self.tape_error = None;
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.reader.reader().state() == ReaderState::Running,
+                    egui::Button::new("OFF"),
+                )
+                .clicked()
+            {
+                self.reader.reader_mut().stop();
+            }
+            if ui
+                .add_enabled(
+                    self.reader.reader().state() == ReaderState::Stopped
+                        && self.reader.reader().position() > 0,
+                    egui::Button::new("Rewind"),
+                )
+                .clicked()
+            {
+                self.reader.clear_pending();
+                self.reader.reader_mut().rewind();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.options.tape_reader.auto_stop, "Auto-stop")
+                .changed()
+            {
+                self.reader
+                    .reader_mut()
+                    .set_auto_stop(self.options.tape_reader.auto_stop);
+            }
+            if ui
+                .checkbox(
+                    &mut self.options.tape_reader.skip_leading_nulls,
+                    "Skip leading nulls",
+                )
+                .changed()
+            {
+                self.reader
+                    .reader_mut()
+                    .set_skip_leading_nulls(self.options.tape_reader.skip_leading_nulls);
+            }
+            if ui
+                .checkbox(&mut self.options.tape_reader.set_msb, "Set MSB")
+                .changed()
+            {
+                self.reader
+                    .reader_mut()
+                    .set_msb(self.options.tape_reader.set_msb);
+            }
+        });
+        let length = self.reader.reader().tape().map_or(0, |tape| tape.len());
+        let percent = if length == 0 {
+            0.0
+        } else {
+            100.0 * self.reader.reader().position() as f32 / length as f32
+        };
+        ui.label(format!(
+            "File: {}",
+            display_path(self.reader_path.as_deref())
+        ));
+        ui.label(format!(
+            "{} bytes, position {}, {:.1}%, {:?}",
+            length,
+            self.reader.reader().position(),
+            percent,
+            self.reader.reader().stop_cause()
+        ));
+        if let Some(tape) = self.reader.reader().tape() {
+            tape_view(
+                ui,
+                tape.bytes(),
+                self.reader.reader().position(),
+                TapeViewOptions {
+                    max_rows: self.options.tape_reader.max_rows,
+                    ghost_outline: self.options.tape_reader.ghost_outline,
+                    bit_label_base: self.options.tape_reader.bit_label_base,
+                    ascii_char_mask_msb: self.options.tape_reader.ascii_char_mask_msb,
+                    palette: self.theme.palette(),
+                },
+            );
+        }
+    }
 
-        let mut punch_open = self.punch_visible;
-        egui::Window::new("Paper Tape Punch")
-            .open(&mut punch_open)
-            .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Select/Load").clicked()
-                        && let Some(path) = punch_dialog(&self.options.tape_punch.initial_file_path)
-                    {
-                        match PunchFile::open(&path, self.punch_mode) {
-                            Ok(punch) => {
-                                self.punch = Some(punch);
-                                self.tape_error = None;
-                            }
-                            Err(error) => {
-                                self.tape_error = Some(format!("punch open failed: {error}"))
-                            }
-                        }
+    fn punch_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Select/Load").clicked()
+                && let Some(path) = punch_dialog(&self.options.tape_punch.initial_file_path)
+            {
+                match PunchFile::open(&path, self.punch_mode) {
+                    Ok(punch) => {
+                        self.punch = Some(punch);
+                        self.tape_error = None;
                     }
-                    if ui
-                        .add_enabled(self.punch.is_some(), egui::Button::new("Unload"))
-                        .clicked()
-                    {
-                        self.punch = None;
+                    Err(error) => self.tape_error = Some(format!("punch open failed: {error}")),
+                }
+            }
+            if ui
+                .add_enabled(self.punch.is_some(), egui::Button::new("Unload"))
+                .clicked()
+            {
+                self.punch = None;
+            }
+            let stopped = self
+                .punch
+                .as_ref()
+                .is_some_and(|p| p.state() != crate::core::paper_tape::PunchState::Running);
+            if ui.add_enabled(stopped, egui::Button::new("ON")).clicked()
+                && let Some(punch) = self.punch.as_mut()
+            {
+                punch.start();
+            }
+            let running = self
+                .punch
+                .as_ref()
+                .is_some_and(|p| p.state() == crate::core::paper_tape::PunchState::Running);
+            if ui.add_enabled(running, egui::Button::new("OFF")).clicked()
+                && let Some(punch) = self.punch.as_mut()
+            {
+                punch.stop();
+            }
+        });
+        ui.horizontal(|ui| {
+            for (mode, label) in [
+                (PunchMode::Append, "Append"),
+                (PunchMode::Overwrite, "Overwrite"),
+            ] {
+                if ui
+                    .selectable_label(self.punch_mode == mode, label)
+                    .clicked()
+                {
+                    self.punch_mode = mode;
+                    if let Some(punch) = self.punch.as_mut() {
+                        punch.set_mode(mode);
                     }
-                    let stopped = self
-                        .punch
-                        .as_ref()
-                        .is_some_and(|p| p.state() != crate::core::paper_tape::PunchState::Running);
-                    if ui.add_enabled(stopped, egui::Button::new("ON")).clicked()
-                        && let Some(punch) = self.punch.as_mut()
-                    {
-                        punch.start();
-                    }
-                    let running = self
-                        .punch
-                        .as_ref()
-                        .is_some_and(|p| p.state() == crate::core::paper_tape::PunchState::Running);
-                    if ui.add_enabled(running, egui::Button::new("OFF")).clicked()
-                        && let Some(punch) = self.punch.as_mut()
-                    {
-                        punch.stop();
-                    }
+                }
+            }
+        });
+        let (path, bytes) = self
+            .punch
+            .as_ref()
+            .map_or((None, &[][..]), |p| (Some(p.path()), p.bytes()));
+        ui.label(format!("File: {}", display_path(path)));
+        ui.label(format!(
+            "{} bytes, {:?}",
+            bytes.len(),
+            self.punch.as_ref().map(PunchFile::state)
+        ));
+        tape_view(
+            ui,
+            bytes,
+            bytes.len(),
+            TapeViewOptions {
+                max_rows: self.options.tape_punch.max_rows,
+                ghost_outline: self.options.tape_punch.ghost_outline,
+                bit_label_base: self.options.tape_punch.bit_label_base,
+                ascii_char_mask_msb: self.options.tape_punch.ascii_char_mask_msb,
+                palette: self.theme.palette(),
+            },
+        );
+    }
+
+    fn panel_header(ui: &mut egui::Ui, placement: &mut PanelPresentation) {
+        ui.horizontal(|ui| {
+            if placement.placement() == PanelPlacement::Docked {
+                if ui.small_button("Undock").clicked() {
+                    placement.undock();
+                }
+            } else if ui.small_button("Dock").clicked() {
+                placement.dock();
+            }
+            if ui.small_button("Hide").clicked() {
+                placement.hide();
+            }
+        });
+    }
+
+    fn docked_tapes(&mut self, ui: &mut egui::Ui) {
+        if self.punch_panel.placement() == PanelPlacement::Docked {
+            ui.heading("Paper Tape Punch");
+            Self::panel_header(ui, &mut self.punch_panel);
+            self.punch_contents(ui);
+            ui.separator();
+        }
+        if self.reader_panel.placement() == PanelPlacement::Docked {
+            ui.heading("Paper Tape Reader");
+            Self::panel_header(ui, &mut self.reader_panel);
+            self.reader_contents(ui);
+        }
+    }
+
+    fn undocked_tapes(&mut self, context: &egui::Context) {
+        let palette = self.theme.palette();
+        let window_frame = egui::Frame::new()
+            .fill(palette.paper)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .inner_margin(10.0);
+        if self.reader_panel.placement() == PanelPlacement::Undocked {
+            let mut open = true;
+            egui::Window::new("Paper Tape Reader")
+                .open(&mut open)
+                .default_width(330.0)
+                .frame(window_frame)
+                .show(context, |ui| {
+                    Self::panel_header(ui, &mut self.reader_panel);
+                    self.reader_contents(ui);
                 });
-                ui.horizontal(|ui| {
-                    for (mode, label) in [
-                        (PunchMode::Append, "Append"),
-                        (PunchMode::Overwrite, "Overwrite"),
-                    ] {
-                        if ui
-                            .selectable_label(self.punch_mode == mode, label)
-                            .clicked()
-                        {
-                            self.punch_mode = mode;
-                            if let Some(punch) = self.punch.as_mut() {
-                                punch.set_mode(mode);
-                            }
-                        }
-                    }
+            if !open {
+                self.reader_panel.hide();
+            }
+        }
+        if self.punch_panel.placement() == PanelPlacement::Undocked {
+            let mut open = true;
+            egui::Window::new("Paper Tape Punch")
+                .open(&mut open)
+                .default_width(330.0)
+                .frame(window_frame)
+                .show(context, |ui| {
+                    Self::panel_header(ui, &mut self.punch_panel);
+                    self.punch_contents(ui);
                 });
-                let (path, bytes) = self
-                    .punch
-                    .as_ref()
-                    .map_or((None, &[][..]), |p| (Some(p.path()), p.bytes()));
-                ui.label(format!("File: {}", display_path(path)));
-                ui.label(format!(
-                    "{} bytes, {:?}",
-                    bytes.len(),
-                    self.punch.as_ref().map(PunchFile::state)
-                ));
-                tape_view(
-                    ui,
-                    bytes,
-                    bytes.len(),
-                    self.options.tape_punch.max_rows,
-                    self.options.tape_punch.ghost_outline,
-                    self.options.tape_punch.bit_label_base,
-                    self.options.tape_punch.ascii_char_mask_msb,
-                );
-            });
-        self.punch_visible = punch_open;
+            if !open {
+                self.punch_panel.hide();
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -771,9 +889,39 @@ impl eframe::App for EguiApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_keyboard(ui.ctx());
-        egui::Panel::top("status").show(ui, |ui| self.controls(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.terminal(ui));
-        self.paper_tape_windows(ui.ctx());
+        let title = match self.runtime.connection_state() {
+            ConnectionState::Connected => format!(
+                "ASR-33 Emulator using {}:{}",
+                self.options.serial_config.port, self.options.serial_config.baudrate
+            ),
+            _ => "ASR-33 Emulator — Disconnected".to_owned(),
+        };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(title));
+        egui::Panel::bottom("operation-bar")
+            .resizable(false)
+            .show(ui, |ui| self.controls(ui));
+        if self.reader_panel.placement() == PanelPlacement::Docked
+            || self.punch_panel.placement() == PanelPlacement::Docked
+        {
+            let width = clamped_dock_width(ui.available_width());
+            egui::Panel::left("paper-tape-dock")
+                .default_size(width)
+                .min_size(180.0)
+                .resizable(true)
+                .frame(
+                    egui::Frame::new()
+                        .fill(self.theme.palette().paper)
+                        .inner_margin(10.0),
+                )
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.docked_tapes(ui));
+                });
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(self.theme.palette().app_background))
+            .show(ui, |ui| self.terminal(ui));
+        self.undocked_tapes(ui.ctx());
     }
 
     fn on_exit(&mut self) {
@@ -836,17 +984,28 @@ fn visible_tape_rows(bytes: &[u8], max_rows: usize) -> (usize, &[u8]) {
     (start, &bytes[start..])
 }
 
-fn tape_view(
-    ui: &mut egui::Ui,
-    bytes: &[u8],
-    position: usize,
+fn history_scroll_target(current: Option<usize>, bottom: usize, wheel: f32) -> Option<usize> {
+    let current = current.unwrap_or(bottom);
+    let next = if wheel > 0.0 {
+        current.saturating_sub(3)
+    } else {
+        current.saturating_add(3).min(bottom)
+    };
+    (next < bottom).then_some(next)
+}
+
+#[derive(Clone, Copy)]
+struct TapeViewOptions {
     max_rows: usize,
     ghost_outline: bool,
     bit_label_base: BitLabelBase,
     ascii_char_mask_msb: bool,
-) {
-    let (start, visible) = visible_tape_rows(bytes, max_rows);
-    let labels = match bit_label_base {
+    palette: ThemePalette,
+}
+
+fn tape_view(ui: &mut egui::Ui, bytes: &[u8], position: usize, options: TapeViewOptions) {
+    let (start, visible) = visible_tape_rows(bytes, options.max_rows);
+    let labels = match options.bit_label_base {
         BitLabelBase::Zero => ["7", "6", "5", "4", "3", "2", "1", "0"],
         BitLabelBase::One => ["8", "7", "6", "5", "4", "3", "2", "1"],
     };
@@ -873,15 +1032,22 @@ fn tape_view(
                             let punched = byte & (1 << bit) != 0;
                             let mark = if punched {
                                 "●"
-                            } else if ghost_outline {
+                            } else if options.ghost_outline {
                                 "○"
                             } else {
                                 " "
                             };
-                            ui.monospace(mark);
+                            ui.colored_label(
+                                if punched {
+                                    options.palette.tape_hole
+                                } else {
+                                    options.palette.tape_ghost
+                                },
+                                egui::RichText::new(mark).monospace(),
+                            );
                         }
                         ui.monospace("•");
-                        let character = if ascii_char_mask_msb {
+                        let character = if options.ascii_char_mask_msb {
                             byte & 0x7f
                         } else {
                             byte
@@ -952,11 +1118,32 @@ fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyboardInput> 
     }
 }
 
+fn apply_tape_shortcut(
+    key: egui::Key,
+    reader: &mut PanelPresentation,
+    punch: &mut PanelPresentation,
+) -> bool {
+    match key {
+        egui::Key::F1 => reader.show(),
+        egui::Key::F2 => reader.hide(),
+        egui::Key::F3 => punch.show(),
+        egui::Key::F4 => punch.hide(),
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{keyboard_input_for_event, repaint_delay, visible_tape_rows};
+    use super::{
+        apply_tape_shortcut, history_scroll_target, keyboard_input_for_event, repaint_delay,
+        visible_tape_rows,
+    };
+    use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
+    use crate::core::paper_tape::{PaperTape, PunchMode, ReaderOptions, ReaderState, TapeReader};
     use crate::ui::keyboard::KeyboardInput;
+    use crate::ui::layout::{PanelPlacement, PanelPresentation};
     use eframe::egui::{Event, Key, Modifiers};
     use std::time::Duration;
 
@@ -1066,5 +1253,45 @@ mod tests {
         assert_eq!(visible_tape_rows(&bytes, 3), (2, &bytes[2..]));
         assert_eq!(visible_tape_rows(&bytes, 0), (5, &bytes[5..]));
         assert_eq!(visible_tape_rows(&bytes, 99), (0, &bytes[..]));
+    }
+
+    #[test]
+    fn f1_f2_and_f3_f4_preserve_tape_visibility_semantics() {
+        let mut reader = PanelPresentation::docked();
+        let mut punch = PanelPresentation::docked();
+        assert!(apply_tape_shortcut(Key::F2, &mut reader, &mut punch));
+        assert_eq!(reader.placement(), PanelPlacement::Hidden);
+        assert!(apply_tape_shortcut(Key::F1, &mut reader, &mut punch));
+        assert_eq!(reader.placement(), PanelPlacement::Docked);
+        punch.undock();
+        assert!(apply_tape_shortcut(Key::F4, &mut reader, &mut punch));
+        assert_eq!(punch.placement(), PanelPlacement::Hidden);
+        assert!(apply_tape_shortcut(Key::F3, &mut reader, &mut punch));
+        assert_eq!(punch.placement(), PanelPlacement::Undocked);
+    }
+
+    #[test]
+    fn mouse_history_scroll_enters_and_leaves_history_view() {
+        assert_eq!(history_scroll_target(None, 20, 1.0), Some(17));
+        assert_eq!(history_scroll_target(Some(17), 20, -1.0), None);
+    }
+
+    #[test]
+    fn placement_changes_preserve_real_reader_and_punch_state() {
+        let mut reader = TapeReader::new(ReaderOptions::default());
+        reader.load(PaperTape::new(b"ABC".to_vec()));
+        assert!(reader.start());
+        let _ = reader.step();
+        let directory = tempfile::tempdir().expect("temporary tape directory");
+        let mut punch = PunchFile::open(&directory.path().join("out.pt"), PunchMode::Append)
+            .expect("punch file opens");
+        assert!(punch.start());
+        let mut placement = PanelPresentation::docked();
+        placement.undock();
+        placement.hide();
+        placement.show();
+        assert_eq!(reader.position(), 1);
+        assert_eq!(reader.state(), ReaderState::Running);
+        assert_eq!(punch.state(), crate::core::paper_tape::PunchState::Running);
     }
 }

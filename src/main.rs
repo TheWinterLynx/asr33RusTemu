@@ -77,9 +77,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         serial_config,
     };
     let title = ui_options.title.clone();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 780.0])
+            .with_min_inner_size([720.0, 480.0])
+            .with_resizable(true),
+        ..Default::default()
+    };
     eframe::run_native(
         &title,
-        eframe::NativeOptions::default(),
+        native_options,
         Box::new(move |context| Ok(Box::new(EguiApp::new(context, runtime, ui_options)))),
     )
     .map_err(|error| io::Error::other(format!("eframe failed: {error}")))?;
