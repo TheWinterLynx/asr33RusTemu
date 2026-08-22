@@ -18,7 +18,9 @@ use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 use super::layout::{
     DockSplitState, DockWidthState, PanelPlacement, PanelPresentation, TerminalMetrics,
 };
-use super::tape_view::{TapeRendererOptions, TapeSourceOrder, TapeViewHistory, render_tape};
+use super::tape_view::{
+    ReaderTapeViewState, TapeRendererOptions, TapeSourceOrder, render_reader_tape, render_tape,
+};
 use super::theme::ThemeKind;
 
 const FONT_NAME: &str = "teletype-33";
@@ -69,7 +71,8 @@ pub struct EguiApp {
     theme: ThemeKind,
     dock_split: DockSplitState,
     dock_width: DockWidthState,
-    reader_view: TapeViewHistory,
+    reader_view: ReaderTapeViewState,
+    reader_seek_position: usize,
     keyboard_target: KeyboardTarget,
     tape_error: Option<String>,
     scroll_top: Option<usize>,
@@ -95,7 +98,6 @@ impl EguiApp {
             PunchConfigMode::Append => PunchMode::Append,
             PunchConfigMode::Overwrite => PunchMode::Overwrite,
         };
-        let reader_view = TapeViewHistory::new(options.tape_reader.max_rows);
         let mut application = Self {
             runtime,
             options,
@@ -110,7 +112,8 @@ impl EguiApp {
             theme: ThemeKind::Light,
             dock_split: DockSplitState::default(),
             dock_width: DockWidthState::default(),
-            reader_view,
+            reader_view: ReaderTapeViewState::default(),
+            reader_seek_position: 0,
             keyboard_target: KeyboardTarget::Terminal,
             tape_error: None,
             scroll_top: None,
@@ -334,9 +337,8 @@ impl EguiApp {
             && reader_route_available
             && self.runtime.transmit_idle()
         {
-            if let Some(confirmed) = self.reader.confirm_transmitted() {
-                self.reader_view.push_confirmed(confirmed.byte);
-            }
+            self.reader.confirm_transmitted();
+            self.reader_seek_position = self.reader.reader().position();
             context.request_repaint_after(READER_FEED_INTERVAL);
         }
     }
@@ -630,7 +632,8 @@ impl EguiApp {
                     Ok(tape) => {
                         self.reader.clear_pending();
                         self.reader.reader_mut().load(tape);
-                        self.reader_view.clear();
+                        self.reader_view.reset();
+                        self.reader_seek_position = 0;
                         self.reader_path = Some(path);
                         self.tape_error = None;
                     }
@@ -646,7 +649,8 @@ impl EguiApp {
             {
                 self.reader.clear_pending();
                 self.reader.reader_mut().unload();
-                self.reader_view.clear();
+                self.reader_view.reset();
+                self.reader_seek_position = 0;
                 self.reader_path = None;
             }
             if ui
@@ -663,6 +667,8 @@ impl EguiApp {
                         Some("reader cannot start: LINE mode is disconnected".to_owned());
                 } else {
                     self.reader.reader_mut().start();
+                    self.reader_seek_position = self.reader.reader().position();
+                    self.reader_view.follow_reader();
                     self.tape_error = None;
                 }
             }
@@ -685,7 +691,8 @@ impl EguiApp {
             {
                 self.reader.clear_pending();
                 self.reader.reader_mut().rewind();
-                self.reader_view.clear();
+                self.reader_view.follow_reader();
+                self.reader_seek_position = 0;
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -734,20 +741,65 @@ impl EguiApp {
             percent,
             self.reader.reader().stop_cause()
         ));
-        if self.reader.reader().tape().is_some() {
-            render_tape(
+        let stopped = self.reader.reader().state() == ReaderState::Stopped;
+        ui.horizontal(|ui| {
+            ui.label("Position:");
+            let length = self.reader.reader().tape().map_or(0, |tape| tape.len());
+            ui.add_enabled(
+                stopped,
+                egui::DragValue::new(&mut self.reader_seek_position).range(0..=length),
+            )
+            .on_hover_text("Stored byte offset; changing this does not transmit data");
+            if ui.add_enabled(stopped, egui::Button::new("Go")).clicked() {
+                self.seek_reader(self.reader_seek_position);
+            }
+            if ui.add_enabled(stopped, egui::Button::new("▲")).clicked() {
+                self.seek_reader(self.reader.reader().position().saturating_sub(1));
+            }
+            if ui.add_enabled(stopped, egui::Button::new("▼")).clicked() {
+                self.seek_reader((self.reader.reader().position() + 1).min(length));
+            }
+            if ui.button("Follow reader").clicked() {
+                self.reader_view.follow_reader();
+            }
+            if !self.reader_view.follows_reader() {
+                ui.label("Viewing tape history");
+            }
+        });
+        let requested_seek = if let Some(tape) = self.reader.reader().tape() {
+            render_reader_tape(
                 ui,
-                self.reader_view.bytes(),
+                tape.bytes(),
+                self.reader.reader().position(),
+                self.reader.reader().state() == ReaderState::Running,
+                self.options.tape_reader.set_msb,
+                &mut self.reader_view,
                 TapeRendererOptions {
                     max_rows: self.options.tape_reader.max_rows,
                     ghost_outline: self.options.tape_reader.ghost_outline,
                     bit_label_base: self.options.tape_reader.bit_label_base,
                     ascii_char_mask_msb: self.options.tape_reader.ascii_char_mask_msb,
                     source_order: TapeSourceOrder::NewestFirst,
-                    mark_newest: true,
+                    mark_newest: false,
                     palette: self.theme.palette(),
                 },
-            );
+            )
+        } else {
+            None
+        };
+        if let Some(position) = requested_seek {
+            self.seek_reader(position);
+        }
+    }
+
+    fn seek_reader(&mut self, position: usize) {
+        match self.reader.seek(position) {
+            Ok(()) => {
+                self.reader_seek_position = position;
+                self.reader_view.follow_reader();
+                self.tape_error = None;
+            }
+            Err(error) => self.tape_error = Some(format!("reader seek failed: {error:?}")),
         }
     }
 
@@ -879,7 +931,9 @@ impl EguiApp {
                 self.dock_split.begin_drag();
             }
             if response.dragged() {
-                self.dock_split.drag(response.drag_delta().y, usable_height);
+                if let Some(delta) = response.total_drag_delta() {
+                    self.dock_split.drag_from_origin(delta.y, usable_height);
+                }
                 ui.ctx().request_repaint();
             }
             if response.drag_stopped() {

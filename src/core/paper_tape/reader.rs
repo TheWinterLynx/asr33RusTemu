@@ -9,6 +9,99 @@ pub struct ReaderOptions {
     pub auto_stop: bool,
 }
 
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    #[test]
+    fn loaded_tape_is_inspectable_and_seek_does_not_emit() {
+        let bytes = b"ABCDEF".to_vec();
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            set_msb: false,
+            auto_stop: false,
+        });
+        reader.load(PaperTape::new(bytes.clone()));
+        assert_eq!(reader.position(), 0);
+        assert_eq!(reader.tape().map(PaperTape::bytes), Some(bytes.as_slice()));
+        reader.seek(5).expect("valid forward seek");
+        reader.seek(2).expect("valid backward seek");
+        reader.seek(4).expect("valid forward seek");
+        assert_eq!(reader.position(), 4);
+        assert_eq!(reader.tape().map(PaperTape::bytes), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn seek_from_middle_starts_at_requested_byte_and_running_seek_is_rejected() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            set_msb: false,
+            auto_stop: false,
+        });
+        reader.load(PaperTape::new(b"ABCDEF".to_vec()));
+        reader.seek(3).expect("valid seek");
+        assert!(reader.start());
+        assert_eq!(reader.seek(0), Err(SeekError::Running));
+        let mut emitted = Vec::new();
+        while let ReaderStep::Byte(byte) = reader.step() {
+            emitted.push(byte);
+        }
+        assert_eq!(emitted, b"DEF");
+    }
+
+    #[test]
+    fn seek_validates_tape_and_range_and_rewind_keeps_data() {
+        let mut reader = TapeReader::new(ReaderOptions::default());
+        assert_eq!(reader.seek(0), Err(SeekError::NoTape));
+        reader.load(PaperTape::new(b"ABC".to_vec()));
+        assert_eq!(
+            reader.seek(4),
+            Err(SeekError::OutOfRange {
+                requested: 4,
+                length: 3
+            })
+        );
+        reader.seek(3).expect("end position is valid");
+        assert!(reader.rewind());
+        assert_eq!(reader.position(), 0);
+        assert_eq!(reader.tape().map(PaperTape::bytes), Some(&b"ABC"[..]));
+    }
+
+    #[test]
+    fn leading_nulls_remain_visible_until_start_and_msb_changes_only_emission() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: true,
+            set_msb: true,
+            auto_stop: false,
+        });
+        reader.load(PaperTape::new(b"\0\0A".to_vec()));
+        assert_eq!(reader.position(), 0);
+        assert_eq!(reader.tape().map(PaperTape::bytes), Some(&b"\0\0A"[..]));
+        assert!(reader.start());
+        assert_eq!(reader.position(), 2);
+        assert_eq!(reader.step(), ReaderStep::Byte(0xc1));
+        assert_eq!(reader.tape().map(PaperTape::bytes), Some(&b"\0\0A"[..]));
+    }
+
+    #[test]
+    fn start_from_middle_preserves_existing_trailer_autostop_quirk() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            set_msb: false,
+            auto_stop: true,
+        });
+        reader.load(PaperTape::new(b"AB\x80\x80\0\0".to_vec()));
+        reader.seek(2).expect("seek to first trailer byte");
+        assert!(reader.start());
+        assert_eq!(reader.step(), ReaderStep::Byte(0x80));
+        assert_eq!(
+            reader.step(),
+            ReaderStep::Stopped(StopCause::TrailingOctal200)
+        );
+        assert_eq!(reader.position(), 3);
+    }
+}
+
 impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
@@ -39,6 +132,13 @@ pub enum ReaderStep {
     Idle,
     Byte(u8),
     Stopped(StopCause),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeekError {
+    NoTape,
+    Running,
+    OutOfRange { requested: usize, length: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +236,24 @@ impl TapeReader {
         } else {
             false
         }
+    }
+
+    pub fn seek(&mut self, position: usize) -> Result<(), SeekError> {
+        let Some(tape) = self.tape.as_ref() else {
+            return Err(SeekError::NoTape);
+        };
+        if self.state == ReaderState::Running {
+            return Err(SeekError::Running);
+        }
+        if position > tape.len() {
+            return Err(SeekError::OutOfRange {
+                requested: position,
+                length: tape.len(),
+            });
+        }
+        self.position = position;
+        self.stop_cause = None;
+        Ok(())
     }
 
     pub(crate) fn restore_position(&mut self, position: usize) {

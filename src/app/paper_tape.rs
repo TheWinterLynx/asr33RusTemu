@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::core::paper_tape::SeekError;
 use crate::core::paper_tape::{ReaderState, ReaderStep, TapeReader};
 
 pub const READER_FEED_INTERVAL: Duration = Duration::from_millis(3);
@@ -92,6 +93,14 @@ impl ReaderFeed {
         } else {
             false
         }
+    }
+
+    pub fn seek(&mut self, position: usize) -> Result<(), SeekError> {
+        if self.reader.state() == ReaderState::Running {
+            return Err(SeekError::Running);
+        }
+        self.rollback_unconfirmed();
+        self.reader.seek(position)
     }
 
     pub fn tick<F>(&mut self, now: Duration, mut transmit: F) -> Option<Duration>
@@ -255,5 +264,37 @@ mod tests {
         feed.rollback_unconfirmed();
         assert_eq!(feed.confirm_transmitted(), None);
         assert_eq!(feed.reader().position(), 0);
+    }
+
+    #[test]
+    fn seek_requires_stopped_reader_and_rolls_back_pending_byte() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            auto_stop: false,
+            set_msb: false,
+        });
+        reader.load(PaperTape::new(b"ABCDEF".to_vec()));
+        assert!(reader.start());
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        feed.tick(Duration::ZERO, FeedResult::Backpressured);
+        assert_eq!(feed.pending_count(), 1);
+        assert!(feed.seek(3).is_err());
+        assert_eq!(feed.reader().position(), 1);
+        feed.reader_mut().stop();
+        feed.seek(3).expect("stopped feed can seek safely");
+        assert_eq!(feed.pending_count(), 0);
+        assert_eq!(feed.reader().position(), 3);
+        assert!(feed.reader_mut().start());
+        let mut emitted = Vec::new();
+        let mut now = READER_FEED_INTERVAL;
+        while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
+            feed.tick(now, |byte| {
+                emitted.push(byte);
+                FeedResult::Accepted
+            });
+            feed.confirm_transmitted();
+            now += READER_FEED_INTERVAL;
+        }
+        assert_eq!(emitted, b"DEF");
     }
 }

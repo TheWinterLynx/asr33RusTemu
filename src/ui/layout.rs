@@ -106,11 +106,13 @@ impl DockSplitState {
         self.drag_origin = Some(self.punch_fraction);
     }
 
-    pub fn drag(&mut self, delta_y: f32, available_height: f32) {
+    pub fn drag_from_origin(&mut self, total_delta_y: f32, available_height: f32) {
         let origin = self.drag_origin.unwrap_or(self.punch_fraction);
         let usable = available_height.max(1.0);
         let minimum = (MIN_PANE_HEIGHT / usable).min(0.45);
-        self.punch_fraction = (origin + delta_y / usable).clamp(minimum, 1.0 - minimum);
+        if total_delta_y.is_finite() && available_height.is_finite() {
+            self.punch_fraction = (origin + total_delta_y / usable).clamp(minimum, 1.0 - minimum);
+        }
     }
 
     pub fn end_drag(&mut self) {
@@ -189,12 +191,12 @@ mod tests {
     fn split_clamps_resizes_and_gives_a_single_pane_full_height() {
         let mut split = DockSplitState::default();
         split.begin_drag();
-        split.drag(-500.0, 600.0);
+        split.drag_from_origin(-500.0, 600.0);
         split.end_drag();
         let (punch, reader) = split.pane_heights(600.0, true);
         assert!(punch >= MIN_PANE_HEIGHT && reader >= MIN_PANE_HEIGHT);
         split.begin_drag();
-        split.drag(500.0, 600.0);
+        split.drag_from_origin(500.0, 600.0);
         split.end_drag();
         let (punch, reader) = split.pane_heights(600.0, true);
         assert!(punch >= MIN_PANE_HEIGHT && reader >= MIN_PANE_HEIGHT);
@@ -205,7 +207,7 @@ mod tests {
     fn split_and_width_state_survive_presentation_changes() {
         let mut split = DockSplitState::default();
         split.begin_drag();
-        split.drag(90.0, 600.0);
+        split.drag_from_origin(90.0, 600.0);
         split.end_drag();
         let ratio = split.punch_fraction();
         let mut panel = PanelPresentation::docked();
@@ -227,6 +229,56 @@ mod tests {
         assert_eq!(initial.width(), 230.0);
         initial.retain_requested(900.0, 1000.0);
         assert_eq!(initial.width(), 550.0);
+    }
+
+    #[test]
+    fn splitter_does_not_snap_back_during_multiframe_drag() {
+        let mut split = DockSplitState::default();
+        split.begin_drag();
+        split.drag_from_origin(10.0, 600.0);
+        let first = split.punch_fraction();
+        split.drag_from_origin(25.0, 600.0);
+        let second = split.punch_fraction();
+        split.drag_from_origin(60.0, 600.0);
+        let third = split.punch_fraction();
+        assert!(0.42 < first && first < second && second < third);
+        assert!((third - 0.52).abs() < f32::EPSILON);
+        split.drag_from_origin(60.0, 600.0);
+        assert_eq!(split.punch_fraction(), third);
+        split.end_drag();
+        assert_eq!(split.punch_fraction(), third);
+
+        split.begin_drag();
+        split.drag_from_origin(-15.0, 600.0);
+        let upward_first = split.punch_fraction();
+        split.drag_from_origin(-45.0, 600.0);
+        let upward_second = split.punch_fraction();
+        assert!(upward_second < upward_first && upward_first < third);
+        split.end_drag();
+        assert_eq!(split.punch_fraction(), upward_second);
+    }
+
+    #[test]
+    fn multiframe_split_drag_is_finite_and_stable_at_both_limits() {
+        let mut split = DockSplitState::default();
+        split.begin_drag();
+        for delta in [-100.0, -1_000.0, f32::NEG_INFINITY, f32::NAN] {
+            split.drag_from_origin(delta, 600.0);
+        }
+        let lower = split.punch_fraction();
+        assert!(lower.is_finite());
+        assert_eq!(lower, MIN_PANE_HEIGHT / 600.0);
+        split.end_drag();
+
+        split.begin_drag();
+        for delta in [100.0, 1_000.0, f32::INFINITY] {
+            split.drag_from_origin(delta, 600.0);
+        }
+        let upper = split.punch_fraction();
+        assert!(upper.is_finite());
+        assert_eq!(upper, 1.0 - MIN_PANE_HEIGHT / 600.0);
+        split.drag_from_origin(1_000.0, -1.0);
+        assert!(split.punch_fraction().is_finite());
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub const DATA_RADIUS: f32 = 6.5;
 pub const SPROCKET_RADIUS: f32 = 4.0;
 const PITCH: f32 = 18.0;
 const ROW_HEIGHT: f32 = 22.0;
+const TAPE_WIDTH: f32 = PITCH * 9.0;
+const TOTAL_WIDTH: f32 = TAPE_WIDTH + 160.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapeColumn {
@@ -32,39 +34,6 @@ pub struct PreparedTape {
 pub enum TapeSourceOrder {
     NewestFirst,
     OldestFirst,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TapeViewHistory {
-    bytes: Vec<u8>,
-    max_rows: usize,
-}
-
-impl TapeViewHistory {
-    #[must_use]
-    pub fn new(max_rows: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            max_rows,
-        }
-    }
-
-    pub fn push_confirmed(&mut self, byte: u8) {
-        if self.max_rows == 0 {
-            return;
-        }
-        self.bytes.insert(0, byte);
-        self.bytes.truncate(self.max_rows);
-    }
-
-    pub fn clear(&mut self) {
-        self.bytes.clear();
-    }
-
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
 }
 
 #[must_use]
@@ -134,6 +103,49 @@ pub struct TapeRendererOptions {
     pub source_order: TapeSourceOrder,
     pub mark_newest: bool,
     pub palette: ThemePalette,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReaderTapeViewState {
+    follow_reader: bool,
+    drag_origin: Option<usize>,
+}
+
+impl Default for ReaderTapeViewState {
+    fn default() -> Self {
+        Self {
+            follow_reader: true,
+            drag_origin: None,
+        }
+    }
+}
+
+impl ReaderTapeViewState {
+    #[must_use]
+    pub const fn follows_reader(&self) -> bool {
+        self.follow_reader
+    }
+
+    pub fn follow_reader(&mut self) {
+        self.follow_reader = true;
+    }
+
+    pub fn inspect_manually(&mut self) {
+        self.follow_reader = false;
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[must_use]
+pub fn position_from_total_drag(origin: usize, total_delta_y: f32, tape_length: usize) -> usize {
+    if !total_delta_y.is_finite() {
+        return origin.min(tape_length);
+    }
+    let row_delta = (-total_delta_y / ROW_HEIGHT).round() as isize;
+    origin.saturating_add_signed(row_delta).min(tape_length)
 }
 
 pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions) {
@@ -234,18 +246,152 @@ pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions
         });
 }
 
+/// Render the complete stored tape with row virtualization. The returned
+/// position is a physical seek requested by dragging the tape, not scrolling.
+pub fn render_reader_tape(
+    ui: &mut egui::Ui,
+    bytes: &[u8],
+    reader_position: usize,
+    reader_running: bool,
+    set_msb: bool,
+    state: &mut ReaderTapeViewState,
+    options: TapeRendererOptions,
+) -> Option<usize> {
+    let available_height = ui.available_height().max(ROW_HEIGHT);
+    let mut area = egui::ScrollArea::both()
+        .max_height(available_height)
+        .auto_shrink([false, false]);
+    if state.follow_reader {
+        let centered = reader_position as f32 * ROW_HEIGHT - available_height * 0.45;
+        area = area.vertical_scroll_offset(centered.max(0.0));
+    }
+    let columns = tape_columns(options.bit_label_base);
+    let mut requested = None;
+    let output = area.show_rows(
+        ui,
+        ROW_HEIGHT,
+        bytes.len().saturating_add(1),
+        |ui, range| {
+            let height = ROW_HEIGHT * range.len() as f32;
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(TOTAL_WIDTH, height),
+                if reader_running {
+                    egui::Sense::hover()
+                } else {
+                    egui::Sense::drag()
+                },
+            );
+            let response = response.on_hover_cursor(if reader_running {
+                egui::CursorIcon::Default
+            } else {
+                egui::CursorIcon::ResizeVertical
+            });
+            if response.drag_started() {
+                state.drag_origin = Some(reader_position);
+            }
+            if let (Some(origin), Some(delta)) = (state.drag_origin, response.total_drag_delta()) {
+                requested = Some(position_from_total_drag(origin, delta.y, bytes.len()));
+            }
+            if response.drag_stopped() {
+                state.drag_origin = None;
+            }
+            let painter = ui.painter_at(rect);
+            let tape_origin = rect.left() + 12.0;
+            for (visible_index, offset) in range.enumerate() {
+                let center_y = rect.top() + ROW_HEIGHT * (visible_index as f32 + 0.5);
+                if offset == reader_position {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(
+                            egui::pos2(rect.center().x, center_y),
+                            egui::vec2(TOTAL_WIDTH, ROW_HEIGHT),
+                        ),
+                        0.0,
+                        options.palette.active,
+                    );
+                    painter.text(
+                        egui::pos2(rect.left(), center_y),
+                        Align2::LEFT_CENTER,
+                        "▶ HEAD",
+                        FontId::proportional(10.0),
+                        options.palette.active,
+                    );
+                }
+                let Some(&byte) = bytes.get(offset) else {
+                    continue;
+                };
+                for (column_index, column) in columns.iter().enumerate() {
+                    let center =
+                        egui::pos2(tape_origin + PITCH * (column_index as f32 + 0.5), center_y);
+                    match column {
+                        TapeColumn::Sprocket => {
+                            painter.circle_filled(
+                                center,
+                                SPROCKET_RADIUS,
+                                options.palette.tape_hole,
+                            );
+                        }
+                        TapeColumn::Data(label) => {
+                            let bit = match options.bit_label_base {
+                                BitLabelBase::Zero => *label,
+                                BitLabelBase::One => label - 1,
+                            };
+                            if byte & (1 << bit) != 0 {
+                                painter.circle_filled(
+                                    center,
+                                    DATA_RADIUS,
+                                    options.palette.tape_hole,
+                                );
+                            } else if options.ghost_outline {
+                                painter.circle_stroke(
+                                    center,
+                                    DATA_RADIUS,
+                                    egui::Stroke::new(1.0, options.palette.tape_ghost),
+                                );
+                            }
+                        }
+                    }
+                }
+                let text_x = tape_origin + TAPE_WIDTH + 8.0;
+                painter.text(
+                    egui::pos2(text_x, center_y),
+                    Align2::LEFT_CENTER,
+                    format!(
+                        "{offset}: {}",
+                        tape_ascii(byte, options.ascii_char_mask_msb)
+                    ),
+                    FontId::monospace(12.0),
+                    options.palette.text,
+                );
+                painter.text(
+                    egui::pos2(text_x + 50.0, center_y),
+                    Align2::LEFT_CENTER,
+                    format_tape_numeric(byte),
+                    FontId::monospace(12.0),
+                    options.palette.text,
+                );
+                if offset == reader_position && set_msb {
+                    painter.text(
+                        egui::pos2(text_x + 50.0, center_y + 9.0),
+                        Align2::LEFT_CENTER,
+                        format!("TX {}", format_tape_numeric(byte | 0x80)),
+                        FontId::monospace(9.0),
+                        options.palette.muted_text,
+                    );
+                }
+            }
+        },
+    );
+    if ui.rect_contains_pointer(output.inner_rect)
+        && ui.input(|input| input.smooth_scroll_delta.y != 0.0)
+    {
+        state.inspect_manually();
+    }
+    requested
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::paper_tape::{FeedResult, ReaderFeed};
-    use crate::core::paper_tape::{PaperTape, ReaderOptions, TapeReader};
-    use std::time::Duration;
-
-    fn confirm_next(feed: &mut ReaderFeed, history: &mut TapeViewHistory, now: Duration) {
-        feed.tick(now, |_| FeedResult::Accepted);
-        let confirmed = feed.confirm_transmitted().expect("byte reaches boundary");
-        history.push_confirmed(confirmed.byte);
-    }
 
     #[test]
     fn physical_columns_match_legacy_and_have_one_small_sprocket() {
@@ -308,14 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn history_is_bounded_and_punch_preview_is_newest_first() {
-        let mut history = TapeViewHistory::new(3);
-        for byte in b"ABCDE" {
-            history.push_confirmed(*byte);
-        }
-        assert_eq!(history.bytes(), b"EDC");
-        history.clear();
-        assert!(history.bytes().is_empty());
+    fn punch_preview_is_bounded_and_newest_first() {
         let punch = prepare_tape(b"ABCDE", 3, false, TapeSourceOrder::OldestFirst, false);
         assert_eq!(
             punch.rows.iter().map(|row| row.byte).collect::<Vec<_>>(),
@@ -329,49 +468,25 @@ mod tests {
     }
 
     #[test]
-    fn reader_history_tracks_only_confirmed_progress_and_msb_at_emission() {
-        let mut reader = TapeReader::new(ReaderOptions {
-            skip_leading_nulls: true,
-            auto_stop: false,
-            set_msb: false,
-        });
-        reader.load(PaperTape::new(b"\0\0ABC".to_vec()));
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
-        let mut history = TapeViewHistory::new(3);
-        assert!(
-            history.bytes().is_empty(),
-            "load does not visualize source bytes"
-        );
-        assert!(feed.reader_mut().start());
-        confirm_next(&mut feed, &mut history, Duration::ZERO);
-        assert_eq!(history.bytes(), b"A");
-        feed.reader_mut().set_msb(true);
-        confirm_next(&mut feed, &mut history, Duration::from_millis(3));
-        confirm_next(&mut feed, &mut history, Duration::from_millis(6));
-        assert_eq!(history.bytes(), &[0xc3, 0xc2, b'A']);
+    fn physical_drag_uses_total_delta_and_clamps_without_rebound() {
+        assert_eq!(position_from_total_drag(50, 0.0, 100), 50);
+        assert_eq!(position_from_total_drag(50, 22.0, 100), 49);
+        assert_eq!(position_from_total_drag(50, 44.0, 100), 48);
+        assert_eq!(position_from_total_drag(50, -66.0, 100), 53);
+        assert_eq!(position_from_total_drag(0, 44.0, 100), 0);
+        assert_eq!(position_from_total_drag(99, -440.0, 100), 100);
+        assert_eq!(position_from_total_drag(25, f32::NAN, 100), 25);
     }
 
     #[test]
-    fn rollback_rewind_and_unload_never_leave_visual_rows() {
-        let mut reader = TapeReader::new(ReaderOptions::default());
-        reader.load(PaperTape::new(b"AB".to_vec()));
-        assert!(reader.start());
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
-        let mut history = TapeViewHistory::new(4);
-        feed.tick(Duration::ZERO, |_| FeedResult::Accepted);
-        feed.rollback_unconfirmed();
-        assert!(history.bytes().is_empty());
-        assert_eq!(feed.reader().position(), 0);
-        confirm_next(&mut feed, &mut history, Duration::from_millis(3));
-        assert_eq!(history.bytes(), b"A");
-        feed.reader_mut().stop();
-        assert!(feed.reader_mut().rewind());
-        history.clear();
-        assert_eq!(feed.reader().position(), 0);
-        assert!(feed.reader().tape().is_some());
-        assert!(history.bytes().is_empty());
-        feed.reader_mut().unload();
-        history.clear();
-        assert!(history.bytes().is_empty());
+    fn reader_view_follow_and_manual_inspection_are_independent_state() {
+        let mut state = ReaderTapeViewState::default();
+        assert!(state.follows_reader());
+        state.inspect_manually();
+        assert!(!state.follows_reader());
+        state.follow_reader();
+        assert!(state.follows_reader());
+        state.reset();
+        assert!(state.follows_reader());
     }
 }
