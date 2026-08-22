@@ -163,6 +163,28 @@ mod tests {
     }
 
     #[test]
+    fn return_is_authentic_cr_and_ctrl_j_is_line_feed_with_parity() {
+        let space = options(KeyboardParityMode::Space);
+        assert_eq!(
+            encode_input(&KeyboardInput::Return, space).expect("CR"),
+            b"\r"
+        );
+        assert_eq!(
+            encode_input(&KeyboardInput::Control('J'), space).expect("LF"),
+            b"\n"
+        );
+        let mark = options(KeyboardParityMode::Mark);
+        assert_eq!(
+            encode_input(&KeyboardInput::Return, mark).expect("marked CR"),
+            b"\x8d"
+        );
+        assert_eq!(
+            encode_input(&KeyboardInput::Control('J'), mark).expect("marked LF"),
+            b"\x8a"
+        );
+    }
+
+    #[test]
     fn rejects_non_ascii_explicitly() {
         let error = encode_input(
             &KeyboardInput::Text("é".into()),

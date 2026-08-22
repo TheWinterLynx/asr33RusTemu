@@ -378,6 +378,53 @@ fn runtime_starts_and_local_loopback_operates_without_transport() {
 }
 
 #[test]
+fn local_cr_overstrikes_and_local_lf_advances_without_carriage_return() {
+    let mut cr_runtime = disconnected_runtime();
+    cr_runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL");
+    cr_runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled");
+    cr_runtime.tick().expect("LOCAL mode applies");
+    cr_runtime
+        .submit(ApplicationCommand::Transmit(b"ABC\rDEF".to_vec()))
+        .expect("CR sequence");
+    cr_runtime.pump().expect("CR sequence drains");
+    let cr_line = cr_runtime
+        .terminal()
+        .line_history()
+        .line(0)
+        .expect("first line");
+    assert_eq!(cr_line.strike_stack(0), &['A', 'D']);
+    assert_eq!(cr_line.strike_stack(1), &['B', 'E']);
+    assert_eq!(cr_line.strike_stack(2), &['C', 'F']);
+
+    let mut lf_runtime = disconnected_runtime();
+    lf_runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL");
+    lf_runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled");
+    lf_runtime.tick().expect("LOCAL mode applies");
+    lf_runtime
+        .submit(ApplicationCommand::Transmit(b"ABC\nDEF".to_vec()))
+        .expect("LF sequence");
+    lf_runtime.pump().expect("LF sequence drains");
+    assert_eq!(lf_runtime.terminal().cursor_position(), (6, 1));
+    assert_eq!(&line(&lf_runtime, 1)[3..6], "DEF");
+}
+
+#[test]
 fn offline_local_loopback_can_feed_an_active_punch() {
     let directory = tempdir().expect("temporary directory");
     let path = directory.path().join("offline.pt");
