@@ -23,7 +23,7 @@ fn compare_python_and_rust(config_filename: &str, overrides: &[&str]) {
     rust_value["terminal"]["config"]
         .as_object_mut()
         .expect("terminal config is an object")
-        .remove("keyboard_return_mode");
+        .remove("input_return_mode");
 
     let python = std::env::var_os("PYTHON")
         .map(PathBuf::from)

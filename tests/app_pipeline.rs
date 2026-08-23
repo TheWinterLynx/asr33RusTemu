@@ -12,7 +12,7 @@ use asr33emu::app::{
     AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState,
     Scheduler,
 };
-use asr33emu::core::config::{KeyboardParityMode, KeyboardReturnMode};
+use asr33emu::core::config::{InputReturnMode, KeyboardParityMode};
 use asr33emu::core::events::{
     ApplicationCommand, CommunicationMode, ThrottleMode, TransportCommand, TransportEvent,
     TransportOperation,
@@ -193,6 +193,10 @@ fn disconnected_runtime() -> Runtime {
 }
 
 fn reader_feed(data: &[u8]) -> ReaderFeed {
+    reader_feed_with_mode(data, InputReturnMode::Cr)
+}
+
+fn reader_feed_with_mode(data: &[u8], return_mode: InputReturnMode) -> ReaderFeed {
     let mut reader = TapeReader::new(ReaderOptions {
         skip_leading_nulls: false,
         auto_stop: false,
@@ -200,15 +204,18 @@ fn reader_feed(data: &[u8]) -> ReaderFeed {
     });
     reader.load(PaperTape::new(data.to_vec()));
     assert!(reader.start());
-    ReaderFeed::new(reader, Duration::ZERO)
+    ReaderFeed::new(reader, Duration::ZERO, return_mode)
 }
 
 fn offer_reader_byte(feed: &mut ReaderFeed, runtime: &mut Runtime, now: Duration) {
-    feed.tick(now, |byte| {
-        match runtime.try_transmit(vec![byte]).expect("runtime running") {
+    feed.tick(now, |emission| {
+        match runtime
+            .try_transmit(emission.as_slice().to_vec())
+            .expect("runtime running")
+        {
             ImmediateTransmit::Accepted => FeedResult::Accepted,
-            ImmediateTransmit::Backpressured(data) | ImmediateTransmit::Disconnected(data) => {
-                FeedResult::Backpressured(data[0])
+            ImmediateTransmit::Backpressured(_) | ImmediateTransmit::Disconnected(_) => {
+                FeedResult::Backpressured(emission)
             }
         }
     });
@@ -426,7 +433,7 @@ fn local_cr_overstrikes_and_local_lf_advances_without_carriage_return() {
     assert_eq!(&line(&lf_runtime, 1)[3..6], "DEF");
 }
 
-fn encoded_return(mode: KeyboardReturnMode) -> Vec<u8> {
+fn encoded_return(mode: InputReturnMode) -> Vec<u8> {
     encode_input(
         &KeyboardInput::Return,
         KeyboardOptions {
@@ -441,8 +448,8 @@ fn encoded_return(mode: KeyboardReturnMode) -> Vec<u8> {
 #[test]
 fn local_keyboard_return_modes_reach_terminal_through_the_normal_pipeline() {
     for (mode, expected_cursor) in [
-        (KeyboardReturnMode::Cr, (0, 0)),
-        (KeyboardReturnMode::CrLf, (0, 1)),
+        (InputReturnMode::Cr, (0, 0)),
+        (InputReturnMode::CrLf, (0, 1)),
     ] {
         let mut runtime = disconnected_runtime();
         runtime
@@ -469,7 +476,7 @@ fn line_crlf_return_preserves_byte_order_at_the_transport() {
     let mut runtime = runtime(false);
     runtime
         .submit(ApplicationCommand::Transmit(encoded_return(
-            KeyboardReturnMode::CrLf,
+            InputReturnMode::CrLf,
         )))
         .expect("Return accepted");
     runtime.pump().expect("Return drains");
@@ -503,7 +510,7 @@ fn crlf_return_reaches_punch_only_via_terminal_forwarding() {
     runtime.tick().expect("configuration applies");
     runtime
         .submit(ApplicationCommand::Transmit(encoded_return(
-            KeyboardReturnMode::CrLf,
+            InputReturnMode::CrLf,
         )))
         .expect("Return accepted");
     runtime.pump().expect("Return drains");
@@ -644,14 +651,18 @@ fn paper_reader_rolls_back_unconfirmed_byte_and_resumes_without_loss() {
         });
         reader.load(PaperTape::new(expected.to_vec()));
         assert!(reader.start());
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
 
         assert_eq!(
-            feed.tick(Duration::ZERO, |byte| {
-                match runtime.try_transmit(vec![byte]).expect("connected") {
+            feed.tick(Duration::ZERO, |emission| {
+                match runtime
+                    .try_transmit(emission.as_slice().to_vec())
+                    .expect("connected")
+                {
                     ImmediateTransmit::Accepted => FeedResult::Accepted,
-                    ImmediateTransmit::Backpressured(data)
-                    | ImmediateTransmit::Disconnected(data) => FeedResult::Backpressured(data[0]),
+                    ImmediateTransmit::Backpressured(_) | ImmediateTransmit::Disconnected(_) => {
+                        FeedResult::Backpressured(emission)
+                    }
                 }
             }),
             Some(Duration::from_millis(3))
@@ -680,11 +691,15 @@ fn paper_reader_rolls_back_unconfirmed_byte_and_resumes_without_loss() {
         assert!(feed.reader_mut().start());
         let mut now = Duration::from_secs(1);
         while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
-            feed.tick(now, |byte| {
-                match runtime.try_transmit(vec![byte]).expect("connected") {
+            feed.tick(now, |emission| {
+                match runtime
+                    .try_transmit(emission.as_slice().to_vec())
+                    .expect("connected")
+                {
                     ImmediateTransmit::Accepted => FeedResult::Accepted,
-                    ImmediateTransmit::Backpressured(data)
-                    | ImmediateTransmit::Disconnected(data) => FeedResult::Backpressured(data[0]),
+                    ImmediateTransmit::Backpressured(_) | ImmediateTransmit::Disconnected(_) => {
+                        FeedResult::Backpressured(emission)
+                    }
                 }
             });
             runtime.scheduler_mut().now = now;
@@ -787,17 +802,17 @@ fn paper_reader_is_lossless_through_capacity_one_line_pipeline() {
     });
     reader.load(PaperTape::new(expected.clone()));
     assert!(reader.start());
-    let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+    let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
     let mut now = Duration::ZERO;
 
     while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
-        let delay = feed.tick(now, |byte| match runtime.try_transmit(vec![byte]) {
-            Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
-            Ok(ImmediateTransmit::Backpressured(data)) => {
-                FeedResult::Backpressured(data.first().copied().map_or(byte, |value| value))
+        let delay = feed.tick(now, |emission| {
+            match runtime.try_transmit(emission.as_slice().to_vec()) {
+                Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
+                Ok(ImmediateTransmit::Backpressured(_)) => FeedResult::Backpressured(emission),
+                Ok(ImmediateTransmit::Disconnected(_)) => panic!("test transport disconnected"),
+                Err(error) => panic!("reader transmit failed: {error}"),
             }
-            Ok(ImmediateTransmit::Disconnected(_)) => panic!("test transport disconnected"),
-            Err(error) => panic!("reader transmit failed: {error}"),
         });
         runtime.tick().expect("runtime tick succeeds");
         if feed.awaiting_confirmation() && runtime.transmit_idle() {
@@ -835,16 +850,16 @@ fn paper_reader_uses_local_loopback_without_reaching_transport() {
     });
     reader.load(PaperTape::new(b"LOCAL".to_vec()));
     assert!(reader.start());
-    let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+    let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
     let mut now = Duration::ZERO;
     while feed.reader().state() == ReaderState::Running {
-        let delay = feed.tick(now, |byte| match runtime.try_transmit(vec![byte]) {
-            Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
-            Ok(ImmediateTransmit::Backpressured(data)) => {
-                FeedResult::Backpressured(data.first().copied().map_or(byte, |value| value))
+        let delay = feed.tick(now, |emission| {
+            match runtime.try_transmit(emission.as_slice().to_vec()) {
+                Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
+                Ok(ImmediateTransmit::Backpressured(_)) => FeedResult::Backpressured(emission),
+                Ok(ImmediateTransmit::Disconnected(_)) => panic!("test transport disconnected"),
+                Err(error) => panic!("reader transmit failed: {error}"),
             }
-            Ok(ImmediateTransmit::Disconnected(_)) => panic!("test transport disconnected"),
-            Err(error) => panic!("reader transmit failed: {error}"),
         });
         runtime.tick().expect("loopback tick succeeds");
         if feed.awaiting_confirmation() && runtime.transmit_idle() {
@@ -861,6 +876,75 @@ fn paper_reader_uses_local_loopback_without_reaching_transport() {
         .filter_map(|column| line.strike_stack(column).last())
         .collect::<String>();
     assert_eq!(rendered, "LOCAL");
+}
+
+#[test]
+fn local_paper_reader_crlf_mode_starts_the_following_text_at_column_zero() {
+    let mut runtime = disconnected_runtime();
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL");
+    runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled");
+    runtime.tick().expect("configuration applies");
+    let mut feed = reader_feed_with_mode(b"ABC\rDEF", InputReturnMode::CrLf);
+    drain_reader(&mut feed, &mut runtime, Duration::ZERO);
+    assert_eq!(&line(&runtime, 0)[..3], "ABC");
+    assert_eq!(&line(&runtime, 1)[..3], "DEF");
+    assert_eq!(runtime.terminal().cursor_position().0, 3);
+}
+
+#[test]
+fn line_paper_reader_crlf_mode_normalizes_without_duplicating_physical_lf() {
+    for tape in [b"A\rB".as_slice(), b"A\r\nB".as_slice()] {
+        let mut runtime = runtime(false);
+        let mut feed = reader_feed_with_mode(tape, InputReturnMode::CrLf);
+        drain_reader(&mut feed, &mut runtime, Duration::ZERO);
+        let sent = connected(&runtime)
+            .sent
+            .iter()
+            .flat_map(|command| match command {
+                TransportCommand::Send(data) => data.iter().copied(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sent, b"A\r\nB");
+        assert_eq!(feed.reader().position(), tape.len());
+        assert!(feed.pending_count() <= 1);
+    }
+}
+
+#[test]
+fn paper_reader_crlf_reaches_punch_through_terminal_forwarding() {
+    let directory = tempdir().expect("temporary directory");
+    let path = directory.path().join("reader-return.pt");
+    let mut punch = PunchFile::open(&path, PunchMode::Overwrite).expect("punch opens");
+    assert!(punch.start());
+    let mut runtime = disconnected_runtime();
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL");
+    runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled");
+    runtime.tick().expect("configuration applies");
+    let mut feed = reader_feed_with_mode(b"A\rB", InputReturnMode::CrLf);
+    drain_reader(&mut feed, &mut runtime, Duration::ZERO);
+    while let Some(event) = runtime.pop_event() {
+        if let RuntimeEvent::TerminalForwarded(data) = event {
+            punch.punch(&data).expect("punch write succeeds");
+        }
+    }
+    drop(punch);
+    assert_eq!(std::fs::read(path).expect("punch readable"), b"A\r\nB");
 }
 
 #[test]

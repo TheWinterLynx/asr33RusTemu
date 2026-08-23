@@ -11,7 +11,7 @@ use crate::app::{
     SystemScheduler,
 };
 use crate::core::config::{
-    KeyboardReturnMode, PunchConfigMode, SerialConfig, TapePunchConfig, TapeReaderConfig,
+    InputReturnMode, PunchConfigMode, SerialConfig, TapePunchConfig, TapeReaderConfig,
 };
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use crate::core::paper_tape::{
@@ -23,7 +23,8 @@ use super::layout::{
     DockSplitState, DockWidthState, PanelPlacement, PanelPresentation, TerminalMetrics,
 };
 use super::tape_view::{
-    ReaderTapeViewState, TapeRendererOptions, TapeSourceOrder, render_reader_tape, render_tape,
+    ReaderTapeViewState, TapePanelMetrics, TapeRendererOptions, TapeSourceOrder,
+    render_reader_tape, render_tape,
 };
 use super::theme::ThemeKind;
 
@@ -108,12 +109,13 @@ impl EguiApp {
             PunchConfigMode::Append => PunchMode::Append,
             PunchConfigMode::Overwrite => PunchMode::Overwrite,
         };
+        let input_return_mode = options.keyboard.return_mode;
         let mut application = Self {
             runtime,
             options,
             transport_error: None,
             shutdown_complete: false,
-            reader: ReaderFeed::new(reader, Duration::ZERO),
+            reader: ReaderFeed::new(reader, Duration::ZERO, input_return_mode),
             reader_path: None,
             punch: None,
             punch_mode,
@@ -304,20 +306,17 @@ impl EguiApp {
         let now = self.runtime.scheduler().now();
         let runtime = &mut self.runtime;
         let mut reader_disconnected = false;
-        if let Some(delay) = self
-            .reader
-            .tick(now, |byte| match runtime.try_transmit(vec![byte]) {
+        if let Some(delay) = self.reader.tick(now, |emission| {
+            match runtime.try_transmit(emission.as_slice().to_vec()) {
                 Ok(ImmediateTransmit::Accepted) => FeedResult::Accepted,
-                Ok(ImmediateTransmit::Backpressured(data)) => {
-                    FeedResult::Backpressured(data.first().copied().map_or(byte, |pending| pending))
-                }
-                Ok(ImmediateTransmit::Disconnected(data)) => {
+                Ok(ImmediateTransmit::Backpressured(_)) => FeedResult::Backpressured(emission),
+                Ok(ImmediateTransmit::Disconnected(_)) => {
                     reader_disconnected = true;
-                    FeedResult::Backpressured(data.first().copied().map_or(byte, |pending| pending))
+                    FeedResult::Backpressured(emission)
                 }
-                Err(_) => FeedResult::Backpressured(byte),
-            })
-        {
+                Err(_) => FeedResult::Backpressured(emission),
+            }
+        }) {
             context.request_repaint_after(delay);
         }
         if reader_disconnected {
@@ -449,19 +448,29 @@ impl EguiApp {
             ui.label("Enter");
             for (mode, label, tooltip) in [
                 (
-                    KeyboardReturnMode::Cr,
+                    InputReturnMode::Cr,
                     "CR",
                     "Authentic ASR-33 Return sends CR only",
                 ),
                 (
-                    KeyboardReturnMode::CrLf,
+                    InputReturnMode::CrLf,
                     "CR+LF",
-                    "Convenience mode: Return sends CR followed by LF",
+                    "Convenience mode: CR input emits CR+LF for keyboard and paper tape",
                 ),
             ] {
-                ui.selectable_value(&mut self.options.keyboard.return_mode, mode, label)
-                    .on_hover_text(tooltip);
+                if ui
+                    .selectable_value(&mut self.options.keyboard.return_mode, mode, label)
+                    .on_hover_text(tooltip)
+                    .changed()
+                {
+                    self.reader.set_return_mode(mode);
+                }
             }
+            ui.label(column_status_label(
+                self.runtime.terminal().cursor_position().0,
+                self.runtime.terminal().width(),
+            ))
+            .on_hover_text("Print-head column / terminal width");
             ui.separator();
             let connected = connection == ConnectionState::Connected;
             ui.label(if connected {
@@ -649,9 +658,8 @@ impl EguiApp {
         }
     }
 
-    fn reader_contents(&mut self, ui: &mut egui::Ui) {
-        configure_tape_controls(ui);
-        ui.horizontal_wrapped(|ui| {
+    fn reader_contents(&mut self, ui: &mut egui::Ui, metrics: TapePanelMetrics) {
+        ui.horizontal(|ui| {
             if ui.button("Load").clicked()
                 && let Some(path) = reader_dialog(&self.options.tape_reader.initial_file_path)
             {
@@ -722,8 +730,8 @@ impl EguiApp {
                 self.reader_seek_position = 0;
             }
         });
-        ui.add_space(3.0);
-        ui.horizontal_wrapped(|ui| {
+        ui.add_space(metrics.group_spacing);
+        ui.horizontal(|ui| {
             if ui
                 .checkbox(&mut self.options.tape_reader.auto_stop, "Auto-stop")
                 .changed()
@@ -758,12 +766,11 @@ impl EguiApp {
         } else {
             100.0 * self.reader.reader().position() as f32 / length as f32
         };
-        ui.label(
-            egui::RichText::new(format!(
-                "File: {}",
-                display_path(self.reader_path.as_deref())
-            ))
-            .color(self.theme.palette().muted_text),
+        tape_path_label(
+            ui,
+            "File",
+            self.reader_path.as_deref(),
+            self.theme.palette().muted_text,
         );
         let status = reader_status_label(
             self.reader.reader().state(),
@@ -775,8 +782,7 @@ impl EguiApp {
             percent,
         ));
         let stopped = self.reader.reader().state() == ReaderState::Stopped;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
+        ui.horizontal(|ui| {
             ui.label("Position:");
             let length = self.reader.reader().tape().map_or(0, |tape| tape.len());
             ui.add_enabled(
@@ -788,7 +794,7 @@ impl EguiApp {
             if ui.add_enabled(stopped, egui::Button::new("Go")).clicked() {
                 self.seek_reader(self.reader_seek_position);
             }
-            if tape_step_button(ui, TapeStepDirection::TowardStart, stopped)
+            if tape_step_button(ui, TapeStepDirection::TowardStart, stopped, metrics.scale)
                 .on_hover_text("Move tape one byte toward start")
                 .clicked()
             {
@@ -798,7 +804,7 @@ impl EguiApp {
                     TapeStepDirection::TowardStart,
                 ));
             }
-            if tape_step_button(ui, TapeStepDirection::TowardEnd, stopped)
+            if tape_step_button(ui, TapeStepDirection::TowardEnd, stopped, metrics.scale)
                 .on_hover_text("Move tape one byte toward end")
                 .clicked()
             {
@@ -833,6 +839,7 @@ impl EguiApp {
                 self.options.tape_reader.set_msb,
                 &mut self.reader_view,
                 TapeRendererOptions {
+                    metrics: metrics.tape,
                     max_rows: self.options.tape_reader.max_rows,
                     ghost_outline: self.options.tape_reader.ghost_outline,
                     bit_label_base: self.options.tape_reader.bit_label_base,
@@ -861,9 +868,8 @@ impl EguiApp {
         }
     }
 
-    fn punch_contents(&mut self, ui: &mut egui::Ui) {
-        configure_tape_controls(ui);
-        ui.horizontal_wrapped(|ui| {
+    fn punch_contents(&mut self, ui: &mut egui::Ui, metrics: TapePanelMetrics) {
+        ui.horizontal(|ui| {
             if ui.button("Select/Load").clicked()
                 && let Some(path) = punch_dialog(&self.options.tape_punch.initial_file_path)
             {
@@ -900,8 +906,8 @@ impl EguiApp {
                 punch.stop();
             }
         });
-        ui.add_space(3.0);
-        ui.horizontal_wrapped(|ui| {
+        ui.add_space(metrics.group_spacing);
+        ui.horizontal(|ui| {
             for (mode, label) in [
                 (PunchMode::Append, "Append"),
                 (PunchMode::Overwrite, "Overwrite"),
@@ -921,10 +927,7 @@ impl EguiApp {
             .punch
             .as_ref()
             .map_or((None, &[][..]), |p| (Some(p.path()), p.bytes()));
-        ui.label(
-            egui::RichText::new(format!("File: {}", display_path(path)))
-                .color(self.theme.palette().muted_text),
-        );
+        tape_path_label(ui, "File", path, self.theme.palette().muted_text);
         ui.label(format!(
             "{} bytes · {}",
             bytes.len(),
@@ -934,6 +937,7 @@ impl EguiApp {
             ui,
             bytes,
             TapeRendererOptions {
+                metrics: metrics.tape,
                 max_rows: self.options.tape_punch.max_rows,
                 ghost_outline: self.options.tape_punch.ghost_outline,
                 bit_label_base: self.options.tape_punch.bit_label_base,
@@ -960,6 +964,28 @@ impl EguiApp {
         });
     }
 
+    fn reader_panel_contents(&mut self, ui: &mut egui::Ui) {
+        let metrics = tape_panel_metrics(ui);
+        ui.scope(|ui| {
+            apply_tape_panel_style(ui, metrics);
+            ui.label(egui::RichText::new("Paper Tape Reader").size(metrics.title_font_size));
+            Self::panel_header(ui, &mut self.reader_panel);
+            ui.add_space(metrics.group_spacing);
+            self.reader_contents(ui, metrics);
+        });
+    }
+
+    fn punch_panel_contents(&mut self, ui: &mut egui::Ui) {
+        let metrics = tape_panel_metrics(ui);
+        ui.scope(|ui| {
+            apply_tape_panel_style(ui, metrics);
+            ui.label(egui::RichText::new("Paper Tape Punch").size(metrics.title_font_size));
+            Self::panel_header(ui, &mut self.punch_panel);
+            ui.add_space(metrics.group_spacing);
+            self.punch_contents(ui, metrics);
+        });
+    }
+
     fn docked_tapes(&mut self, ui: &mut egui::Ui) {
         let punch_docked = self.punch_panel.placement() == PanelPlacement::Docked;
         let reader_docked = self.reader_panel.placement() == PanelPlacement::Docked;
@@ -974,9 +1000,7 @@ impl EguiApp {
                 |ui| {
                     ui.set_min_size(egui::Vec2::ZERO);
                     ui.set_clip_rect(ui.max_rect());
-                    ui.heading("Paper Tape Punch");
-                    Self::panel_header(ui, &mut self.punch_panel);
-                    self.punch_contents(ui);
+                    self.punch_panel_contents(ui);
                 },
             );
         }
@@ -1011,9 +1035,7 @@ impl EguiApp {
                 |ui| {
                     ui.set_min_size(egui::Vec2::ZERO);
                     ui.set_clip_rect(ui.max_rect());
-                    ui.heading("Paper Tape Reader");
-                    Self::panel_header(ui, &mut self.reader_panel);
-                    self.reader_contents(ui);
+                    self.reader_panel_contents(ui);
                 },
             );
         }
@@ -1032,8 +1054,7 @@ impl EguiApp {
                 .default_width(330.0)
                 .frame(window_frame)
                 .show(context, |ui| {
-                    Self::panel_header(ui, &mut self.reader_panel);
-                    self.reader_contents(ui);
+                    self.reader_panel_contents(ui);
                 });
             if !open {
                 self.reader_panel.hide();
@@ -1046,8 +1067,7 @@ impl EguiApp {
                 .default_width(330.0)
                 .frame(window_frame)
                 .show(context, |ui| {
-                    Self::panel_header(ui, &mut self.punch_panel);
-                    self.punch_contents(ui);
+                    self.punch_panel_contents(ui);
                 });
             if !open {
                 self.punch_panel.hide();
@@ -1149,10 +1169,53 @@ fn install_font(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
-fn configure_tape_controls(ui: &mut egui::Ui) {
-    ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
-    ui.spacing_mut().interact_size.y = 24.0;
-    ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
+fn tape_panel_metrics(ui: &egui::Ui) -> TapePanelMetrics {
+    let available =
+        (ui.available_rect_before_wrap().width() - ui.spacing().scroll.allocated_width()).max(0.0);
+    TapePanelMetrics::for_available_width(available)
+}
+
+fn apply_tape_panel_style(ui: &mut egui::Ui, metrics: TapePanelMetrics) {
+    let mut style = (**ui.style()).clone();
+    for text_style in [
+        egui::TextStyle::Body,
+        egui::TextStyle::Button,
+        egui::TextStyle::Monospace,
+    ] {
+        if let Some(font) = style.text_styles.get_mut(&text_style) {
+            font.size = metrics.body_font_size;
+        }
+    }
+    if let Some(font) = style.text_styles.get_mut(&egui::TextStyle::Small) {
+        font.size = metrics.small_font_size;
+    }
+    if let Some(font) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
+        font.size = metrics.title_font_size;
+    }
+    style.spacing.interact_size *= metrics.scale;
+    style.spacing.interact_size.y = metrics.button_height;
+    style.spacing.button_padding = egui::vec2(metrics.button_padding_x, metrics.button_padding_y);
+    style.spacing.item_spacing = egui::Vec2::splat(metrics.item_spacing);
+    style.spacing.icon_width = metrics.checkbox_size;
+    style.spacing.icon_width_inner *= metrics.scale;
+    style.spacing.icon_spacing *= metrics.scale;
+    style.spacing.indent *= metrics.scale;
+    style.spacing.extra_text_line_spacing *= metrics.scale;
+    ui.set_style(style);
+}
+
+fn tape_path_label(ui: &mut egui::Ui, prefix: &str, path: Option<&Path>, color: egui::Color32) {
+    let full_path = display_path(path);
+    ui.add(
+        egui::Label::new(egui::RichText::new(format!("{prefix}: {full_path}")).color(color))
+            .truncate(),
+    )
+    .on_hover_text(full_path);
+}
+
+#[must_use]
+fn column_status_label(column: usize, width: usize) -> String {
+    format!("Col {column} / {width}")
 }
 
 #[must_use]
@@ -1306,8 +1369,9 @@ fn tape_step_button(
     ui: &mut egui::Ui,
     direction: TapeStepDirection,
     enabled: bool,
+    scale: f32,
 ) -> egui::Response {
-    let size = egui::vec2(24.0, 20.0);
+    let size = egui::vec2(24.0, 20.0) * scale;
     let sense = if enabled {
         egui::Sense::click()
     } else {
@@ -1325,14 +1389,14 @@ fn tape_step_button(
     let center = rect.center();
     let points = match direction {
         TapeStepDirection::TowardStart => [
-            egui::pos2(center.x, center.y - 4.0),
-            egui::pos2(center.x - 5.0, center.y + 3.0),
-            egui::pos2(center.x + 5.0, center.y + 3.0),
+            egui::pos2(center.x, center.y - 4.0 * scale),
+            egui::pos2(center.x - 5.0 * scale, center.y + 3.0 * scale),
+            egui::pos2(center.x + 5.0 * scale, center.y + 3.0 * scale),
         ],
         TapeStepDirection::TowardEnd => [
-            egui::pos2(center.x, center.y + 4.0),
-            egui::pos2(center.x - 5.0, center.y - 3.0),
-            egui::pos2(center.x + 5.0, center.y - 3.0),
+            egui::pos2(center.x, center.y + 4.0 * scale),
+            egui::pos2(center.x - 5.0 * scale, center.y - 3.0 * scale),
+            egui::pos2(center.x + 5.0 * scale, center.y - 3.0 * scale),
         ],
     };
     let color = if enabled {
@@ -1366,9 +1430,10 @@ fn apply_tape_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardTarget, TapeStepDirection, apply_tape_shortcut, history_scroll_target,
-        keyboard_input_for_event, keyboard_input_for_target, punch_status_label,
-        reader_status_label, repaint_delay, should_send_to_terminal, stepped_position,
+        KeyboardTarget, TapeStepDirection, apply_tape_shortcut, column_status_label,
+        history_scroll_target, keyboard_input_for_event, keyboard_input_for_target,
+        punch_status_label, reader_status_label, repaint_delay, should_send_to_terminal,
+        stepped_position,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
@@ -1408,6 +1473,12 @@ mod tests {
             repaint_delay(PumpStatus::Backpressured),
             Some(Duration::from_millis(10))
         );
+    }
+
+    #[test]
+    fn column_status_uses_terminal_column_and_width() {
+        assert_eq!(column_status_label(0, 72), "Col 0 / 72");
+        assert_eq!(column_status_label(3, 80), "Col 3 / 80");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::core::config::InputReturnMode;
 use crate::core::paper_tape::SeekError;
 use crate::core::paper_tape::{ReaderState, ReaderStep, TapeReader};
 
@@ -10,7 +11,38 @@ pub const READER_FEED_INTERVAL: Duration = Duration::from_millis(3);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedResult {
     Accepted,
-    Backpressured(u8),
+    Backpressured(ReaderEmission),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderEmission {
+    pub source_byte: u8,
+    pub source_offset: usize,
+    tx_bytes: [u8; 2],
+    len: u8,
+}
+
+impl ReaderEmission {
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.tx_bytes[..usize::from(self.len)]
+    }
+}
+
+#[must_use]
+pub const fn reader_tx_bytes(
+    emitted_byte: u8,
+    next_physical_byte: Option<u8>,
+    return_mode: InputReturnMode,
+) -> ([u8; 2], u8) {
+    let should_add_lf = matches!(return_mode, InputReturnMode::CrLf)
+        && emitted_byte & 0x7f == b'\r'
+        && !matches!(next_physical_byte, Some(byte) if byte & 0x7f == b'\n');
+    if should_add_lf {
+        ([emitted_byte, emitted_byte & 0x80 | b'\n'], 2)
+    } else {
+        ([emitted_byte, 0], 1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,26 +51,22 @@ pub struct ConfirmedReaderByte {
     pub source_offset: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InFlightReaderByte {
-    byte: u8,
-    source_offset: usize,
-}
-
 #[derive(Debug)]
 pub struct ReaderFeed {
     reader: TapeReader,
-    pending: Option<u8>,
+    return_mode: InputReturnMode,
+    pending: Option<ReaderEmission>,
     checkpoint: Option<usize>,
-    in_flight: Option<InFlightReaderByte>,
+    in_flight: Option<ReaderEmission>,
     next_due: Duration,
 }
 
 impl ReaderFeed {
     #[must_use]
-    pub fn new(reader: TapeReader, now: Duration) -> Self {
+    pub fn new(reader: TapeReader, now: Duration, return_mode: InputReturnMode) -> Self {
         Self {
             reader,
+            return_mode,
             pending: None,
             checkpoint: None,
             in_flight: None,
@@ -51,6 +79,9 @@ impl ReaderFeed {
     }
     pub fn reader_mut(&mut self) -> &mut TapeReader {
         &mut self.reader
+    }
+    pub fn set_return_mode(&mut self, return_mode: InputReturnMode) {
+        self.return_mode = return_mode;
     }
     #[must_use]
     pub fn pending_count(&self) -> usize {
@@ -68,9 +99,9 @@ impl ReaderFeed {
     /// Commit the current reader position after its byte reaches the runtime's
     /// transport/terminal boundary.
     pub fn confirm_transmitted(&mut self) -> Option<ConfirmedReaderByte> {
-        let confirmed = self.in_flight.take().map(|in_flight| ConfirmedReaderByte {
-            byte: in_flight.byte,
-            source_offset: in_flight.source_offset,
+        let confirmed = self.in_flight.take().map(|emission| ConfirmedReaderByte {
+            byte: emission.source_byte,
+            source_offset: emission.source_offset,
         });
         self.checkpoint = None;
         confirmed
@@ -105,7 +136,7 @@ impl ReaderFeed {
 
     pub fn tick<F>(&mut self, now: Duration, mut transmit: F) -> Option<Duration>
     where
-        F: FnMut(u8) -> FeedResult,
+        F: FnMut(ReaderEmission) -> FeedResult,
     {
         if self.reader.state() != ReaderState::Running {
             return None;
@@ -116,32 +147,37 @@ impl ReaderFeed {
         if now < self.next_due {
             return Some(self.next_due - now);
         }
-        let byte = match self.pending.take() {
-            Some(byte) => byte,
+        let emission = match self.pending.take() {
+            Some(emission) => emission,
             None => {
                 let checkpoint = self.reader.position();
                 match self.reader.step() {
                     ReaderStep::Byte(byte) => {
                         self.checkpoint = Some(checkpoint);
-                        byte
+                        let next_byte = self
+                            .reader
+                            .tape()
+                            .and_then(|tape| tape.bytes().get(self.reader.position()))
+                            .copied();
+                        let (tx_bytes, len) = reader_tx_bytes(byte, next_byte, self.return_mode);
+                        ReaderEmission {
+                            source_byte: byte,
+                            source_offset: checkpoint,
+                            tx_bytes,
+                            len,
+                        }
                     }
                     ReaderStep::Idle | ReaderStep::Stopped(_) => return None,
                 }
             }
         };
-        match transmit(byte) {
+        match transmit(emission) {
             FeedResult::Accepted => {
-                let source_offset = self
-                    .checkpoint
-                    .unwrap_or_else(|| self.reader.position().saturating_sub(1));
-                self.in_flight = Some(InFlightReaderByte {
-                    byte,
-                    source_offset,
-                });
+                self.in_flight = Some(emission);
                 self.next_due = now + READER_FEED_INTERVAL;
             }
-            FeedResult::Backpressured(byte) => {
-                self.pending = Some(byte);
+            FeedResult::Backpressured(emission) => {
+                self.pending = Some(emission);
                 return Some(Duration::from_millis(1));
             }
         }
@@ -151,7 +187,8 @@ impl ReaderFeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{FeedResult, READER_FEED_INTERVAL, ReaderFeed};
+    use super::{FeedResult, READER_FEED_INTERVAL, ReaderFeed, reader_tx_bytes};
+    use crate::core::config::InputReturnMode;
     use crate::core::paper_tape::{PaperTape, ReaderOptions, ReaderState, TapeReader};
     use std::time::Duration;
 
@@ -164,18 +201,18 @@ mod tests {
         });
         reader.load(PaperTape::new((0_u8..32).collect()));
         assert!(reader.start());
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
         let mut accepted = Vec::new();
         let mut reject = true;
         let mut now = Duration::ZERO;
         while feed.reader().state() == ReaderState::Running || feed.pending_count() > 0 {
-            let delay = feed.tick(now, |byte| {
+            let delay = feed.tick(now, |emission| {
                 if reject {
                     reject = false;
-                    FeedResult::Backpressured(byte)
+                    FeedResult::Backpressured(emission)
                 } else {
                     reject = true;
-                    accepted.push(byte);
+                    accepted.extend_from_slice(emission.as_slice());
                     FeedResult::Accepted
                 }
             });
@@ -193,20 +230,20 @@ mod tests {
         let mut reader = TapeReader::new(ReaderOptions::default());
         reader.load(PaperTape::new(b"A\x80\x80".to_vec()));
         reader.start();
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
         let mut emitted = Vec::new();
-        feed.tick(Duration::ZERO, |byte| {
-            emitted.push(byte);
+        feed.tick(Duration::ZERO, |emission| {
+            emitted.extend_from_slice(emission.as_slice());
             FeedResult::Accepted
         });
         feed.confirm_transmitted();
-        feed.tick(Duration::from_millis(3), |byte| {
-            emitted.push(byte);
+        feed.tick(Duration::from_millis(3), |emission| {
+            emitted.extend_from_slice(emission.as_slice());
             FeedResult::Accepted
         });
         feed.confirm_transmitted();
-        feed.tick(Duration::from_millis(6), |byte| {
-            emitted.push(byte);
+        feed.tick(Duration::from_millis(6), |emission| {
+            emitted.extend_from_slice(emission.as_slice());
             FeedResult::Accepted
         });
         assert_eq!(emitted, b"A\x80");
@@ -222,7 +259,7 @@ mod tests {
         });
         reader.load(PaperTape::new(b"ABC".to_vec()));
         assert!(reader.start());
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
         assert_eq!(
             feed.tick(Duration::ZERO, FeedResult::Backpressured),
             Some(Duration::from_millis(1))
@@ -247,7 +284,7 @@ mod tests {
         });
         reader.load(PaperTape::new(b"A".to_vec()));
         assert!(reader.start());
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
         feed.tick(Duration::ZERO, |_| FeedResult::Accepted);
         assert_eq!(
             feed.confirm_transmitted(),
@@ -275,7 +312,7 @@ mod tests {
         });
         reader.load(PaperTape::new(b"ABCDEF".to_vec()));
         assert!(reader.start());
-        let mut feed = ReaderFeed::new(reader, Duration::ZERO);
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::Cr);
         feed.tick(Duration::ZERO, FeedResult::Backpressured);
         assert_eq!(feed.pending_count(), 1);
         assert!(feed.seek(3).is_err());
@@ -288,13 +325,67 @@ mod tests {
         let mut emitted = Vec::new();
         let mut now = READER_FEED_INTERVAL;
         while feed.reader().state() == ReaderState::Running || feed.pending_count() != 0 {
-            feed.tick(now, |byte| {
-                emitted.push(byte);
+            feed.tick(now, |emission| {
+                emitted.extend_from_slice(emission.as_slice());
                 FeedResult::Accepted
             });
             feed.confirm_transmitted();
             now += READER_FEED_INTERVAL;
         }
         assert_eq!(emitted, b"DEF");
+    }
+
+    #[test]
+    fn return_expansion_is_bounded_preserves_msb_and_skips_existing_lf() {
+        assert_eq!(
+            reader_tx_bytes(b'\r', Some(b'A'), InputReturnMode::CrLf),
+            (*b"\r\n", 2)
+        );
+        assert_eq!(
+            reader_tx_bytes(0x8d, Some(b'A'), InputReturnMode::CrLf),
+            ([0x8d, 0x8a], 2)
+        );
+        assert_eq!(
+            reader_tx_bytes(b'\r', Some(b'\n'), InputReturnMode::CrLf),
+            ([b'\r', 0], 1)
+        );
+        assert_eq!(
+            reader_tx_bytes(b'\r', Some(0x8a), InputReturnMode::CrLf),
+            ([b'\r', 0], 1)
+        );
+        assert_eq!(
+            reader_tx_bytes(b'\r', None, InputReturnMode::Cr),
+            ([b'\r', 0], 1)
+        );
+    }
+
+    #[test]
+    fn crlf_emission_rolls_back_as_one_physical_byte_under_backpressure() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: false,
+            auto_stop: false,
+            set_msb: true,
+        });
+        reader.load(PaperTape::new(b"\rA".to_vec()));
+        assert!(reader.start());
+        let mut feed = ReaderFeed::new(reader, Duration::ZERO, InputReturnMode::CrLf);
+        let mut first = None;
+        feed.tick(Duration::ZERO, |emission| {
+            first = Some(emission);
+            FeedResult::Backpressured(emission)
+        });
+        assert_eq!(first.expect("one emission").as_slice(), [0x8d, 0x8a]);
+        assert_eq!(feed.pending_count(), 1);
+        assert_eq!(feed.reader().position(), 1);
+        let mut retried = Vec::new();
+        feed.tick(Duration::from_millis(1), |emission| {
+            retried.extend_from_slice(emission.as_slice());
+            FeedResult::Accepted
+        });
+        assert_eq!(retried, [0x8d, 0x8a]);
+        assert!(feed.awaiting_confirmation());
+        feed.rollback_unconfirmed();
+        assert_eq!(feed.reader().position(), 0);
+        assert_eq!(feed.pending_count(), 0);
     }
 }

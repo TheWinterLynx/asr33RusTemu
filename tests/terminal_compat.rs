@@ -22,6 +22,23 @@ fn line_text(terminal: &Terminal, row: usize) -> String {
 }
 
 #[test]
+fn cursor_column_and_width_are_the_single_status_counter_source() {
+    let mut state = terminal(72, 4, 0, false);
+    assert_eq!(state.cursor_position().0, 0);
+    assert_eq!(state.width(), 72);
+    state.receive_data(b"ABC").expect("text accepted");
+    assert_eq!(state.cursor_position().0, 3);
+    state.receive_data(b"\n").expect("LF accepted");
+    assert_eq!(state.cursor_position().0, 3, "LF preserves column");
+    state.receive_data(b"\r\n").expect("CRLF accepted");
+    assert_eq!(state.cursor_position().0, 0);
+
+    let mut wrapping = terminal(4, 2, 0, true);
+    wrapping.receive_data(b"ABCDE").expect("autowrap accepted");
+    assert_eq!(wrapping.cursor_position(), (1, 1));
+}
+
+#[test]
 fn parity_examples_match_python() {
     assert_eq!(encode_even_parity(b"AC\x7f"), b"A\xc3\xff");
     assert_eq!(mask_parity_bit(b"\x00\x7f\x80\xff"), b"\x00\x7f\x00\x7f");

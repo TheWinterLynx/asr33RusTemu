@@ -5,7 +5,9 @@ use crate::core::config::BitLabelBase;
 use super::theme::ThemePalette;
 
 pub const NATURAL_SCALE: f32 = 1.0;
-pub const MIN_SCALE: f32 = 0.70;
+pub const MIN_PANEL_SCALE: f32 = 0.64;
+pub const MAX_PANEL_SCALE: f32 = 1.25;
+pub const REFERENCE_PANEL_WIDTH: f32 = 382.0;
 const NATURAL_PITCH: f32 = 18.0;
 const NATURAL_DATA_RADIUS: f32 = 6.5;
 const NATURAL_SPROCKET_RADIUS: f32 = 4.0;
@@ -16,16 +18,63 @@ const NATURAL_METADATA_GAP: f32 = 6.0;
 const NATURAL_OFFSET_WIDTH: f32 = 44.0;
 const NATURAL_ASCII_WIDTH: f32 = 18.0;
 const NATURAL_NUMERIC_WIDTH: f32 = 88.0;
-const MIN_LABEL_FONT_SIZE: f32 = 9.5;
-const MIN_DATA_FONT_SIZE: f32 = 10.5;
-const MIN_NUMERIC_FONT_SIZE: f32 = 10.0;
-const MIN_OFFSET_FONT_SIZE: f32 = 9.5;
-const MIN_OFFSET_WIDTH: f32 = MIN_OFFSET_FONT_SIZE * 4.0;
-const MIN_ASCII_WIDTH: f32 = NATURAL_ASCII_WIDTH * MIN_SCALE;
-const MIN_NUMERIC_WIDTH: f32 = MIN_NUMERIC_FONT_SIZE * 6.4;
 const HEAD_HOLE_GAP: f32 = 4.0;
 pub const READER_SCROLL_ID: &str = "paper-tape-reader-scroll";
 pub const PUNCH_SCROLL_ID: &str = "paper-tape-punch-scroll";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TapePanelMetrics {
+    pub scale: f32,
+    pub reference_width: f32,
+    pub scaled_width: f32,
+    pub requires_horizontal_scroll: bool,
+    pub title_font_size: f32,
+    pub body_font_size: f32,
+    pub small_font_size: f32,
+    pub button_height: f32,
+    pub button_padding_x: f32,
+    pub button_padding_y: f32,
+    pub item_spacing: f32,
+    pub group_spacing: f32,
+    pub checkbox_size: f32,
+    pub tape: TapeRenderMetrics,
+}
+
+impl TapePanelMetrics {
+    #[must_use]
+    pub fn for_available_width(available_width: f32) -> Self {
+        let width = if available_width.is_finite() {
+            available_width.max(0.0)
+        } else if available_width == f32::INFINITY {
+            REFERENCE_PANEL_WIDTH * MAX_PANEL_SCALE
+        } else {
+            0.0
+        };
+        let scale = (width / REFERENCE_PANEL_WIDTH).clamp(MIN_PANEL_SCALE, MAX_PANEL_SCALE);
+        Self::from_scale(scale, width < REFERENCE_PANEL_WIDTH * MIN_PANEL_SCALE)
+    }
+
+    #[must_use]
+    pub fn from_scale(scale: f32, requires_horizontal_scroll: bool) -> Self {
+        let scale = scale.clamp(MIN_PANEL_SCALE, MAX_PANEL_SCALE);
+        Self {
+            scale,
+            reference_width: REFERENCE_PANEL_WIDTH,
+            scaled_width: REFERENCE_PANEL_WIDTH * scale,
+            requires_horizontal_scroll,
+            title_font_size: 20.0 * scale,
+            body_font_size: 14.0 * scale,
+            small_font_size: 12.0 * scale,
+            button_height: 24.0 * scale,
+            button_padding_x: 7.0 * scale,
+            button_padding_y: 3.0 * scale,
+            item_spacing: 5.0 * scale,
+            group_spacing: 5.0 * scale,
+            checkbox_size: 18.0 * scale,
+            tape: TapeRenderMetrics::for_scale(scale, requires_horizontal_scroll),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TapeRenderMetrics {
@@ -56,52 +105,16 @@ impl TapeRenderMetrics {
         + NATURAL_OFFSET_WIDTH
         + NATURAL_ASCII_WIDTH
         + NATURAL_NUMERIC_WIDTH;
-    pub const MINIMUM_FIT_WIDTH: f32 = NATURAL_PADDING * MIN_SCALE * 2.0
-        + NATURAL_HEAD_GUTTER * MIN_SCALE
-        + NATURAL_PITCH * 9.0 * MIN_SCALE
-        + NATURAL_METADATA_GAP * MIN_SCALE * 3.0
-        + MIN_OFFSET_WIDTH
-        + MIN_ASCII_WIDTH
-        + MIN_NUMERIC_WIDTH;
-
     #[must_use]
-    pub fn for_available_width(available_width: f32) -> Self {
-        let width = if available_width.is_finite() {
-            available_width.max(0.0)
-        } else if available_width == f32::INFINITY {
-            Self::NATURAL_WIDTH
-        } else {
-            0.0
-        };
-        if width >= Self::NATURAL_WIDTH {
-            return Self::from_scale(NATURAL_SCALE, false);
-        }
-        if width < Self::MINIMUM_FIT_WIDTH {
-            return Self::from_scale(MIN_SCALE, true);
-        }
-
-        let mut low = MIN_SCALE;
-        let mut high = NATURAL_SCALE;
-        for _ in 0..20 {
-            let candidate = (low + high) * 0.5;
-            if Self::from_scale(candidate, false).total_width <= width {
-                low = candidate;
-            } else {
-                high = candidate;
-            }
-        }
-        Self::from_scale(low, false)
-    }
-
-    fn from_scale(scale: f32, requires_horizontal_scroll: bool) -> Self {
+    pub fn for_scale(scale: f32, requires_horizontal_scroll: bool) -> Self {
         let scaled = |value: f32| value * scale;
         let padding = scaled(NATURAL_PADDING);
         let head_gutter_width = scaled(NATURAL_HEAD_GUTTER);
         let tape_width = scaled(NATURAL_PITCH * 9.0);
         let metadata_gap = scaled(NATURAL_METADATA_GAP);
-        let offset_width = scaled(NATURAL_OFFSET_WIDTH).max(MIN_OFFSET_WIDTH);
-        let ascii_width = scaled(NATURAL_ASCII_WIDTH).max(MIN_ASCII_WIDTH);
-        let numeric_width = scaled(NATURAL_NUMERIC_WIDTH).max(MIN_NUMERIC_WIDTH);
+        let offset_width = scaled(NATURAL_OFFSET_WIDTH);
+        let ascii_width = scaled(NATURAL_ASCII_WIDTH);
+        let numeric_width = scaled(NATURAL_NUMERIC_WIDTH);
         let total_width = padding * 2.0
             + head_gutter_width
             + tape_width
@@ -117,10 +130,10 @@ impl TapeRenderMetrics {
             data_radius: scaled(NATURAL_DATA_RADIUS),
             sprocket_radius: scaled(NATURAL_SPROCKET_RADIUS),
             row_height: scaled(NATURAL_ROW_HEIGHT),
-            label_font_size: scaled(11.0).max(MIN_LABEL_FONT_SIZE),
-            data_font_size: scaled(12.0).max(MIN_DATA_FONT_SIZE),
-            numeric_font_size: scaled(11.0).max(MIN_NUMERIC_FONT_SIZE),
-            offset_font_size: scaled(11.0).max(MIN_OFFSET_FONT_SIZE),
+            label_font_size: scaled(11.0),
+            data_font_size: scaled(12.0),
+            numeric_font_size: scaled(11.0),
+            offset_font_size: scaled(11.0),
             metadata_gap,
             offset_width,
             ascii_width,
@@ -231,6 +244,7 @@ pub fn prepare_tape(
 }
 
 pub struct TapeRendererOptions {
+    pub metrics: TapeRenderMetrics,
     pub max_rows: usize,
     pub ghost_outline: bool,
     pub bit_label_base: BitLabelBase,
@@ -376,9 +390,7 @@ pub fn position_from_total_drag_with_row_height(
 }
 
 pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions) {
-    let available_width =
-        (ui.available_rect_before_wrap().width() - ui.spacing().scroll.allocated_width()).max(0.0);
-    let metrics = TapeRenderMetrics::for_available_width(available_width);
+    let metrics = options.metrics;
     let prepared = prepare_tape(
         bytes,
         options.max_rows,
@@ -496,9 +508,7 @@ pub fn render_reader_tape(
     state: &mut ReaderTapeViewState,
     options: TapeRendererOptions,
 ) -> Option<usize> {
-    let available_width =
-        (ui.available_rect_before_wrap().width() - ui.spacing().scroll.allocated_width()).max(0.0);
-    let metrics = TapeRenderMetrics::for_available_width(available_width);
+    let metrics = options.metrics;
     let available_height = ui.available_height().max(metrics.row_height);
     let wheel = ui.rect_contains_pointer(ui.available_rect_before_wrap())
         && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
@@ -698,7 +708,7 @@ mod tests {
                 .count(),
             8
         );
-        let natural = TapeRenderMetrics::for_available_width(TapeRenderMetrics::NATURAL_WIDTH);
+        let natural = TapePanelMetrics::for_available_width(REFERENCE_PANEL_WIDTH).tape;
         let radii = [natural.sprocket_radius, natural.data_radius];
         assert!(radii[0] < radii[1]);
     }
@@ -801,60 +811,69 @@ mod tests {
     }
 
     #[test]
-    fn responsive_metrics_scale_before_requesting_horizontal_scroll() {
-        let wide = TapeRenderMetrics::for_available_width(500.0);
-        assert_eq!(wide.scale, NATURAL_SCALE);
-        assert!(!wide.requires_horizontal_scroll);
-
-        let intermediate = TapeRenderMetrics::for_available_width(
-            (TapeRenderMetrics::NATURAL_WIDTH + TapeRenderMetrics::MINIMUM_FIT_WIDTH) / 2.0,
-        );
-        assert!(MIN_SCALE < intermediate.scale && intermediate.scale < NATURAL_SCALE);
-        assert!(!intermediate.requires_horizontal_scroll);
-
-        let minimum = TapeRenderMetrics::for_available_width(TapeRenderMetrics::MINIMUM_FIT_WIDTH);
-        assert!((minimum.scale - MIN_SCALE).abs() < f32::EPSILON);
-        assert!(!minimum.requires_horizontal_scroll);
-
-        let narrower =
-            TapeRenderMetrics::for_available_width(TapeRenderMetrics::MINIMUM_FIT_WIDTH - 1.0);
-        assert_eq!(narrower.scale, MIN_SCALE);
-        assert!(narrower.requires_horizontal_scroll);
+    fn panel_scale_uses_reference_minimum_and_maximum_widths() {
+        let natural = TapePanelMetrics::for_available_width(REFERENCE_PANEL_WIDTH);
+        assert_eq!(natural.scale, NATURAL_SCALE);
+        let compact = TapePanelMetrics::for_available_width(REFERENCE_PANEL_WIDTH * 0.8);
+        assert_eq!(compact.scale, 0.8);
+        let expanded = TapePanelMetrics::for_available_width(REFERENCE_PANEL_WIDTH * 1.1);
+        assert_eq!(expanded.scale, 1.1);
+        let maximum = TapePanelMetrics::for_available_width(f32::INFINITY);
+        assert_eq!(maximum.scale, MAX_PANEL_SCALE);
+        let minimum = TapePanelMetrics::for_available_width(1.0);
+        assert_eq!(minimum.scale, MIN_PANEL_SCALE);
+        assert!(minimum.requires_horizontal_scroll);
     }
 
     #[test]
-    fn responsive_metrics_are_finite_monotonic_and_physically_proportional() {
-        let widths = [f32::INFINITY, 500.0, 350.0, 250.0, 180.0, 0.0, f32::NAN];
-        let mut previous = NATURAL_SCALE;
+    fn panel_scale_is_finite_and_monotonic() {
+        let widths = [0.0, 180.0, 250.0, 350.0, 500.0, f32::INFINITY];
+        let mut previous = MIN_PANEL_SCALE;
         for width in widths {
-            let metrics = TapeRenderMetrics::for_available_width(width);
+            let metrics = TapePanelMetrics::for_available_width(width);
             assert!(metrics.scale.is_finite());
-            assert!((MIN_SCALE..=NATURAL_SCALE).contains(&metrics.scale));
-            assert!(metrics.scale <= previous);
-            assert!(metrics.sprocket_radius < metrics.data_radius);
-            assert!(metrics.pitch > 2.0 * metrics.data_radius);
+            assert!((MIN_PANEL_SCALE..=MAX_PANEL_SCALE).contains(&metrics.scale));
+            assert!(metrics.scale >= previous);
             previous = metrics.scale;
+        }
+        assert_eq!(
+            TapePanelMetrics::for_available_width(f32::NAN).scale,
+            MIN_PANEL_SCALE
+        );
+    }
+
+    #[test]
+    fn every_panel_and_tape_size_derives_from_the_same_scale() {
+        for scale in [MIN_PANEL_SCALE, 0.8, NATURAL_SCALE, MAX_PANEL_SCALE] {
+            let metrics = TapePanelMetrics::from_scale(scale, false);
+            let ratios = [
+                metrics.button_height / 24.0,
+                metrics.button_padding_x / 7.0,
+                metrics.button_padding_y / 3.0,
+                metrics.body_font_size / 14.0,
+                metrics.small_font_size / 12.0,
+                metrics.title_font_size / 20.0,
+                metrics.checkbox_size / 18.0,
+                metrics.item_spacing / 5.0,
+                metrics.group_spacing / 5.0,
+                metrics.scaled_width / metrics.reference_width,
+                metrics.tape.pitch / NATURAL_PITCH,
+                metrics.tape.data_radius / NATURAL_DATA_RADIUS,
+                metrics.tape.row_height / NATURAL_ROW_HEIGHT,
+                metrics.tape.data_font_size / 12.0,
+            ];
+            for ratio in ratios {
+                assert!((ratio - scale).abs() < 0.001);
+            }
+            assert!(metrics.tape.sprocket_radius < metrics.tape.data_radius);
+            assert!(metrics.tape.pitch > 2.0 * metrics.tape.data_radius);
         }
     }
 
     #[test]
-    fn responsive_metrics_keep_metadata_legible_at_minimum_scale() {
-        let metrics = TapeRenderMetrics::for_available_width(TapeRenderMetrics::MINIMUM_FIT_WIDTH);
-        assert!(metrics.label_font_size >= MIN_LABEL_FONT_SIZE);
-        assert!(metrics.data_font_size >= MIN_DATA_FONT_SIZE);
-        assert!(metrics.numeric_font_size >= MIN_NUMERIC_FONT_SIZE);
-        assert!(metrics.offset_font_size >= MIN_OFFSET_FONT_SIZE);
-        assert!(metrics.total_width <= TapeRenderMetrics::MINIMUM_FIT_WIDTH + 0.01);
-    }
-
-    #[test]
     fn head_gutter_never_overlaps_first_hole_at_any_supported_scale() {
-        for width in [
-            TapeRenderMetrics::NATURAL_WIDTH,
-            TapeRenderMetrics::NATURAL_WIDTH * 0.84,
-            TapeRenderMetrics::MINIMUM_FIT_WIDTH,
-        ] {
-            let metrics = TapeRenderMetrics::for_available_width(width);
+        for scale in [MIN_PANEL_SCALE, 0.84, NATURAL_SCALE, MAX_PANEL_SCALE] {
+            let metrics = TapePanelMetrics::from_scale(scale, false).tape;
             let marker_right = metrics.head_marker_right(0.0);
             let required_gap = HEAD_HOLE_GAP * metrics.scale;
             assert!(marker_right + required_gap <= metrics.first_hole_left(0.0));
@@ -863,12 +882,8 @@ mod tests {
 
     #[test]
     fn bit_labels_remain_centered_over_uniform_columns_at_every_scale() {
-        for width in [
-            TapeRenderMetrics::NATURAL_WIDTH,
-            TapeRenderMetrics::NATURAL_WIDTH * 0.8,
-            TapeRenderMetrics::MINIMUM_FIT_WIDTH,
-        ] {
-            let metrics = TapeRenderMetrics::for_available_width(width);
+        for scale in [MIN_PANEL_SCALE, 0.8, NATURAL_SCALE, MAX_PANEL_SCALE] {
+            let metrics = TapePanelMetrics::from_scale(scale, false).tape;
             let origin = metrics.tape_origin(0.0);
             let centers = (0..9)
                 .map(|index| origin + metrics.pitch * (index as f32 + 0.5))
@@ -882,9 +897,8 @@ mod tests {
 
     #[test]
     fn physical_drag_tracks_one_visual_row_at_every_scale() {
-        for scale in [NATURAL_SCALE, 0.8, MIN_SCALE] {
-            let metrics =
-                TapeRenderMetrics::for_available_width(TapeRenderMetrics::NATURAL_WIDTH * scale);
+        for scale in [NATURAL_SCALE, 0.8, MIN_PANEL_SCALE, MAX_PANEL_SCALE] {
+            let metrics = TapePanelMetrics::from_scale(scale, false).tape;
             assert_eq!(
                 position_from_total_drag_with_row_height(
                     50,
@@ -933,7 +947,7 @@ mod tests {
         reader.load(PaperTape::new(bytes.clone()));
         reader.seek(100).expect("manual seek");
         for width in [500.0, 350.0, 250.0, 180.0] {
-            let _ = TapeRenderMetrics::for_available_width(width);
+            let _ = TapePanelMetrics::for_available_width(width);
         }
         assert_eq!(reader.position(), 100);
         assert_eq!(reader.tape().map(PaperTape::bytes), Some(bytes.as_slice()));
