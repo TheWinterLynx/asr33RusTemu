@@ -20,10 +20,10 @@ serialport = { version = "4.9", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17.2", default-features = false }
+rodio = "0.21"
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Communication",
     "Win32_Foundation",
-    "Win32_Media_Audio",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
