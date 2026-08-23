@@ -15,7 +15,7 @@ use crate::core::events::{
     ApplicationCommand, CommunicationMode, DataFlow, ThrottleOutput, TransportCommand,
     TransportEvent, TransportOperation,
 };
-use crate::core::terminal::{Terminal, TerminalError, TerminalOptions};
+use crate::core::terminal::{CharacterEvent, Terminal, TerminalError, TerminalOptions};
 use crate::core::throttle::{DataThrottle, ThrottleConfig, ThrottleStep};
 
 const MAX_TICK_ROUNDS: usize = 32;
@@ -355,6 +355,10 @@ where
 
     pub fn terminal(&self) -> &Terminal {
         &self.terminal
+    }
+
+    pub fn pop_character_event(&mut self) -> Option<CharacterEvent> {
+        self.terminal.pop_character_event()
     }
 
     pub fn state(&self) -> RuntimeState {

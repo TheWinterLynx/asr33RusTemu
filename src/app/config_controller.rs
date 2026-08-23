@@ -105,7 +105,7 @@ impl ConfigChangePlan {
             "SSH",
             ChangeClass::Unavailable,
         );
-        add(old.sound != new.sound, "sound", ChangeClass::Unavailable);
+        add(old.sound != new.sound, "sound", ChangeClass::Live);
         add(
             old.frontend != new.frontend,
             "legacy frontend",
@@ -211,7 +211,7 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::{InputReturnMode, TerminalMode};
+    use crate::core::config::{InputReturnMode, LidState, MuteState, TerminalMode};
 
     fn config() -> AppConfig {
         AppConfig::from_yaml_str(include_str!("../../asr33_config.yaml")).expect("fixture")
@@ -293,6 +293,26 @@ mod tests {
                 .changes
                 .iter()
                 .any(|x| x.class == ChangeClass::Unavailable)
+        );
+    }
+
+    #[test]
+    fn sound_changes_are_live() {
+        let a = config();
+        let mut b = a.clone();
+        b.sound.config.lid = match a.sound.config.lid {
+            LidState::Up => LidState::Down,
+            LidState::Down => LidState::Up,
+        };
+        b.sound.config.mute_state = match a.sound.config.mute_state {
+            MuteState::Muted => MuteState::Unmuted,
+            MuteState::Unmuted => MuteState::Muted,
+        };
+        let plan = ConfigChangePlan::between(&a, &b);
+        assert!(
+            plan.changes
+                .iter()
+                .any(|change| change.label == "sound" && change.class == ChangeClass::Live)
         );
     }
 

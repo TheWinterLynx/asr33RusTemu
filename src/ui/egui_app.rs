@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Align2, FontData, FontDefinitions, FontFamily, FontId};
 
+use crate::adapters::audio::{AudioAvailability, AudioEngine};
 use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
 use crate::app::config_controller::{ConfigChangePlan, SettingsState, serial_reconnect_required};
@@ -12,8 +13,8 @@ use crate::app::{
     SystemScheduler,
 };
 use crate::core::config::{
-    AppConfig, BackendKind, InputReturnMode, PunchConfigMode, SerialConfig, TapePunchConfig,
-    TapeReaderConfig, TerminalMode, ThrottleMode as ConfigThrottleMode,
+    AppConfig, BackendKind, InputReturnMode, LidState, MuteState, PunchConfigMode, SerialConfig,
+    TapePunchConfig, TapeReaderConfig, TerminalMode, ThrottleMode as ConfigThrottleMode,
 };
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use crate::core::paper_tape::{
@@ -69,6 +70,14 @@ const fn startup_connection_state(
         connection_state: ConnectionState::Disconnected,
         transport_error: None,
         active_serial_config: None,
+    }
+}
+
+#[must_use]
+const fn toggled_lid(lid: LidState) -> LidState {
+    match lid {
+        LidState::Up => LidState::Down,
+        LidState::Down => LidState::Up,
     }
 }
 
@@ -147,6 +156,11 @@ pub struct EguiApp {
     settings_view: SettingsView,
     current_view: AppView,
     active_serial_config: Option<SerialConfig>,
+    audio: AudioEngine,
+    audio_error: Option<String>,
+    sound_muted: bool,
+    lid_state: LidState,
+    reader_audio_running: bool,
 }
 
 impl EguiApp {
@@ -178,6 +192,9 @@ impl EguiApp {
             runtime.connection_state(),
             &startup_connection.connection_state
         );
+        let lid_state = options.applied_config.sound.config.lid;
+        let sound_muted = options.applied_config.sound.config.mute_state == MuteState::Muted;
+        let audio = AudioEngine::start(lid_state, sound_muted);
         let mut application = Self {
             runtime,
             options,
@@ -204,6 +221,11 @@ impl EguiApp {
             settings_view: SettingsView::default(),
             current_view: AppView::Terminal,
             active_serial_config: startup_connection.active_serial_config,
+            audio,
+            audio_error: None,
+            sound_muted,
+            lid_state,
+            reader_audio_running: false,
         };
         application.refresh_ports(PortRefreshPolicy::Silent);
         application.theme.apply(&creation_context.egui_ctx);
@@ -215,6 +237,44 @@ impl EguiApp {
             .map(|ports| ports.into_iter().map(|port| port.port_name).collect())
             .map_err(|error| error.to_string());
         (self.available_ports, self.port_error) = port_enumeration_update(result, policy);
+    }
+
+    fn set_sound_muted(&mut self, muted: bool) {
+        self.sound_muted = muted;
+        self.audio.set_muted(muted);
+    }
+
+    fn toggle_sound_muted(&mut self) {
+        self.set_sound_muted(!self.sound_muted);
+    }
+
+    fn set_lid_state(&mut self, lid: LidState) {
+        self.lid_state = lid;
+        self.audio.set_lid(lid);
+    }
+
+    fn toggle_lid(&mut self) {
+        self.set_lid_state(toggled_lid(self.lid_state));
+    }
+
+    fn sync_reader_audio(&mut self) {
+        let running = self.reader.reader().state() == ReaderState::Running;
+        if running != self.reader_audio_running {
+            self.reader_audio_running = running;
+            self.audio.set_tape_reader_running(running);
+        }
+    }
+
+    fn refresh_audio_status(&mut self) {
+        if let Some(status) = self.audio.refresh_status() {
+            match status {
+                AudioAvailability::Available => self.audio_error = None,
+                AudioAvailability::Unavailable(message) => {
+                    self.audio_error = Some(format!("audio unavailable: {message}"));
+                }
+                AudioAvailability::Starting | AudioAvailability::Stopped => {}
+            }
+        }
     }
 
     fn connect_selected(&mut self) {
@@ -327,6 +387,12 @@ impl EguiApp {
                 ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
             );
         }
+        if old.sound.config.lid != new.sound.config.lid {
+            self.set_lid_state(new.sound.config.lid);
+        }
+        if old.sound.config.mute_state != new.sound.config.mute_state {
+            self.set_sound_muted(new.sound.config.mute_state == MuteState::Muted);
+        }
         self.options.keyboard.uppercase_only = terminal.keyboard_uppercase_only;
         self.options.keyboard.parity = terminal.keyboard_parity_mode;
         self.options.keyboard.return_mode = terminal.input_return_mode;
@@ -410,6 +476,7 @@ impl EguiApp {
             if let Some(input) = logical {
                 match encode_input(&input, self.options.keyboard) {
                     Ok(bytes) if !bytes.is_empty() => {
+                        self.audio.keypress();
                         self.submit(context, ApplicationCommand::Transmit(bytes));
                     }
                     Ok(_) => {}
@@ -444,7 +511,8 @@ impl EguiApp {
                     ApplicationCommand::SetThrottleMode(self.options.throttle_mode),
                 );
             }
-            // F6/F7 are reserved for the future audio slice.
+            egui::Key::F6 => self.toggle_sound_muted(),
+            egui::Key::F7 => self.toggle_lid(),
             egui::Key::F8 => {
                 let mode = match self.options.communication_mode {
                     CommunicationMode::Line => CommunicationMode::Local,
@@ -536,6 +604,11 @@ impl EguiApp {
             }
         }
         self.collect_runtime_events();
+        while let Some(event) = self.runtime.pop_character_event() {
+            self.audio.character(event);
+        }
+        self.sync_reader_audio();
+        self.refresh_audio_status();
         let reader_route_available = self.options.communication_mode == CommunicationMode::Local
             || self.runtime.connection_state() == &ConnectionState::Connected;
         if self.reader.awaiting_confirmation()
@@ -604,10 +677,35 @@ impl EguiApp {
                     ApplicationCommand::SetThrottleMode(self.options.throttle_mode),
                 );
             }
-            ui.add_enabled(false, egui::Button::new("Sound —"))
-                .on_disabled_hover_text("Audio not migrated yet");
-            ui.add_enabled(false, egui::Button::new("Lid —"))
-                .on_disabled_hover_text("Audio not migrated yet");
+            ui.label("Sound");
+            let sound_label = if self.sound_muted { "Muted" } else { "On" };
+            let sound_tooltip = match self.audio.availability() {
+                AudioAvailability::Starting => "Audio device is starting (F6 toggles mute)".to_owned(),
+                AudioAvailability::Available => "Toggle mechanical audio mute (F6)".to_owned(),
+                AudioAvailability::Unavailable(message) => {
+                    format!("Audio unavailable: {message}. F6 still changes the saved mute state")
+                }
+                AudioAvailability::Stopped => "Audio is stopped".to_owned(),
+            };
+            if ui
+                .button(sound_label)
+                .on_hover_text(sound_tooltip)
+                .clicked()
+            {
+                self.toggle_sound_muted();
+            }
+            ui.label("Lid");
+            let lid_label = match self.lid_state {
+                LidState::Up => "Up",
+                LidState::Down => "Down",
+            };
+            if ui
+                .button(lid_label)
+                .on_hover_text("Raise/lower the teletype lid and change acoustic samples (F7)")
+                .clicked()
+            {
+                self.toggle_lid();
+            }
             ui.separator();
             ui.label("Comm");
             if ui
@@ -736,6 +834,7 @@ impl EguiApp {
             .as_ref()
             .or(self.port_error.as_ref())
             .or(self.tape_error.as_ref())
+            .or(self.audio_error.as_ref())
             .cloned();
         if let Some(error) = error {
             ui.horizontal(|ui| {
@@ -748,6 +847,7 @@ impl EguiApp {
                     self.transport_error = None;
                     self.port_error = None;
                     self.tape_error = None;
+                    self.audio_error = None;
                 }
             });
         }
@@ -767,6 +867,12 @@ impl EguiApp {
             PunchMode::Overwrite => PunchConfigMode::Overwrite,
         };
         let serial = self.options.serial_config.clone();
+        let lid_state = self.lid_state;
+        let mute_state = if self.sound_muted {
+            MuteState::Muted
+        } else {
+            MuteState::Unmuted
+        };
         self.settings_state
             .update_applied_from_live_control(|config| {
                 config.terminal.config.mode = match communication_mode {
@@ -784,6 +890,8 @@ impl EguiApp {
                 config.tape_reader.config = tape_reader;
                 config.tape_punch.config = tape_punch;
                 config.backend.serial_config = serial;
+                config.sound.config.lid = lid_state;
+                config.sound.config.mute_state = mute_state;
             });
         if serial_changed {
             self.settings_state.pending_reconnect = serial_reconnect_required(
@@ -1325,9 +1433,12 @@ impl EguiApp {
         self.reader.reader_mut().stop();
         self.reader.unload();
         self.punch = None;
+        self.audio.set_tape_reader_running(false);
+        self.audio.shutdown();
         if let Err(error) = self.runtime.shutdown().and_then(|()| self.runtime.join()) {
             self.transport_error = Some(error.to_string());
         }
+        self.audio.join();
         self.shutdown_complete = true;
     }
 }
@@ -1716,11 +1827,13 @@ mod tests {
         column_status_label, history_scroll_target, keyboard_input_for_event,
         keyboard_input_for_target, open_serial_for_explicit_request, port_enumeration_update,
         punch_status_label, reader_status_label, repaint_delay, should_send_to_terminal,
-        startup_connection_state, stepped_position,
+        startup_connection_state, stepped_position, toggled_lid,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
-    use crate::core::config::{BackendKind, DataBits, SerialConfig, SerialParity, StopBits};
+    use crate::core::config::{
+        BackendKind, DataBits, LidState, SerialConfig, SerialParity, StopBits,
+    };
     use crate::core::paper_tape::{
         PaperTape, PunchMode, PunchState, ReaderOptions, ReaderState, StopCause, TapeReader,
     };
@@ -1833,6 +1946,12 @@ mod tests {
             repaint_delay(PumpStatus::Backpressured),
             Some(Duration::from_millis(10))
         );
+    }
+
+    #[test]
+    fn audio_lid_toggle_is_a_stable_two_state_transition() {
+        assert_eq!(toggled_lid(LidState::Up), LidState::Down);
+        assert_eq!(toggled_lid(LidState::Down), LidState::Up);
     }
 
     #[test]

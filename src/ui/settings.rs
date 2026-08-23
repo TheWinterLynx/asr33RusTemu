@@ -892,13 +892,13 @@ fn tape_punch(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) 
 fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let s = &mut c.sound.config;
     ui.heading("Sound");
-    ui.weak("Audio backend not migrated yet.");
-    section(ui, metrics, "Stored sound preferences");
+    ui.weak("Native ASR-33 mechanical audio. Apply or Save changes the current session immediately.");
+    section(ui, metrics, "Mechanical audio");
     row(
         ui,
         "Lid",
-        "Initial lid state for the legacy mechanical model; Rust audio is not implemented yet.",
-        ChangeClass::Unavailable,
+        "Selects the up/down acoustic sample family and plays the lid mechanism when the state changes.",
+        ChangeClass::Live,
         |ui| {
             ui.selectable_value(&mut s.lid, LidState::Up, "Up");
             ui.selectable_value(&mut s.lid, LidState::Down, "Down");
@@ -907,8 +907,8 @@ fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     row(
         ui,
         "Mute",
-        "Initial audio mute state; Rust audio is not implemented yet.",
-        ChangeClass::Unavailable,
+        "Mutes or unmutes all ASR-33 mechanical audio with the legacy 200 ms fade.",
+        ChangeClass::Live,
         |ui| {
             ui.selectable_value(&mut s.mute_state, MuteState::Muted, "Muted");
             ui.selectable_value(&mut s.mute_state, MuteState::Unmuted, "Unmuted");
@@ -961,7 +961,7 @@ fn ssh(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     row(
         ui,
         "Password",
-        "Password used for SSH authentication when password authentication is enabled.",
+        "Password used to authenticate to the SSH server when password authentication is enabled.",
         ChangeClass::Unavailable,
         |ui| {
             optional_text(ui, &mut s.password, true);

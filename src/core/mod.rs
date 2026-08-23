@@ -1,5 +1,6 @@
 //! Deterministic ASR-33 domain logic.
 
+pub mod audio;
 pub mod config;
 pub mod config_store;
 pub mod events;
