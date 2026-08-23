@@ -33,6 +33,12 @@ enum KeyboardTarget {
     UiText,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapeStepDirection {
+    TowardStart,
+    TowardEnd,
+}
+
 #[derive(Clone, Debug)]
 pub struct UiOptions {
     pub title: String,
@@ -753,11 +759,25 @@ impl EguiApp {
             if ui.add_enabled(stopped, egui::Button::new("Go")).clicked() {
                 self.seek_reader(self.reader_seek_position);
             }
-            if ui.add_enabled(stopped, egui::Button::new("▲")).clicked() {
-                self.seek_reader(self.reader.reader().position().saturating_sub(1));
+            if tape_step_button(ui, TapeStepDirection::TowardStart, stopped)
+                .on_hover_text("Move tape one byte toward start")
+                .clicked()
+            {
+                self.seek_reader(stepped_position(
+                    self.reader.reader().position(),
+                    length,
+                    TapeStepDirection::TowardStart,
+                ));
             }
-            if ui.add_enabled(stopped, egui::Button::new("▼")).clicked() {
-                self.seek_reader((self.reader.reader().position() + 1).min(length));
+            if tape_step_button(ui, TapeStepDirection::TowardEnd, stopped)
+                .on_hover_text("Move tape one byte toward end")
+                .clicked()
+            {
+                self.seek_reader(stepped_position(
+                    self.reader.reader().position(),
+                    length,
+                    TapeStepDirection::TowardEnd,
+                ));
             }
             if ui.button("Follow reader").clicked() {
                 self.reader_view.follow_reader();
@@ -910,6 +930,7 @@ impl EguiApp {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.set_min_size(egui::Vec2::ZERO);
+                    ui.set_clip_rect(ui.max_rect());
                     ui.heading("Paper Tape Punch");
                     Self::panel_header(ui, &mut self.punch_panel);
                     self.punch_contents(ui);
@@ -946,6 +967,7 @@ impl EguiApp {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     ui.set_min_size(egui::Vec2::ZERO);
+                    ui.set_clip_rect(ui.max_rect());
                     ui.heading("Paper Tape Reader");
                     Self::panel_header(ui, &mut self.reader_panel);
                     self.reader_contents(ui);
@@ -1202,6 +1224,60 @@ fn map_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyboardInput> 
     }
 }
 
+#[must_use]
+fn stepped_position(position: usize, tape_length: usize, direction: TapeStepDirection) -> usize {
+    match direction {
+        TapeStepDirection::TowardStart => position.saturating_sub(1),
+        TapeStepDirection::TowardEnd => position.saturating_add(1).min(tape_length),
+    }
+}
+
+fn tape_step_button(
+    ui: &mut egui::Ui,
+    direction: TapeStepDirection,
+    enabled: bool,
+) -> egui::Response {
+    let size = egui::vec2(24.0, 20.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        visuals.corner_radius,
+        visuals.bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let center = rect.center();
+    let points = match direction {
+        TapeStepDirection::TowardStart => [
+            egui::pos2(center.x, center.y - 4.0),
+            egui::pos2(center.x - 5.0, center.y + 3.0),
+            egui::pos2(center.x + 5.0, center.y + 3.0),
+        ],
+        TapeStepDirection::TowardEnd => [
+            egui::pos2(center.x, center.y + 4.0),
+            egui::pos2(center.x - 5.0, center.y - 3.0),
+            egui::pos2(center.x + 5.0, center.y - 3.0),
+        ],
+    };
+    let color = if enabled {
+        visuals.fg_stroke.color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        points.to_vec(),
+        color,
+        egui::Stroke::NONE,
+    ));
+    response
+}
+
 fn apply_tape_shortcut(
     key: egui::Key,
     reader: &mut PanelPresentation,
@@ -1220,8 +1296,9 @@ fn apply_tape_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardTarget, apply_tape_shortcut, history_scroll_target, keyboard_input_for_event,
-        keyboard_input_for_target, repaint_delay, should_send_to_terminal,
+        KeyboardTarget, TapeStepDirection, apply_tape_shortcut, history_scroll_target,
+        keyboard_input_for_event, keyboard_input_for_target, repaint_delay,
+        should_send_to_terminal, stepped_position,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
@@ -1388,5 +1465,13 @@ mod tests {
         assert_eq!(reader.position(), 1);
         assert_eq!(reader.state(), ReaderState::Running);
         assert_eq!(punch.state(), crate::core::paper_tape::PunchState::Running);
+    }
+
+    #[test]
+    fn tape_step_buttons_move_one_byte_and_clamp_to_loaded_tape() {
+        assert_eq!(stepped_position(0, 6, TapeStepDirection::TowardStart), 0);
+        assert_eq!(stepped_position(4, 6, TapeStepDirection::TowardStart), 3);
+        assert_eq!(stepped_position(4, 6, TapeStepDirection::TowardEnd), 5);
+        assert_eq!(stepped_position(6, 6, TapeStepDirection::TowardEnd), 6);
     }
 }

@@ -10,6 +10,8 @@ const PITCH: f32 = 18.0;
 const ROW_HEIGHT: f32 = 22.0;
 const TAPE_WIDTH: f32 = PITCH * 9.0;
 const TOTAL_WIDTH: f32 = TAPE_WIDTH + 160.0;
+pub const READER_SCROLL_ID: &str = "paper-tape-reader-scroll";
+pub const PUNCH_SCROLL_ID: &str = "paper-tape-punch-scroll";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapeColumn {
@@ -108,6 +110,9 @@ pub struct TapeRendererOptions {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReaderTapeViewState {
     follow_reader: bool,
+    follow_scroll_pending: bool,
+    last_reader_position: Option<usize>,
+    last_scroll_offset: f32,
     drag_origin: Option<usize>,
 }
 
@@ -115,6 +120,9 @@ impl Default for ReaderTapeViewState {
     fn default() -> Self {
         Self {
             follow_reader: true,
+            follow_scroll_pending: true,
+            last_reader_position: None,
+            last_scroll_offset: 0.0,
             drag_origin: None,
         }
     }
@@ -128,15 +136,57 @@ impl ReaderTapeViewState {
 
     pub fn follow_reader(&mut self) {
         self.follow_reader = true;
+        self.follow_scroll_pending = true;
     }
 
     pub fn inspect_manually(&mut self) {
         self.follow_reader = false;
+        self.follow_scroll_pending = false;
     }
 
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    fn requested_follow_offset(
+        &mut self,
+        reader_position: usize,
+        viewport_height: f32,
+    ) -> Option<f32> {
+        if self.follow_reader && self.last_reader_position != Some(reader_position) {
+            self.follow_scroll_pending = true;
+        }
+        self.last_reader_position = Some(reader_position);
+        if self.follow_reader && self.follow_scroll_pending {
+            self.follow_scroll_pending = false;
+            Some((reader_position as f32 * ROW_HEIGHT - viewport_height * 0.45).max(0.0))
+        } else {
+            None
+        }
+    }
+
+    fn observe_scroll(
+        &mut self,
+        offset: f32,
+        maximum_offset: f32,
+        wheel: bool,
+        requested_offset: Option<f32>,
+    ) {
+        let scrollbar_changed =
+            requested_offset.is_none() && (offset - self.last_scroll_offset).abs() > f32::EPSILON;
+        let overrode_follow = requested_offset
+            .map(|expected| expected.clamp(0.0, maximum_offset))
+            .is_some_and(|expected| (offset - expected).abs() > 1.0);
+        if wheel || scrollbar_changed || overrode_follow {
+            self.inspect_manually();
+        }
+        self.last_scroll_offset = offset;
+    }
+}
+
+#[must_use]
+pub const fn head_colors(palette: ThemePalette) -> (egui::Color32, egui::Color32) {
+    (palette.active, palette.text)
 }
 
 #[must_use]
@@ -163,6 +213,7 @@ pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions
     let height = ROW_HEIGHT * (prepared.rows.len() as f32 + 1.0);
     let max_height = ui.available_height().max(0.0);
     egui::ScrollArea::both()
+        .id_salt(PUNCH_SCROLL_ID)
         .max_height(max_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -258,12 +309,18 @@ pub fn render_reader_tape(
     options: TapeRendererOptions,
 ) -> Option<usize> {
     let available_height = ui.available_height().max(ROW_HEIGHT);
+    let wheel = ui.rect_contains_pointer(ui.available_rect_before_wrap())
+        && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
+    if wheel {
+        state.inspect_manually();
+    }
+    let requested_offset = state.requested_follow_offset(reader_position, available_height);
     let mut area = egui::ScrollArea::both()
+        .id_salt(READER_SCROLL_ID)
         .max_height(available_height)
         .auto_shrink([false, false]);
-    if state.follow_reader {
-        let centered = reader_position as f32 * ROW_HEIGHT - available_height * 0.45;
-        area = area.vertical_scroll_offset(centered.max(0.0));
+    if let Some(offset) = requested_offset {
+        area = area.vertical_scroll_offset(offset);
     }
     let columns = tape_columns(options.bit_label_base);
     let mut requested = None;
@@ -300,20 +357,30 @@ pub fn render_reader_tape(
             for (visible_index, offset) in range.enumerate() {
                 let center_y = rect.top() + ROW_HEIGHT * (visible_index as f32 + 0.5);
                 if offset == reader_position {
+                    let (head_background, head_foreground) = head_colors(options.palette);
                     painter.rect_filled(
                         egui::Rect::from_center_size(
                             egui::pos2(rect.center().x, center_y),
                             egui::vec2(TOTAL_WIDTH, ROW_HEIGHT),
                         ),
                         0.0,
-                        options.palette.active,
+                        head_background,
                     );
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(rect.left() + 1.0, center_y - 4.0),
+                            egui::pos2(rect.left() + 1.0, center_y + 4.0),
+                            egui::pos2(rect.left() + 7.0, center_y),
+                        ],
+                        head_foreground,
+                        egui::Stroke::NONE,
+                    ));
                     painter.text(
-                        egui::pos2(rect.left(), center_y),
+                        egui::pos2(rect.left() + 9.0, center_y),
                         Align2::LEFT_CENTER,
-                        "▶ HEAD",
+                        "HEAD",
                         FontId::proportional(10.0),
-                        options.palette.active,
+                        head_foreground,
                     );
                 }
                 let Some(&byte) = bytes.get(offset) else {
@@ -381,11 +448,13 @@ pub fn render_reader_tape(
             }
         },
     );
-    if ui.rect_contains_pointer(output.inner_rect)
-        && ui.input(|input| input.smooth_scroll_delta.y != 0.0)
-    {
-        state.inspect_manually();
-    }
+    let maximum_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+    state.observe_scroll(
+        output.state.offset.y,
+        maximum_offset,
+        wheel,
+        requested_offset,
+    );
     requested
 }
 
@@ -482,11 +551,49 @@ mod tests {
     fn reader_view_follow_and_manual_inspection_are_independent_state() {
         let mut state = ReaderTapeViewState::default();
         assert!(state.follows_reader());
+        let requested = state.requested_follow_offset(100, 220.0);
+        assert!(requested.is_some());
+        state.observe_scroll(requested.unwrap_or_default(), 10_000.0, true, requested);
+        assert!(!state.follows_reader(), "mouse wheel disables follow");
+        let position = 17;
+        state.observe_scroll(1_000.0, 10_000.0, false, None);
+        assert_eq!(position, 17, "viewport scroll is not reader position");
+        state.follow_reader();
+        assert!(
+            state.follows_reader(),
+            "Follow reader click restores follow"
+        );
+        let requested = state.requested_follow_offset(101, 220.0);
+        assert!(
+            requested.is_some(),
+            "advancing reader requests one recenter"
+        );
+        state.observe_scroll(requested.unwrap_or_default(), 10_000.0, false, requested);
+        assert!(state.follows_reader());
+        assert_eq!(state.requested_follow_offset(101, 220.0), None);
         state.inspect_manually();
         assert!(!state.follows_reader());
-        state.follow_reader();
-        assert!(state.follows_reader());
         state.reset();
         assert!(state.follows_reader());
+    }
+
+    #[test]
+    fn scrollbar_override_disables_follow_and_scroll_identities_are_distinct() {
+        let mut state = ReaderTapeViewState::default();
+        let requested = state.requested_follow_offset(500, 220.0);
+        state.observe_scroll(8_000.0, 10_000.0, false, requested);
+        assert!(!state.follows_reader());
+        assert_ne!(READER_SCROLL_ID, PUNCH_SCROLL_ID);
+    }
+
+    #[test]
+    fn head_foreground_contrasts_with_background_in_both_themes() {
+        for theme in [
+            crate::ui::theme::ThemeKind::Light,
+            crate::ui::theme::ThemeKind::Dark,
+        ] {
+            let (background, foreground) = head_colors(theme.palette());
+            assert_ne!(background, foreground);
+        }
     }
 }

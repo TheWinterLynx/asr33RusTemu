@@ -100,6 +100,61 @@ mod seek_tests {
         );
         assert_eq!(reader.position(), 3);
     }
+
+    #[test]
+    fn manual_seek_starts_exactly_on_null_even_when_skip_is_enabled() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: true,
+            set_msb: false,
+            auto_stop: false,
+        });
+        reader.load(PaperTape::new(b"AB\0CD".to_vec()));
+        reader.seek(2).expect("manual seek to embedded null");
+        assert!(reader.start());
+        let mut emitted = Vec::new();
+        while let ReaderStep::Byte(byte) = reader.step() {
+            emitted.push(byte);
+        }
+        assert_eq!(emitted, b"\0CD");
+
+        reader.load(PaperTape::new(b"\0\0A".to_vec()));
+        reader.seek(0).expect("explicit zero is still manual");
+        assert!(reader.start());
+        let mut emitted = Vec::new();
+        while let ReaderStep::Byte(byte) = reader.step() {
+            emitted.push(byte);
+        }
+        assert_eq!(emitted, b"\0\0A");
+    }
+
+    #[test]
+    fn rewind_restores_legacy_leading_null_skip() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: true,
+            set_msb: false,
+            auto_stop: false,
+        });
+        reader.load(PaperTape::new(b"\0\0A".to_vec()));
+        reader.seek(1).expect("manual seek");
+        assert!(reader.rewind());
+        assert!(reader.start());
+        assert_eq!(reader.position(), 2);
+        assert_eq!(reader.step(), ReaderStep::Byte(b'A'));
+    }
+
+    #[test]
+    fn manual_seek_to_null_trailer_does_not_skip_before_autostop() {
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: true,
+            set_msb: false,
+            auto_stop: true,
+        });
+        reader.load(PaperTape::new(b"AB\0\0".to_vec()));
+        reader.seek(2).expect("manual seek to trailer start");
+        assert!(reader.start());
+        assert_eq!(reader.step(), ReaderStep::Byte(0));
+        assert_eq!(reader.step(), ReaderStep::Stopped(StopCause::TrailingNull));
+    }
 }
 
 impl Default for ReaderOptions {
@@ -148,6 +203,7 @@ pub struct TapeReader {
     state: ReaderState,
     stop_cause: Option<StopCause>,
     options: ReaderOptions,
+    manually_positioned: bool,
 }
 
 impl TapeReader {
@@ -159,6 +215,7 @@ impl TapeReader {
             state: ReaderState::Unloaded,
             stop_cause: None,
             options,
+            manually_positioned: false,
         }
     }
 
@@ -166,6 +223,7 @@ impl TapeReader {
         self.tape = Some(tape);
         self.position = 0;
         self.state = ReaderState::Stopped;
+        self.manually_positioned = false;
         // legacy behavior: loading does not clear a previous stop cause. It is
         // cleared when the reader is turned on.
     }
@@ -173,6 +231,7 @@ impl TapeReader {
     pub fn unload(&mut self) -> Option<PaperTape> {
         self.position = 0;
         self.state = ReaderState::Unloaded;
+        self.manually_positioned = false;
         self.tape.take()
     }
 
@@ -213,11 +272,12 @@ impl TapeReader {
             return false;
         };
 
-        if self.options.skip_leading_nulls {
+        if self.options.skip_leading_nulls && !self.manually_positioned {
             while self.position < tape.len() && tape.bytes()[self.position] == 0o000 {
                 self.position += 1;
             }
         }
+        self.manually_positioned = false;
         self.state = ReaderState::Running;
         self.stop_cause = None;
         true
@@ -232,6 +292,7 @@ impl TapeReader {
     pub fn rewind(&mut self) -> bool {
         if self.tape.is_some() && self.state != ReaderState::Running && self.position > 0 {
             self.position = 0;
+            self.manually_positioned = false;
             true
         } else {
             false
@@ -253,6 +314,7 @@ impl TapeReader {
         }
         self.position = position;
         self.stop_cause = None;
+        self.manually_positioned = true;
         Ok(())
     }
 
