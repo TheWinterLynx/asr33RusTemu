@@ -24,7 +24,7 @@ use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 use super::layout::{
     DockSplitState, DockWidthState, PanelPlacement, PanelPresentation, TerminalMetrics,
 };
-use super::settings::{SettingsAction, SettingsWindow};
+use super::settings::{AppView, SettingsAction, SettingsUiMetrics, SettingsView};
 use super::tape_view::{
     ReaderTapeViewState, TapePanelMetrics, TapeRendererOptions, TapeSourceOrder,
     render_reader_tape, render_tape,
@@ -98,7 +98,8 @@ pub struct EguiApp {
     available_ports: Vec<String>,
     port_error: Option<String>,
     settings_state: SettingsState,
-    settings_window: SettingsWindow,
+    settings_view: SettingsView,
+    current_view: AppView,
     active_serial_config: Option<SerialConfig>,
 }
 
@@ -148,7 +149,8 @@ impl EguiApp {
             available_ports: Vec::new(),
             port_error: None,
             settings_state,
-            settings_window: SettingsWindow::default(),
+            settings_view: SettingsView::default(),
+            current_view: AppView::Terminal,
             active_serial_config: None,
         };
         application.refresh_ports();
@@ -304,9 +306,9 @@ impl EguiApp {
         };
         self.options.serial_config = new.backend.serial_config.clone();
         self.options.backend_kind = new.backend.kind;
-        self.theme = self.settings_window.draft_theme;
+        self.theme = self.settings_view.draft_theme;
         self.theme.apply(context);
-        self.settings_window.applied_theme = self.theme;
+        self.settings_view.applied_theme = self.theme;
         self.settings_state.commit_apply(&plan);
         self.settings_state.pending_reconnect = self.options.backend_kind == BackendKind::Serial
             && serial_reconnect_required(
@@ -318,39 +320,40 @@ impl EguiApp {
     }
 
     fn handle_settings_action(&mut self, context: &egui::Context, action: SettingsAction) {
-        self.settings_window.error = None;
+        self.settings_view.error = None;
         match action {
             SettingsAction::Apply => {
                 if let Err(error) = self.apply_settings(context) {
-                    self.settings_window.error = Some(error);
+                    self.settings_view.error = Some(error);
                 }
             }
             SettingsAction::Save => match self.apply_settings(context) {
                 Ok(()) => {
                     if let Err(error) = self.settings_state.save_applied() {
-                        self.settings_window.error = Some(format!("Applied, save failed: {error}"));
+                        self.settings_view.error = Some(format!("Applied, save failed: {error}"));
                     }
                 }
-                Err(error) => self.settings_window.error = Some(error),
+                Err(error) => self.settings_view.error = Some(error),
             },
             SettingsAction::Cancel => {
                 self.settings_state.cancel();
-                self.settings_window.draft_theme = self.settings_window.applied_theme;
-                self.settings_window.open = false;
+                self.settings_view.draft_theme = self.settings_view.applied_theme;
+                self.current_view.show_terminal();
             }
             SettingsAction::Revert => {
                 self.settings_state.revert();
-                self.settings_window.draft_theme = self.settings_window.applied_theme;
+                self.settings_view.draft_theme = self.settings_view.applied_theme;
             }
             SettingsAction::Reconnect => {
                 if self.options.backend_kind == BackendKind::Serial {
                     self.disconnect();
                     self.connect_selected();
                 } else {
-                    self.settings_window.error = Some("SSH backend not migrated yet".to_owned());
+                    self.settings_view.error = Some("SSH backend not migrated yet".to_owned());
                 }
             }
             SettingsAction::RefreshPorts => self.refresh_ports(),
+            SettingsAction::Close => self.current_view.show_terminal(),
         }
     }
 
@@ -745,8 +748,8 @@ impl EguiApp {
                 &self.options.serial_config,
             );
         }
-        self.settings_window.applied_theme = self.theme;
-        self.settings_window.draft_theme = self.theme;
+        self.settings_view.applied_theme = self.theme;
+        self.settings_view.draft_theme = self.theme;
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
@@ -1314,60 +1317,69 @@ impl eframe::App for EguiApp {
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title));
-        egui::Panel::top("application-menu")
-            .resizable(false)
-            .show(ui, |ui| {
-                egui::MenuBar::new().ui(ui, |ui| {
-                    if ui.button("Settings").clicked() {
-                        self.settings_window
-                            .open(&mut self.settings_state, self.theme);
-                    }
+        match self.current_view {
+            AppView::Terminal => {
+                egui::Panel::top("application-menu")
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        egui::MenuBar::new().ui(ui, |ui| {
+                            if ui.button("Settings").clicked() {
+                                self.settings_view
+                                    .open(&mut self.settings_state, self.theme);
+                                self.current_view.open_settings();
+                            }
+                        });
+                    });
+                egui::Panel::bottom("operation-bar")
+                    .resizable(false)
+                    .show(ui, |ui| self.controls(ui));
+                if self.reader_panel.placement() == PanelPlacement::Docked
+                    || self.punch_panel.placement() == PanelPlacement::Docked
+                {
+                    let viewport_width = ui.available_width();
+                    let maximum = (viewport_width * 0.55).max(230.0);
+                    let response = egui::Panel::left("paper-tape-dock")
+                        .default_size(self.dock_width.width())
+                        .min_size(230.0)
+                        .max_size(maximum)
+                        .resizable(true)
+                        .frame(
+                            egui::Frame::new()
+                                .fill(self.theme.palette().paper)
+                                .inner_margin(10.0),
+                        )
+                        .show(ui, |ui| self.docked_tapes(ui));
+                    self.dock_width
+                        .retain_requested(response.response.rect.width(), viewport_width);
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(self.theme.palette().app_background))
+                    .show(ui, |ui| self.terminal(ui));
+                self.undocked_tapes(ui.ctx());
+                self.handle_keyboard(ui.ctx());
+                self.sync_controls_to_applied();
+            }
+            AppView::Settings => {
+                self.keyboard_target = KeyboardTarget::UiText;
+                let viewport = ui.ctx().input(|input| {
+                    input
+                        .viewport()
+                        .inner_rect
+                        .map_or_else(|| input.content_rect().size(), |rect| rect.size())
                 });
-            });
-        if self.settings_window.open {
-            ui.disable();
-        }
-        egui::Panel::bottom("operation-bar")
-            .resizable(false)
-            .show(ui, |ui| self.controls(ui));
-        if self.reader_panel.placement() == PanelPlacement::Docked
-            || self.punch_panel.placement() == PanelPlacement::Docked
-        {
-            let viewport_width = ui.available_width();
-            let maximum = (viewport_width * 0.55).max(230.0);
-            let response = egui::Panel::left("paper-tape-dock")
-                .default_size(self.dock_width.width())
-                .min_size(230.0)
-                .max_size(maximum)
-                .resizable(true)
-                .frame(
-                    egui::Frame::new()
-                        .fill(self.theme.palette().paper)
-                        .inner_margin(10.0),
-                )
-                .show(ui, |ui| self.docked_tapes(ui));
-            self.dock_width
-                .retain_requested(response.response.rect.width(), viewport_width);
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.theme.palette().app_background))
-            .show(ui, |ui| self.terminal(ui));
-        self.undocked_tapes(ui.ctx());
-        let settings_action = self.settings_window.show(
-            ui.ctx(),
-            &mut self.settings_state,
-            &self.available_ports,
-            self.runtime.connection_state() == &ConnectionState::Connected,
-            self.active_serial_config.as_ref(),
-        );
-        if let Some(action) = settings_action {
-            self.handle_settings_action(ui.ctx(), action);
-        }
-        if self.settings_window.open {
-            self.keyboard_target = KeyboardTarget::UiText;
-        } else {
-            self.handle_keyboard(ui.ctx());
-            self.sync_controls_to_applied();
+                let metrics = SettingsUiMetrics::from_viewport(viewport);
+                let settings_action = self.settings_view.show(
+                    ui,
+                    metrics,
+                    &mut self.settings_state,
+                    &self.available_ports,
+                    self.runtime.connection_state() == &ConnectionState::Connected,
+                    self.active_serial_config.as_ref(),
+                );
+                if let Some(action) = settings_action {
+                    self.handle_settings_action(ui.ctx(), action);
+                }
+            }
         }
     }
 

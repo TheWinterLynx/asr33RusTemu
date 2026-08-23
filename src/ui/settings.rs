@@ -6,7 +6,7 @@ use crate::app::config_controller::{ChangeClass, SettingsState};
 use crate::core::config::*;
 use eframe::egui;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum SettingsPage {
     #[default]
     General,
@@ -19,6 +19,74 @@ pub enum SettingsPage {
     Ssh,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AppView {
+    #[default]
+    Terminal,
+    Settings,
+}
+
+impl AppView {
+    pub fn open_settings(&mut self) {
+        *self = Self::Settings;
+    }
+    pub fn show_terminal(&mut self) {
+        *self = Self::Terminal;
+    }
+}
+
+pub const SETTINGS_REFERENCE_WIDTH: f32 = 1280.0;
+pub const SETTINGS_REFERENCE_HEIGHT: f32 = 780.0;
+pub const MIN_SETTINGS_SCALE: f32 = 0.80;
+pub const MAX_SETTINGS_SCALE: f32 = 1.30;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettingsUiMetrics {
+    pub scale: f32,
+    pub title_font: f32,
+    pub section_font: f32,
+    pub body_font: f32,
+    pub small_font: f32,
+    pub nav_font: f32,
+    pub badge_font: f32,
+    pub button_height: f32,
+    pub row_height: f32,
+    pub row_spacing: f32,
+    pub section_spacing: f32,
+    pub padding: f32,
+    pub nav_width: f32,
+    pub label_width: f32,
+    pub control_width: f32,
+    pub footer_button_width: f32,
+}
+
+impl SettingsUiMetrics {
+    #[must_use]
+    pub fn from_viewport(viewport: egui::Vec2) -> Self {
+        let viewport_scale =
+            (viewport.x / SETTINGS_REFERENCE_WIDTH).min(viewport.y / SETTINGS_REFERENCE_HEIGHT);
+        let scale = viewport_scale.clamp(MIN_SETTINGS_SCALE, MAX_SETTINGS_SCALE);
+        Self {
+            scale,
+            title_font: 25.0 * scale,
+            section_font: 18.0 * scale,
+            body_font: 14.0 * scale,
+            small_font: 12.0 * scale,
+            nav_font: 15.0 * scale,
+            badge_font: 11.0 * scale,
+            button_height: 28.0 * scale,
+            row_height: 31.0 * scale,
+            row_spacing: 7.0 * scale,
+            section_spacing: 15.0 * scale,
+            padding: 14.0 * scale,
+            nav_width: 155.0 * scale,
+            label_width: 175.0 * scale,
+            control_width: 310.0 * scale,
+            footer_button_width: 76.0 * scale,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsAction {
     Apply,
@@ -27,11 +95,11 @@ pub enum SettingsAction {
     Revert,
     Reconnect,
     RefreshPorts,
+    Close,
 }
 
 #[derive(Debug, Default)]
-pub struct SettingsWindow {
-    pub open: bool,
+pub struct SettingsView {
     page: SettingsPage,
     pub error: Option<String>,
     confirm_discard: bool,
@@ -39,48 +107,73 @@ pub struct SettingsWindow {
     pub draft_theme: ThemeKind,
 }
 
-impl SettingsWindow {
+impl SettingsView {
     pub fn open(&mut self, state: &mut SettingsState, theme: ThemeKind) {
         state.open();
         self.applied_theme = theme;
         self.draft_theme = theme;
         self.error = None;
-        self.open = true;
+        self.confirm_discard = false;
+    }
+
+    pub fn request_close(&mut self, dirty: bool) -> Option<SettingsAction> {
+        if dirty {
+            self.confirm_discard = true;
+            None
+        } else {
+            Some(SettingsAction::Close)
+        }
+    }
+
+    pub fn keep_editing(&mut self) {
+        self.confirm_discard = false;
+    }
+
+    #[must_use]
+    pub const fn discard_confirmation_visible(&self) -> bool {
+        self.confirm_discard
     }
 
     pub fn show(
         &mut self,
-        context: &egui::Context,
+        ui: &mut egui::Ui,
+        metrics: SettingsUiMetrics,
         state: &mut SettingsState,
         ports: &[String],
         connected: bool,
         active_serial: Option<&SerialConfig>,
     ) -> Option<SettingsAction> {
-        if !self.open {
-            return None;
-        }
-        let mut open = self.open;
         let mut action = None;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .resizable(true)
-            .default_size([850.0, 610.0])
-            .show(context, |ui| {
+        apply_settings_style(ui, metrics);
+        egui::Panel::top("settings-view-header")
+            .resizable(false)
+            .exact_size(56.0 * metrics.scale)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        for (page, label) in pages() {
-                            ui.selectable_value(&mut self.page, page, label);
+                    ui.label(
+                        egui::RichText::new("Settings")
+                            .size(metrics.title_font)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized(
+                                [metrics.button_height, metrics.button_height],
+                                egui::Button::new("X"),
+                            )
+                            .on_hover_text("Close Settings")
+                            .clicked()
+                        {
+                            action = self.request_close(
+                                state.draft_dirty() || self.draft_theme != self.applied_theme,
+                            );
                         }
                     });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("settings-content")
-                        .show(ui, |ui| {
-                            ui.set_min_width(610.0);
-                            self.page(ui, state, ports, connected, active_serial);
-                        });
                 });
-                ui.separator();
+            });
+        egui::Panel::bottom("settings-view-footer")
+            .resizable(false)
+            .show(ui, |ui| {
                 ui.label(format!("Config file: {}", state.path().display()));
                 if self.page == SettingsPage::Connection
                     && ui.small_button("Refresh serial ports").clicked()
@@ -110,18 +203,42 @@ impl SettingsWindow {
                 if let Some(error) = &self.error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        action = Some(SettingsAction::Cancel);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [metrics.footer_button_width, metrics.button_height],
+                            egui::Button::new("Save"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(SettingsAction::Save);
                     }
-                    if ui.button("Revert").clicked() {
-                        action = Some(SettingsAction::Revert);
-                    }
-                    if ui.button("Apply").clicked() {
+                    if ui
+                        .add_sized(
+                            [metrics.footer_button_width, metrics.button_height],
+                            egui::Button::new("Apply"),
+                        )
+                        .clicked()
+                    {
                         action = Some(SettingsAction::Apply);
                     }
-                    if ui.button("Save").clicked() {
-                        action = Some(SettingsAction::Save);
+                    if ui
+                        .add_sized(
+                            [metrics.footer_button_width, metrics.button_height],
+                            egui::Button::new("Revert"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(SettingsAction::Revert);
+                    }
+                    if ui
+                        .add_sized(
+                            [metrics.footer_button_width, metrics.button_height],
+                            egui::Button::new("Cancel"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(SettingsAction::Cancel);
                     }
                     if state.pending_reconnect
                         && ui
@@ -140,43 +257,102 @@ impl SettingsWindow {
                             self.confirm_discard = false;
                         }
                         if ui.button("Keep editing").clicked() {
-                            self.confirm_discard = false;
+                            self.keep_editing();
                         }
                     });
                 }
             });
-        if !open {
-            if state.draft_dirty() || self.draft_theme != self.applied_theme {
-                self.confirm_discard = true;
-                self.open = true;
-            } else {
-                self.open = false;
-            }
-        }
+        egui::Panel::left("settings-view-navigation")
+            .resizable(false)
+            .exact_size(metrics.nav_width)
+            .show(ui, |ui| {
+                ui.add_space(metrics.padding);
+                for (page, label) in pages() {
+                    if ui
+                        .add_sized(
+                            [
+                                metrics.nav_width - 2.0 * metrics.padding,
+                                metrics.button_height,
+                            ],
+                            egui::Button::selectable(
+                                self.page == page,
+                                egui::RichText::new(label).size(metrics.nav_font),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.page = page;
+                    }
+                }
+            });
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(("settings-content", self.page))
+                .show(ui, |ui| {
+                    ui.add_space(metrics.padding);
+                    self.page(ui, metrics, state, ports, connected, active_serial);
+                    ui.add_space(metrics.padding);
+                });
+        });
         action
     }
 
     fn page(
         &mut self,
         ui: &mut egui::Ui,
+        metrics: SettingsUiMetrics,
         state: &mut SettingsState,
         ports: &[String],
         connected: bool,
         active_serial: Option<&SerialConfig>,
     ) {
         match self.page {
-            SettingsPage::General => general(ui, state, &mut self.draft_theme),
-            SettingsPage::Terminal => terminal(ui, &mut state.draft_config),
-            SettingsPage::Connection => {
-                connection(ui, &mut state.draft_config, ports, connected, active_serial)
-            }
-            SettingsPage::Throttle => throttle(ui, &mut state.draft_config),
-            SettingsPage::TapeReader => tape_reader(ui, &mut state.draft_config),
-            SettingsPage::TapePunch => tape_punch(ui, &mut state.draft_config),
-            SettingsPage::Sound => sound(ui, &mut state.draft_config),
-            SettingsPage::Ssh => ssh(ui, &mut state.draft_config),
+            SettingsPage::General => general(ui, metrics, state, &mut self.draft_theme),
+            SettingsPage::Terminal => terminal(ui, metrics, &mut state.draft_config),
+            SettingsPage::Connection => connection(
+                ui,
+                metrics,
+                &mut state.draft_config,
+                ports,
+                connected,
+                active_serial,
+            ),
+            SettingsPage::Throttle => throttle(ui, metrics, &mut state.draft_config),
+            SettingsPage::TapeReader => tape_reader(ui, metrics, &mut state.draft_config),
+            SettingsPage::TapePunch => tape_punch(ui, metrics, &mut state.draft_config),
+            SettingsPage::Sound => sound(ui, metrics, &mut state.draft_config),
+            SettingsPage::Ssh => ssh(ui, metrics, &mut state.draft_config),
         }
     }
+}
+
+fn apply_settings_style(ui: &mut egui::Ui, metrics: SettingsUiMetrics) {
+    let mut style = (**ui.style()).clone();
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::proportional(metrics.body_font),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::proportional(metrics.body_font),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::proportional(metrics.small_font),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::proportional(metrics.section_font),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(metrics.badge_font),
+    );
+    style.spacing.item_spacing = egui::vec2(metrics.row_spacing, metrics.row_spacing);
+    style.spacing.interact_size.y = metrics.row_height;
+    style.spacing.indent = metrics.label_width;
+    style.spacing.text_edit_width = metrics.control_width;
+    ui.set_style(style);
 }
 
 fn pages() -> [(SettingsPage, &'static str); 8] {
@@ -192,20 +368,48 @@ fn pages() -> [(SettingsPage, &'static str); 8] {
     ]
 }
 fn badge(ui: &mut egui::Ui, class: ChangeClass) {
-    ui.weak(match class {
-        ChangeClass::Live => "LIVE",
-        ChangeClass::Reconnect => "RECONNECT",
-        ChangeClass::Restart => "RESTART",
-        ChangeClass::Unavailable => "NOT IMPLEMENTED",
-        ChangeClass::Legacy => "LEGACY",
-    });
+    let (short, explanation) = match class {
+        ChangeClass::Live => ("LIVE", "Applies to the current session"),
+        ChangeClass::Reconnect => ("RECONNECT", "Requires an explicit serial reconnect"),
+        ChangeClass::Restart => ("RESTART", "Takes effect after restarting the application"),
+        ChangeClass::Unavailable => ("N/A", "Stored for compatibility; not implemented yet"),
+        ChangeClass::Legacy => ("LEGACY", "Legacy compatibility input"),
+    };
+    ui.label(egui::RichText::new(short).monospace().weak())
+        .on_hover_text(explanation);
 }
 fn row(ui: &mut egui::Ui, label: &str, class: ChangeClass, add: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        add(ui);
-        badge(ui, class);
-    });
+    let body = ui.text_style_height(&egui::TextStyle::Body);
+    let row_height = ui.spacing().interact_size.y.max(body * 2.0);
+    let label_width = ui.spacing().indent;
+    let control_width = ui
+        .spacing()
+        .text_edit_width
+        .min((ui.available_width() - label_width - body * 6.0).max(body * 8.0));
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add_sized([label_width, row_height], egui::Label::new(label));
+            ui.allocate_ui_with_layout(
+                egui::vec2(control_width, row_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                add,
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                badge(ui, class)
+            });
+        },
+    );
+}
+fn section(ui: &mut egui::Ui, metrics: SettingsUiMetrics, title: &str) {
+    ui.add_space(metrics.section_spacing);
+    ui.label(
+        egui::RichText::new(title)
+            .size(metrics.section_font)
+            .strong(),
+    );
+    ui.separator();
 }
 fn path(ui: &mut egui::Ui, value: &mut std::path::PathBuf) {
     let mut text = value.to_string_lossy().into_owned();
@@ -232,38 +436,42 @@ fn optional_text(ui: &mut egui::Ui, value: &mut Option<String>, password: bool) 
     }
 }
 
-fn general(ui: &mut egui::Ui, state: &mut SettingsState, theme: &mut ThemeKind) {
+fn general(
+    ui: &mut egui::Ui,
+    metrics: SettingsUiMetrics,
+    state: &mut SettingsState,
+    theme: &mut ThemeKind,
+) {
     ui.heading("General / Appearance");
+    section(ui, metrics, "Appearance");
     row(ui, "Theme", ChangeClass::Live, |ui| {
         ui.selectable_value(theme, ThemeKind::Light, "Light");
         ui.selectable_value(theme, ThemeKind::Dark, "Dark");
     });
-    ui.separator();
-    ui.heading("Legacy compatibility");
+    section(ui, metrics, "Compatibility");
     ui.label(format!(
         "frontend.type = {:?} (read-only; Rust always uses egui)",
         state.draft_config.frontend.kind
     ));
 }
-fn terminal(ui: &mut egui::Ui, c: &mut AppConfig) {
+fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.terminal.config;
     ui.heading("Terminal");
+    section(ui, metrics, "Behavior");
     row(ui, "Communication", ChangeClass::Live, |ui| {
         ui.selectable_value(&mut t.mode, TerminalMode::Line, "LINE");
         ui.selectable_value(&mut t.mode, TerminalMode::Local, "LOCAL");
     });
-    row(ui, "Columns", ChangeClass::Restart, |ui| {
-        ui.add(egui::DragValue::new(&mut t.columns).range(1..=10000));
-    });
-    row(ui, "Rows", ChangeClass::Restart, |ui| {
-        ui.add(egui::DragValue::new(&mut t.rows).range(1..=10000));
-    });
-    row(ui, "Scrollback", ChangeClass::Restart, |ui| {
-        ui.add(egui::DragValue::new(&mut t.scrollback));
-    });
     row(ui, "Autowrap", ChangeClass::Restart, |ui| {
         ui.checkbox(&mut t.autowrap, "");
     });
+    let mut enabled = !t.no_print;
+    row(ui, "Printer enabled", ChangeClass::Live, |ui| {
+        if ui.checkbox(&mut enabled, "").changed() {
+            t.no_print = !enabled;
+        }
+    });
+    section(ui, metrics, "Keyboard");
     row(ui, "Uppercase only", ChangeClass::Live, |ui| {
         ui.checkbox(&mut t.keyboard_uppercase_only, "");
     });
@@ -280,15 +488,15 @@ fn terminal(ui: &mut egui::Ui, c: &mut AppConfig) {
         ui.selectable_value(&mut t.input_return_mode, InputReturnMode::Cr, "Raw");
         ui.selectable_value(&mut t.input_return_mode, InputReturnMode::CrLf, "CR+LF");
     });
-    row(ui, "Send CR at startup", ChangeClass::Restart, |ui| {
-        ui.checkbox(&mut t.send_cr_at_startup, "")
-            .on_hover_text("Next application session only");
+    section(ui, metrics, "Dimensions and font");
+    row(ui, "Columns", ChangeClass::Restart, |ui| {
+        ui.add(egui::DragValue::new(&mut t.columns).range(1..=10000));
     });
-    let mut enabled = !t.no_print;
-    row(ui, "Printer enabled", ChangeClass::Live, |ui| {
-        if ui.checkbox(&mut enabled, "").changed() {
-            t.no_print = !enabled;
-        }
+    row(ui, "Rows", ChangeClass::Restart, |ui| {
+        ui.add(egui::DragValue::new(&mut t.rows).range(1..=10000));
+    });
+    row(ui, "Scrollback", ChangeClass::Restart, |ui| {
+        ui.add(egui::DragValue::new(&mut t.scrollback));
     });
     row(ui, "Font path", ChangeClass::Restart, |ui| {
         optional_path(ui, &mut t.font_path)
@@ -296,15 +504,22 @@ fn terminal(ui: &mut egui::Ui, c: &mut AppConfig) {
     row(ui, "Font size", ChangeClass::Live, |ui| {
         ui.add(egui::DragValue::new(&mut t.font_size).range(1..=200));
     });
+    section(ui, metrics, "Startup");
+    row(ui, "Send CR at startup", ChangeClass::Restart, |ui| {
+        ui.checkbox(&mut t.send_cr_at_startup, "")
+            .on_hover_text("Takes effect on the next application session");
+    });
 }
 fn connection(
     ui: &mut egui::Ui,
+    metrics: SettingsUiMetrics,
     c: &mut AppConfig,
     ports: &[String],
     connected: bool,
     active_serial: Option<&SerialConfig>,
 ) {
     ui.heading("Connection");
+    section(ui, metrics, "Status");
     ui.label(if connected {
         "Connected"
     } else {
@@ -317,10 +532,7 @@ fn connection(
         ));
         ui.weak("Edits below are desired settings and do not alter this live connection until Reconnect now.");
     }
-    row(ui, "Backend", ChangeClass::Unavailable, |ui| {
-        ui.selectable_value(&mut c.backend.kind, BackendKind::Serial, "Serial");
-        ui.selectable_value(&mut c.backend.kind, BackendKind::Ssh, "SSH (not migrated)");
-    });
+    section(ui, metrics, "Serial connection");
     let s = &mut c.backend.serial_config;
     row(ui, "Port", ChangeClass::Reconnect, |ui| {
         ui.text_edit_singleline(&mut s.port);
@@ -365,10 +577,16 @@ fn connection(
             ui.selectable_value(&mut s.stopbits, x, n);
         }
     });
+    section(ui, metrics, "Backend");
+    row(ui, "Backend type", ChangeClass::Unavailable, |ui| {
+        ui.selectable_value(&mut c.backend.kind, BackendKind::Serial, "Serial");
+        ui.selectable_value(&mut c.backend.kind, BackendKind::Ssh, "SSH (not migrated)");
+    });
 }
-fn throttle(ui: &mut egui::Ui, c: &mut AppConfig) {
+fn throttle(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.data_throttle.config;
     ui.heading("Data Rate / Throttle");
+    section(ui, metrics, "Pacing");
     row(ui, "Mode", ChangeClass::Live, |ui| {
         ui.selectable_value(&mut t.mode, ThrottleMode::Throttled, "Throttled");
         ui.selectable_value(&mut t.mode, ThrottleMode::Unthrottled, "Unthrottled");
@@ -380,44 +598,22 @@ fn throttle(ui: &mut egui::Ui, c: &mut AppConfig) {
         ui.add(egui::DragValue::new(&mut t.receive_rate_cps).range(1..=i64::MAX));
     });
 }
-fn tape_reader(ui: &mut egui::Ui, c: &mut AppConfig) {
+fn tape_reader(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.tape_reader.config;
     ui.heading("Paper Tape Reader");
-    row(ui, "Max visible rows", ChangeClass::Live, |ui| {
-        ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
-    });
-    row(ui, "Initial file path", ChangeClass::Live, |ui| {
-        path(ui, &mut t.initial_file_path)
-    });
+    section(ui, metrics, "Behavior");
     for (label, v) in [
         ("Skip leading nulls", &mut t.skip_leading_nulls),
         ("Auto-stop trailers", &mut t.auto_stop),
         ("Set MSB", &mut t.set_msb),
-        ("Ghost outline", &mut t.ghost_outline),
-        ("ASCII masks MSB", &mut t.ascii_char_mask_msb),
     ] {
         row(ui, label, ChangeClass::Live, |ui| {
             ui.checkbox(v, "");
         });
     }
-    row(ui, "Bit label base", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
-        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
-    });
-    ui.weak("Behavioral changes affect future bytes and never reposition loaded tape.");
-}
-fn tape_punch(ui: &mut egui::Ui, c: &mut AppConfig) {
-    let t = &mut c.tape_punch.config;
-    ui.heading("Paper Tape Punch");
+    section(ui, metrics, "Display");
     row(ui, "Max visible rows", ChangeClass::Live, |ui| {
         ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
-    });
-    row(ui, "Initial file path", ChangeClass::Live, |ui| {
-        path(ui, &mut t.initial_file_path)
-    });
-    row(ui, "Next file mode", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.mode, PunchConfigMode::Append, "Append");
-        ui.selectable_value(&mut t.mode, PunchConfigMode::Overwrite, "Overwrite");
     });
     for (label, v) in [
         ("Ghost outline", &mut t.ghost_outline),
@@ -431,12 +627,47 @@ fn tape_punch(ui: &mut egui::Ui, c: &mut AppConfig) {
         ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
         ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
     });
+    section(ui, metrics, "Files");
+    row(ui, "Initial file path", ChangeClass::Live, |ui| {
+        path(ui, &mut t.initial_file_path)
+    });
+    ui.weak("Behavioral changes affect future bytes and never reposition loaded tape.");
+}
+fn tape_punch(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
+    let t = &mut c.tape_punch.config;
+    ui.heading("Paper Tape Punch");
+    section(ui, metrics, "Behavior");
+    row(ui, "Next file mode", ChangeClass::Live, |ui| {
+        ui.selectable_value(&mut t.mode, PunchConfigMode::Append, "Append");
+        ui.selectable_value(&mut t.mode, PunchConfigMode::Overwrite, "Overwrite");
+    });
+    section(ui, metrics, "Display");
+    row(ui, "Max visible rows", ChangeClass::Live, |ui| {
+        ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
+    });
+    for (label, v) in [
+        ("Ghost outline", &mut t.ghost_outline),
+        ("ASCII masks MSB", &mut t.ascii_char_mask_msb),
+    ] {
+        row(ui, label, ChangeClass::Live, |ui| {
+            ui.checkbox(v, "");
+        });
+    }
+    row(ui, "Bit label base", ChangeClass::Live, |ui| {
+        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
+        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
+    });
+    section(ui, metrics, "Files");
+    row(ui, "Initial file path", ChangeClass::Live, |ui| {
+        path(ui, &mut t.initial_file_path)
+    });
     ui.weak("Mode and initial path apply to the next selected file; an open file is never reopened or truncated.");
 }
-fn sound(ui: &mut egui::Ui, c: &mut AppConfig) {
+fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let s = &mut c.sound.config;
     ui.heading("Sound");
-    ui.colored_label(ui.visuals().warn_fg_color, "Audio not implemented yet");
+    ui.weak("Audio backend not migrated yet.");
+    section(ui, metrics, "Stored sound preferences");
     row(ui, "Lid", ChangeClass::Unavailable, |ui| {
         ui.selectable_value(&mut s.lid, LidState::Up, "Up");
         ui.selectable_value(&mut s.lid, LidState::Down, "Down");
@@ -446,14 +677,14 @@ fn sound(ui: &mut egui::Ui, c: &mut AppConfig) {
         ui.selectable_value(&mut s.mute_state, MuteState::Unmuted, "Unmuted");
     });
 }
-fn ssh(ui: &mut egui::Ui, c: &mut AppConfig) {
+fn ssh(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let s = &mut c.backend.ssh_config;
     ui.heading("SSH");
     ui.colored_label(
         ui.visuals().warn_fg_color,
         "SSH backend not migrated yet; values can be safely persisted.",
     );
-    ui.heading("Connection");
+    section(ui, metrics, "Connection");
     row(ui, "Host", ChangeClass::Unavailable, |ui| {
         ui.text_edit_singleline(&mut s.host);
     });
@@ -463,7 +694,7 @@ fn ssh(ui: &mut egui::Ui, c: &mut AppConfig) {
     row(ui, "Username", ChangeClass::Unavailable, |ui| {
         ui.text_edit_singleline(&mut s.username);
     });
-    ui.heading("Authentication");
+    section(ui, metrics, "Authentication");
     row(ui, "Key file", ChangeClass::Unavailable, |ui| {
         optional_path(ui, &mut s.key_filename)
     });
@@ -473,7 +704,7 @@ fn ssh(ui: &mut egui::Ui, c: &mut AppConfig) {
     row(ui, "Use agent", ChangeClass::Unavailable, |ui| {
         ui.checkbox(&mut s.use_agent, "");
     });
-    ui.heading("Host key");
+    section(ui, metrics, "Host verification");
     row(ui, "Policy", ChangeClass::Unavailable, |ui| {
         for (x, n) in [
             (HostKeyPolicy::Strict, "Strict"),
@@ -492,4 +723,73 @@ fn ssh(ui: &mut egui::Ui, c: &mut AppConfig) {
     row(ui, "TOFU prompt", ChangeClass::Unavailable, |ui| {
         ui.checkbox(&mut s.tofu_prompt, "");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> AppConfig {
+        AppConfig::from_yaml_str(include_str!("../../asr33_config.yaml")).expect("fixture")
+    }
+
+    #[test]
+    fn settings_scale_uses_global_reference_viewport_and_clamps() {
+        let reference = SettingsUiMetrics::from_viewport(egui::vec2(1280.0, 780.0));
+        let larger = SettingsUiMetrics::from_viewport(egui::vec2(1920.0, 1080.0));
+        let smaller = SettingsUiMetrics::from_viewport(egui::vec2(800.0, 600.0));
+        let minimum = SettingsUiMetrics::from_viewport(egui::vec2(100.0, 100.0));
+        let maximum = SettingsUiMetrics::from_viewport(egui::vec2(8000.0, 8000.0));
+        assert_eq!(reference.scale, 1.0);
+        assert!(larger.scale > reference.scale);
+        assert!(smaller.scale < reference.scale);
+        assert_eq!(minimum.scale, MIN_SETTINGS_SCALE);
+        assert_eq!(maximum.scale, MAX_SETTINGS_SCALE);
+    }
+
+    #[test]
+    fn selected_page_cannot_affect_metrics_for_the_same_viewport() {
+        let viewport = egui::vec2(1280.0, 780.0);
+        let expected = SettingsUiMetrics::from_viewport(viewport);
+        for page in pages().map(|(page, _)| page) {
+            let mut view = SettingsView {
+                page,
+                ..SettingsView::default()
+            };
+            assert_eq!(SettingsUiMetrics::from_viewport(viewport), expected);
+            view.page = SettingsPage::General;
+            assert_eq!(SettingsUiMetrics::from_viewport(viewport), expected);
+        }
+    }
+
+    #[test]
+    fn full_view_navigation_preserves_dirty_close_confirmation() {
+        let base = config();
+        let mut state = SettingsState::new("settings.yaml".into(), base.clone(), base);
+        let mut current = AppView::Terminal;
+        let mut settings = SettingsView::default();
+        current.open_settings();
+        settings.open(&mut state, ThemeKind::Light);
+        assert_eq!(current, AppView::Settings);
+
+        state.draft_config.terminal.config.columns += 1;
+        assert_eq!(settings.request_close(state.draft_dirty()), None);
+        assert!(settings.discard_confirmation_visible());
+        assert_eq!(current, AppView::Settings);
+        settings.keep_editing();
+        assert!(!settings.discard_confirmation_visible());
+
+        assert_eq!(settings.request_close(state.draft_dirty()), None);
+        state.cancel();
+        current.show_terminal();
+        assert_eq!(current, AppView::Terminal);
+        assert!(!state.draft_dirty());
+
+        current.open_settings();
+        settings.open(&mut state, ThemeKind::Light);
+        assert!(!settings.discard_confirmation_visible());
+        assert_eq!(settings.request_close(false), Some(SettingsAction::Close));
+        current.show_terminal();
+        assert_eq!(current, AppView::Terminal);
+    }
 }
