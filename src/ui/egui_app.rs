@@ -748,7 +748,8 @@ impl EguiApp {
             self.reader.reader().stop_cause()
         ));
         let stopped = self.reader.reader().state() == ReaderState::Stopped;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
             ui.label("Position:");
             let length = self.reader.reader().tape().map_or(0, |tape| tape.len());
             ui.add_enabled(
@@ -779,7 +780,11 @@ impl EguiApp {
                     TapeStepDirection::TowardEnd,
                 ));
             }
-            if ui.button("Follow reader").clicked() {
+            if ui
+                .button("Follow")
+                .on_hover_text("Follow the reader head as the tape advances")
+                .clicked()
+            {
                 self.reader_view.follow_reader();
             }
             if !self.reader_view.follows_reader() {

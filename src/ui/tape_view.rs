@@ -4,14 +4,98 @@ use crate::core::config::BitLabelBase;
 
 use super::theme::ThemePalette;
 
-pub const DATA_RADIUS: f32 = 6.5;
-pub const SPROCKET_RADIUS: f32 = 4.0;
-const PITCH: f32 = 18.0;
-const ROW_HEIGHT: f32 = 22.0;
-const TAPE_WIDTH: f32 = PITCH * 9.0;
-const TOTAL_WIDTH: f32 = TAPE_WIDTH + 160.0;
+pub const NATURAL_SCALE: f32 = 1.0;
+pub const MIN_SCALE: f32 = 0.70;
+const NATURAL_PITCH: f32 = 18.0;
+const NATURAL_DATA_RADIUS: f32 = 6.5;
+const NATURAL_SPROCKET_RADIUS: f32 = 4.0;
+const NATURAL_ROW_HEIGHT: f32 = 22.0;
+const NATURAL_HEAD_GUTTER: f32 = 36.0;
+const NATURAL_PADDING: f32 = 8.0;
+const NATURAL_METADATA_GAP: f32 = 6.0;
+const NATURAL_OFFSET_WIDTH: f32 = 44.0;
+const NATURAL_ASCII_WIDTH: f32 = 18.0;
+const NATURAL_NUMERIC_WIDTH: f32 = 88.0;
+const HEAD_HOLE_GAP: f32 = 4.0;
 pub const READER_SCROLL_ID: &str = "paper-tape-reader-scroll";
 pub const PUNCH_SCROLL_ID: &str = "paper-tape-punch-scroll";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TapeRenderMetrics {
+    pub scale: f32,
+    pub requires_horizontal_scroll: bool,
+    pub head_gutter_width: f32,
+    pub pitch: f32,
+    pub data_radius: f32,
+    pub sprocket_radius: f32,
+    pub row_height: f32,
+    pub label_font_size: f32,
+    pub data_font_size: f32,
+    pub numeric_font_size: f32,
+    pub metadata_gap: f32,
+    pub offset_width: f32,
+    pub ascii_width: f32,
+    pub tape_width: f32,
+    pub total_width: f32,
+    pub padding: f32,
+}
+
+impl TapeRenderMetrics {
+    pub const NATURAL_WIDTH: f32 = NATURAL_PADDING * 2.0
+        + NATURAL_HEAD_GUTTER
+        + NATURAL_PITCH * 9.0
+        + NATURAL_METADATA_GAP * 3.0
+        + NATURAL_OFFSET_WIDTH
+        + NATURAL_ASCII_WIDTH
+        + NATURAL_NUMERIC_WIDTH;
+    pub const MINIMUM_FIT_WIDTH: f32 = Self::NATURAL_WIDTH * MIN_SCALE;
+
+    #[must_use]
+    pub fn for_available_width(available_width: f32) -> Self {
+        let width = if available_width.is_finite() {
+            available_width.max(0.0)
+        } else if available_width == f32::INFINITY {
+            Self::NATURAL_WIDTH
+        } else {
+            0.0
+        };
+        let scale = (width / Self::NATURAL_WIDTH).clamp(MIN_SCALE, NATURAL_SCALE);
+        let scaled = |value: f32| value * scale;
+        Self {
+            scale,
+            requires_horizontal_scroll: width + f32::EPSILON < Self::MINIMUM_FIT_WIDTH,
+            head_gutter_width: scaled(NATURAL_HEAD_GUTTER),
+            pitch: scaled(NATURAL_PITCH),
+            data_radius: scaled(NATURAL_DATA_RADIUS),
+            sprocket_radius: scaled(NATURAL_SPROCKET_RADIUS),
+            row_height: scaled(NATURAL_ROW_HEIGHT),
+            label_font_size: scaled(11.0),
+            data_font_size: scaled(12.0),
+            numeric_font_size: scaled(11.0),
+            metadata_gap: scaled(NATURAL_METADATA_GAP),
+            offset_width: scaled(NATURAL_OFFSET_WIDTH),
+            ascii_width: scaled(NATURAL_ASCII_WIDTH),
+            tape_width: scaled(NATURAL_PITCH * 9.0),
+            total_width: scaled(Self::NATURAL_WIDTH),
+            padding: scaled(NATURAL_PADDING),
+        }
+    }
+
+    #[must_use]
+    pub fn tape_origin(self, left: f32) -> f32 {
+        left + self.padding + self.head_gutter_width
+    }
+
+    #[must_use]
+    pub fn head_marker_right(self, left: f32) -> f32 {
+        self.tape_origin(left) - HEAD_HOLE_GAP * self.scale
+    }
+
+    #[must_use]
+    pub fn first_hole_left(self, left: f32) -> f32 {
+        self.tape_origin(left) + self.pitch * 0.5 - self.data_radius
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapeColumn {
@@ -113,6 +197,7 @@ pub struct ReaderTapeViewState {
     follow_scroll_pending: bool,
     last_reader_position: Option<usize>,
     last_scroll_offset: f32,
+    last_row_height: Option<f32>,
     drag_origin: Option<usize>,
 }
 
@@ -123,6 +208,7 @@ impl Default for ReaderTapeViewState {
             follow_scroll_pending: true,
             last_reader_position: None,
             last_scroll_offset: 0.0,
+            last_row_height: None,
             drag_origin: None,
         }
     }
@@ -152,17 +238,28 @@ impl ReaderTapeViewState {
         &mut self,
         reader_position: usize,
         viewport_height: f32,
+        row_height: f32,
     ) -> Option<f32> {
+        let row_height_changed = self
+            .last_row_height
+            .is_some_and(|previous| (previous - row_height).abs() > f32::EPSILON);
         if self.follow_reader && self.last_reader_position != Some(reader_position) {
             self.follow_scroll_pending = true;
         }
         self.last_reader_position = Some(reader_position);
-        if self.follow_reader && self.follow_scroll_pending {
+        let requested = if self.follow_reader && (self.follow_scroll_pending || row_height_changed)
+        {
             self.follow_scroll_pending = false;
-            Some((reader_position as f32 * ROW_HEIGHT - viewport_height * 0.45).max(0.0))
+            Some((reader_position as f32 * row_height - viewport_height * 0.45).max(0.0))
+        } else if !self.follow_reader && row_height_changed {
+            let logical_top = self.last_scroll_offset
+                / self.last_row_height.unwrap_or(row_height).max(f32::EPSILON);
+            Some(logical_top * row_height)
         } else {
             None
-        }
+        };
+        self.last_row_height = Some(row_height);
+        requested
     }
 
     fn observe_scroll(
@@ -189,16 +286,50 @@ pub const fn head_colors(palette: ThemePalette) -> (egui::Color32, egui::Color32
     (palette.active, palette.text)
 }
 
+fn paint_head_marker(
+    painter: &egui::Painter,
+    left: f32,
+    center_y: f32,
+    metrics: TapeRenderMetrics,
+    color: egui::Color32,
+) {
+    let marker_right = metrics.head_marker_right(left);
+    let marker_half_height = 4.0 * metrics.scale;
+    let marker_width = 7.0 * metrics.scale;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(marker_right - marker_width, center_y - marker_half_height),
+            egui::pos2(marker_right - marker_width, center_y + marker_half_height),
+            egui::pos2(marker_right, center_y),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
 #[must_use]
 pub fn position_from_total_drag(origin: usize, total_delta_y: f32, tape_length: usize) -> usize {
-    if !total_delta_y.is_finite() {
+    position_from_total_drag_with_row_height(origin, total_delta_y, tape_length, NATURAL_ROW_HEIGHT)
+}
+
+#[must_use]
+pub fn position_from_total_drag_with_row_height(
+    origin: usize,
+    total_delta_y: f32,
+    tape_length: usize,
+    row_height: f32,
+) -> usize {
+    if !total_delta_y.is_finite() || !row_height.is_finite() || row_height <= 0.0 {
         return origin.min(tape_length);
     }
-    let row_delta = (-total_delta_y / ROW_HEIGHT).round() as isize;
+    let row_delta = (-total_delta_y / row_height).round() as isize;
     origin.saturating_add_signed(row_delta).min(tape_length)
 }
 
 pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions) {
+    let available_width =
+        (ui.available_rect_before_wrap().width() - ui.spacing().scroll.allocated_width()).max(0.0);
+    let metrics = TapeRenderMetrics::for_available_width(available_width);
     let prepared = prepare_tape(
         bytes,
         options.max_rows,
@@ -207,52 +338,57 @@ pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions
         options.mark_newest,
     );
     let columns = tape_columns(options.bit_label_base);
-    let tape_width = PITCH * 9.0;
-    let numeric_width = 126.0;
-    let total_width = tape_width + numeric_width + 34.0;
-    let height = ROW_HEIGHT * (prepared.rows.len() as f32 + 1.0);
+    let height = metrics.row_height * (prepared.rows.len() as f32 + 1.0);
     let max_height = ui.available_height().max(0.0);
-    egui::ScrollArea::both()
+    egui::ScrollArea::vertical()
+        .hscroll(metrics.requires_horizontal_scroll)
         .id_salt(PUNCH_SCROLL_ID)
         .max_height(max_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(total_width, height), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(metrics.total_width, height),
+                egui::Sense::hover(),
+            );
             let painter = ui.painter_at(rect);
-            let tape_origin = rect.left() + 12.0;
+            let tape_origin = metrics.tape_origin(rect.left());
             for (index, column) in columns.iter().enumerate() {
                 let label = match column {
                     TapeColumn::Data(bit) => bit.to_string(),
                     TapeColumn::Sprocket => "S".to_owned(),
                 };
                 painter.text(
-                    egui::pos2(tape_origin + PITCH * (index as f32 + 0.5), rect.top()),
+                    egui::pos2(
+                        tape_origin + metrics.pitch * (index as f32 + 0.5),
+                        rect.top(),
+                    ),
                     Align2::CENTER_TOP,
                     label,
-                    FontId::monospace(11.0),
+                    FontId::monospace(metrics.label_font_size),
                     options.palette.muted_text,
                 );
             }
             for (row_index, row) in prepared.rows.iter().enumerate() {
-                let center_y = rect.top() + ROW_HEIGHT * (row_index as f32 + 1.5);
+                let center_y = rect.top() + metrics.row_height * (row_index as f32 + 1.5);
                 if row.marker {
                     painter.text(
                         egui::pos2(rect.left(), center_y),
                         Align2::LEFT_CENTER,
                         "▶",
-                        FontId::proportional(11.0),
+                        FontId::proportional(metrics.label_font_size),
                         options.palette.active,
                     );
                 }
                 for (column_index, column) in columns.iter().enumerate() {
-                    let center =
-                        egui::pos2(tape_origin + PITCH * (column_index as f32 + 0.5), center_y);
+                    let center = egui::pos2(
+                        tape_origin + metrics.pitch * (column_index as f32 + 0.5),
+                        center_y,
+                    );
                     match column {
                         TapeColumn::Sprocket => {
                             painter.circle_filled(
                                 center,
-                                SPROCKET_RADIUS,
+                                metrics.sprocket_radius,
                                 options.palette.tape_hole,
                             );
                         }
@@ -265,32 +401,35 @@ pub fn render_tape(ui: &mut egui::Ui, bytes: &[u8], options: TapeRendererOptions
                             if punched {
                                 painter.circle_filled(
                                     center,
-                                    DATA_RADIUS,
+                                    metrics.data_radius,
                                     options.palette.tape_hole,
                                 );
                             } else if options.ghost_outline {
                                 painter.circle_stroke(
                                     center,
-                                    DATA_RADIUS,
+                                    metrics.data_radius,
                                     egui::Stroke::new(1.0, options.palette.tape_ghost),
                                 );
                             }
                         }
                     }
                 }
-                let text_x = tape_origin + tape_width + 8.0;
+                let text_x = tape_origin + metrics.tape_width + metrics.metadata_gap;
                 painter.text(
                     egui::pos2(text_x, center_y),
                     Align2::LEFT_CENTER,
                     row.ascii,
-                    FontId::monospace(12.0),
+                    FontId::monospace(metrics.data_font_size),
                     options.palette.text,
                 );
                 painter.text(
-                    egui::pos2(text_x + 22.0, center_y),
+                    egui::pos2(
+                        text_x + metrics.ascii_width + metrics.metadata_gap,
+                        center_y,
+                    ),
                     Align2::LEFT_CENTER,
                     format_tape_numeric(row.byte),
-                    FontId::monospace(12.0),
+                    FontId::monospace(metrics.numeric_font_size),
                     options.palette.text,
                 );
             }
@@ -308,14 +447,19 @@ pub fn render_reader_tape(
     state: &mut ReaderTapeViewState,
     options: TapeRendererOptions,
 ) -> Option<usize> {
-    let available_height = ui.available_height().max(ROW_HEIGHT);
+    let available_width =
+        (ui.available_rect_before_wrap().width() - ui.spacing().scroll.allocated_width()).max(0.0);
+    let metrics = TapeRenderMetrics::for_available_width(available_width);
+    let available_height = ui.available_height().max(metrics.row_height);
     let wheel = ui.rect_contains_pointer(ui.available_rect_before_wrap())
         && ui.input(|input| input.smooth_scroll_delta.y != 0.0);
     if wheel {
         state.inspect_manually();
     }
-    let requested_offset = state.requested_follow_offset(reader_position, available_height);
-    let mut area = egui::ScrollArea::both()
+    let requested_offset =
+        state.requested_follow_offset(reader_position, available_height, metrics.row_height);
+    let mut area = egui::ScrollArea::vertical()
+        .hscroll(metrics.requires_horizontal_scroll)
         .id_salt(READER_SCROLL_ID)
         .max_height(available_height)
         .auto_shrink([false, false]);
@@ -326,12 +470,12 @@ pub fn render_reader_tape(
     let mut requested = None;
     let output = area.show_rows(
         ui,
-        ROW_HEIGHT,
+        metrics.row_height,
         bytes.len().saturating_add(1),
         |ui, range| {
-            let height = ROW_HEIGHT * range.len() as f32;
+            let height = metrics.row_height * range.len() as f32;
             let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(TOTAL_WIDTH, height),
+                egui::vec2(metrics.total_width, height),
                 if reader_running {
                     egui::Sense::hover()
                 } else {
@@ -347,53 +491,49 @@ pub fn render_reader_tape(
                 state.drag_origin = Some(reader_position);
             }
             if let (Some(origin), Some(delta)) = (state.drag_origin, response.total_drag_delta()) {
-                requested = Some(position_from_total_drag(origin, delta.y, bytes.len()));
+                requested = Some(position_from_total_drag_with_row_height(
+                    origin,
+                    delta.y,
+                    bytes.len(),
+                    metrics.row_height,
+                ));
             }
             if response.drag_stopped() {
                 state.drag_origin = None;
             }
             let painter = ui.painter_at(rect);
-            let tape_origin = rect.left() + 12.0;
+            let tape_origin = metrics.tape_origin(rect.left());
             for (visible_index, offset) in range.enumerate() {
-                let center_y = rect.top() + ROW_HEIGHT * (visible_index as f32 + 0.5);
-                if offset == reader_position {
-                    let (head_background, head_foreground) = head_colors(options.palette);
+                let center_y = rect.top() + metrics.row_height * (visible_index as f32 + 0.5);
+                let is_head = offset == reader_position;
+                if is_head {
+                    let (head_background, _) = head_colors(options.palette);
                     painter.rect_filled(
                         egui::Rect::from_center_size(
                             egui::pos2(rect.center().x, center_y),
-                            egui::vec2(TOTAL_WIDTH, ROW_HEIGHT),
+                            egui::vec2(metrics.total_width, metrics.row_height),
                         ),
                         0.0,
                         head_background,
                     );
-                    painter.add(egui::Shape::convex_polygon(
-                        vec![
-                            egui::pos2(rect.left() + 1.0, center_y - 4.0),
-                            egui::pos2(rect.left() + 1.0, center_y + 4.0),
-                            egui::pos2(rect.left() + 7.0, center_y),
-                        ],
-                        head_foreground,
-                        egui::Stroke::NONE,
-                    ));
-                    painter.text(
-                        egui::pos2(rect.left() + 9.0, center_y),
-                        Align2::LEFT_CENTER,
-                        "HEAD",
-                        FontId::proportional(10.0),
-                        head_foreground,
-                    );
                 }
                 let Some(&byte) = bytes.get(offset) else {
+                    if is_head {
+                        let (_, foreground) = head_colors(options.palette);
+                        paint_head_marker(&painter, rect.left(), center_y, metrics, foreground);
+                    }
                     continue;
                 };
                 for (column_index, column) in columns.iter().enumerate() {
-                    let center =
-                        egui::pos2(tape_origin + PITCH * (column_index as f32 + 0.5), center_y);
+                    let center = egui::pos2(
+                        tape_origin + metrics.pitch * (column_index as f32 + 0.5),
+                        center_y,
+                    );
                     match column {
                         TapeColumn::Sprocket => {
                             painter.circle_filled(
                                 center,
-                                SPROCKET_RADIUS,
+                                metrics.sprocket_radius,
                                 options.palette.tape_hole,
                             );
                         }
@@ -405,45 +545,55 @@ pub fn render_reader_tape(
                             if byte & (1 << bit) != 0 {
                                 painter.circle_filled(
                                     center,
-                                    DATA_RADIUS,
+                                    metrics.data_radius,
                                     options.palette.tape_hole,
                                 );
                             } else if options.ghost_outline {
                                 painter.circle_stroke(
                                     center,
-                                    DATA_RADIUS,
+                                    metrics.data_radius,
                                     egui::Stroke::new(1.0, options.palette.tape_ghost),
                                 );
                             }
                         }
                     }
                 }
-                let text_x = tape_origin + TAPE_WIDTH + 8.0;
+                let text_x = tape_origin + metrics.tape_width + metrics.metadata_gap;
                 painter.text(
                     egui::pos2(text_x, center_y),
                     Align2::LEFT_CENTER,
-                    format!(
-                        "{offset}: {}",
-                        tape_ascii(byte, options.ascii_char_mask_msb)
-                    ),
-                    FontId::monospace(12.0),
+                    offset.to_string(),
+                    FontId::monospace(metrics.numeric_font_size),
                     options.palette.text,
                 );
                 painter.text(
-                    egui::pos2(text_x + 50.0, center_y),
+                    egui::pos2(text_x + metrics.offset_width, center_y),
+                    Align2::LEFT_CENTER,
+                    tape_ascii(byte, options.ascii_char_mask_msb),
+                    FontId::monospace(metrics.data_font_size),
+                    options.palette.text,
+                );
+                let numeric_x =
+                    text_x + metrics.offset_width + metrics.ascii_width + metrics.metadata_gap;
+                painter.text(
+                    egui::pos2(numeric_x, center_y),
                     Align2::LEFT_CENTER,
                     format_tape_numeric(byte),
-                    FontId::monospace(12.0),
+                    FontId::monospace(metrics.numeric_font_size),
                     options.palette.text,
                 );
                 if offset == reader_position && set_msb {
                     painter.text(
-                        egui::pos2(text_x + 50.0, center_y + 9.0),
+                        egui::pos2(numeric_x, center_y + 8.0 * metrics.scale),
                         Align2::LEFT_CENTER,
                         format!("TX {}", format_tape_numeric(byte | 0x80)),
-                        FontId::monospace(9.0),
+                        FontId::monospace(8.5 * metrics.scale),
                         options.palette.muted_text,
                     );
+                }
+                if is_head {
+                    let (_, head_foreground) = head_colors(options.palette);
+                    paint_head_marker(&painter, rect.left(), center_y, metrics, head_foreground);
                 }
             }
         },
@@ -499,7 +649,8 @@ mod tests {
                 .count(),
             8
         );
-        let radii = [SPROCKET_RADIUS, DATA_RADIUS];
+        let natural = TapeRenderMetrics::for_available_width(TapeRenderMetrics::NATURAL_WIDTH);
+        let radii = [natural.sprocket_radius, natural.data_radius];
         assert!(radii[0] < radii[1]);
     }
 
@@ -551,7 +702,7 @@ mod tests {
     fn reader_view_follow_and_manual_inspection_are_independent_state() {
         let mut state = ReaderTapeViewState::default();
         assert!(state.follows_reader());
-        let requested = state.requested_follow_offset(100, 220.0);
+        let requested = state.requested_follow_offset(100, 220.0, NATURAL_ROW_HEIGHT);
         assert!(requested.is_some());
         state.observe_scroll(requested.unwrap_or_default(), 10_000.0, true, requested);
         assert!(!state.follows_reader(), "mouse wheel disables follow");
@@ -563,14 +714,17 @@ mod tests {
             state.follows_reader(),
             "Follow reader click restores follow"
         );
-        let requested = state.requested_follow_offset(101, 220.0);
+        let requested = state.requested_follow_offset(101, 220.0, NATURAL_ROW_HEIGHT);
         assert!(
             requested.is_some(),
             "advancing reader requests one recenter"
         );
         state.observe_scroll(requested.unwrap_or_default(), 10_000.0, false, requested);
         assert!(state.follows_reader());
-        assert_eq!(state.requested_follow_offset(101, 220.0), None);
+        assert_eq!(
+            state.requested_follow_offset(101, 220.0, NATURAL_ROW_HEIGHT),
+            None
+        );
         state.inspect_manually();
         assert!(!state.follows_reader());
         state.reset();
@@ -580,7 +734,7 @@ mod tests {
     #[test]
     fn scrollbar_override_disables_follow_and_scroll_identities_are_distinct() {
         let mut state = ReaderTapeViewState::default();
-        let requested = state.requested_follow_offset(500, 220.0);
+        let requested = state.requested_follow_offset(500, 220.0, NATURAL_ROW_HEIGHT);
         state.observe_scroll(8_000.0, 10_000.0, false, requested);
         assert!(!state.follows_reader());
         assert_ne!(READER_SCROLL_ID, PUNCH_SCROLL_ID);
@@ -595,5 +749,136 @@ mod tests {
             let (background, foreground) = head_colors(theme.palette());
             assert_ne!(background, foreground);
         }
+    }
+
+    #[test]
+    fn responsive_metrics_scale_before_requesting_horizontal_scroll() {
+        let wide = TapeRenderMetrics::for_available_width(500.0);
+        assert_eq!(wide.scale, NATURAL_SCALE);
+        assert!(!wide.requires_horizontal_scroll);
+
+        let intermediate = TapeRenderMetrics::for_available_width(
+            (TapeRenderMetrics::NATURAL_WIDTH + TapeRenderMetrics::MINIMUM_FIT_WIDTH) / 2.0,
+        );
+        assert!(MIN_SCALE < intermediate.scale && intermediate.scale < NATURAL_SCALE);
+        assert!(!intermediate.requires_horizontal_scroll);
+
+        let minimum = TapeRenderMetrics::for_available_width(TapeRenderMetrics::MINIMUM_FIT_WIDTH);
+        assert!((minimum.scale - MIN_SCALE).abs() < f32::EPSILON);
+        assert!(!minimum.requires_horizontal_scroll);
+
+        let narrower =
+            TapeRenderMetrics::for_available_width(TapeRenderMetrics::MINIMUM_FIT_WIDTH - 1.0);
+        assert_eq!(narrower.scale, MIN_SCALE);
+        assert!(narrower.requires_horizontal_scroll);
+    }
+
+    #[test]
+    fn responsive_metrics_are_finite_monotonic_and_physically_proportional() {
+        let widths = [f32::INFINITY, 500.0, 350.0, 250.0, 180.0, 0.0, f32::NAN];
+        let mut previous = NATURAL_SCALE;
+        for width in widths {
+            let metrics = TapeRenderMetrics::for_available_width(width);
+            assert!(metrics.scale.is_finite());
+            assert!((MIN_SCALE..=NATURAL_SCALE).contains(&metrics.scale));
+            assert!(metrics.scale <= previous);
+            assert!(metrics.sprocket_radius < metrics.data_radius);
+            assert!(metrics.pitch > 2.0 * metrics.data_radius);
+            previous = metrics.scale;
+        }
+    }
+
+    #[test]
+    fn head_gutter_never_overlaps_first_hole_at_any_supported_scale() {
+        for width in [
+            TapeRenderMetrics::NATURAL_WIDTH,
+            TapeRenderMetrics::NATURAL_WIDTH * 0.84,
+            TapeRenderMetrics::MINIMUM_FIT_WIDTH,
+        ] {
+            let metrics = TapeRenderMetrics::for_available_width(width);
+            let marker_right = metrics.head_marker_right(0.0);
+            let required_gap = HEAD_HOLE_GAP * metrics.scale;
+            assert!(marker_right + required_gap <= metrics.first_hole_left(0.0));
+        }
+    }
+
+    #[test]
+    fn bit_labels_remain_centered_over_uniform_columns_at_every_scale() {
+        for width in [
+            TapeRenderMetrics::NATURAL_WIDTH,
+            TapeRenderMetrics::NATURAL_WIDTH * 0.8,
+            TapeRenderMetrics::MINIMUM_FIT_WIDTH,
+        ] {
+            let metrics = TapeRenderMetrics::for_available_width(width);
+            let origin = metrics.tape_origin(0.0);
+            let centers = (0..9)
+                .map(|index| origin + metrics.pitch * (index as f32 + 0.5))
+                .collect::<Vec<_>>();
+            for pair in centers.windows(2) {
+                assert!((pair[1] - pair[0] - metrics.pitch).abs() < 0.001);
+            }
+            assert_eq!(tape_columns(BitLabelBase::One)[3], TapeColumn::Sprocket);
+        }
+    }
+
+    #[test]
+    fn physical_drag_tracks_one_visual_row_at_every_scale() {
+        for scale in [NATURAL_SCALE, 0.8, MIN_SCALE] {
+            let metrics =
+                TapeRenderMetrics::for_available_width(TapeRenderMetrics::NATURAL_WIDTH * scale);
+            assert_eq!(
+                position_from_total_drag_with_row_height(
+                    50,
+                    metrics.row_height,
+                    100,
+                    metrics.row_height,
+                ),
+                49
+            );
+            assert_eq!(
+                position_from_total_drag_with_row_height(
+                    50,
+                    -metrics.row_height,
+                    100,
+                    metrics.row_height,
+                ),
+                51
+            );
+        }
+    }
+
+    #[test]
+    fn resize_preserves_logical_top_row_while_not_following() {
+        let mut state = ReaderTapeViewState::default();
+        state.inspect_manually();
+        state.last_scroll_offset = 500.0 * NATURAL_ROW_HEIGHT;
+        state.last_row_height = Some(NATURAL_ROW_HEIGHT);
+        let compact_row_height = NATURAL_ROW_HEIGHT * 0.7;
+        assert_eq!(
+            state.requested_follow_offset(100, 220.0, compact_row_height),
+            Some(500.0 * compact_row_height)
+        );
+        assert!(!state.follows_reader());
+    }
+
+    #[test]
+    fn calculating_metrics_never_changes_reader_model_or_manual_positioning() {
+        use crate::core::paper_tape::{PaperTape, ReaderOptions, ReaderStep, TapeReader};
+
+        let bytes = [b'A'; 100].into_iter().chain([0, b'B']).collect::<Vec<_>>();
+        let mut reader = TapeReader::new(ReaderOptions {
+            skip_leading_nulls: true,
+            set_msb: false,
+            auto_stop: false,
+        });
+        reader.load(PaperTape::new(bytes.clone()));
+        reader.seek(100).expect("manual seek");
+        for width in [500.0, 350.0, 250.0, 180.0] {
+            let _ = TapeRenderMetrics::for_available_width(width);
+        }
+        assert_eq!(reader.position(), 100);
+        assert_eq!(reader.tape().map(PaperTape::bytes), Some(bytes.as_slice()));
+        assert!(reader.start());
+        assert_eq!(reader.step(), ReaderStep::Byte(0));
     }
 }
