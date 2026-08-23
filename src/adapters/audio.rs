@@ -1,10 +1,11 @@
-//! Native ASR-33 mechanical-audio adapter.
+//! Native mechanical-audio adapter.
 //!
-//! The bundled Hugh Pyle recordings are treated as the source of truth for
-//! timbre.  Continuous recordings (printer, hum and tape reader) are looped,
-//! while mechanical effects are played as complete one-shots.  The Windows
-//! backend uses waveOut on a dedicated worker thread; UI/core code never
-//! blocks on audio and audio failure is never fatal to the emulator.
+//! Audio is deliberately optional: construction never prevents the terminal
+//! from starting. A bounded event channel keeps high-rate terminal activity
+//! from becoming unbounded work, while low-rate controls use a separate
+//! reliable channel. Windows owns the actual waveOut device on its worker
+//! thread; other platforms report audio as unavailable without affecting the
+//! emulator.
 
 use std::error::Error;
 use std::fmt;
@@ -228,11 +229,11 @@ impl PcmClip {
         }
         let channels = usize::from(self.channels);
         let base = frame * channels;
-        let left = f32::from(self.samples[base]) / 32_768.0;
+        let left = f32::from(self.samples[base]) / f32::from(i16::MAX);
         let right = if channels == 1 {
             left
         } else {
-            f32::from(self.samples[base + 1]) / 32_768.0
+            f32::from(self.samples[base + 1]) / f32::from(i16::MAX)
         };
         Some((left, right))
     }
@@ -373,10 +374,11 @@ impl SoundLibrary {
         if let Some(exact) = self.sounds.iter().find(|sound| sound.stem == prefix) {
             return Some(Arc::clone(&exact.clip));
         }
+        let variant_prefix = format!("{prefix}-");
         let matches = self
             .sounds
             .iter()
-            .filter(|sound| sound.stem.starts_with(&prefix))
+            .filter(|sound| sound.stem.starts_with(&variant_prefix))
             .collect::<Vec<_>>();
         if matches.is_empty() {
             return None;
@@ -453,24 +455,6 @@ fn load_default_library() -> Result<SoundLibrary, String> {
     Err(errors.join("; "))
 }
 
-fn priority_mix(background: f32, effect: f32) -> f32 {
-    let effect = effect.clamp(-1.0, 1.0);
-    let candidate = effect + background;
-    if (-1.0..=1.0).contains(&candidate) {
-        return candidate;
-    }
-    if background == 0.0 {
-        return effect;
-    }
-    let allowed_background = if candidate > 1.0 {
-        1.0 - effect
-    } else {
-        -1.0 - effect
-    };
-    let scale = (allowed_background / background).clamp(0.0, 1.0);
-    (effect + background * scale).clamp(-1.0, 1.0)
-}
-
 #[cfg(windows)]
 mod platform {
     use std::mem::size_of;
@@ -487,32 +471,27 @@ mod platform {
 
     use super::{
         AUDIO_EVENT_CAPACITY, AudioAvailability, AudioControl, AudioEvent, PcmClip, SoundLibrary,
-        continuous_key, effect_key, load_default_library, priority_mix,
+        continuous_key, effect_key, load_default_library,
     };
-    use crate::core::audio::{ContinuousSound, EffectSound};
+    use crate::core::audio::{
+        AudioStateMachine, ContinuousSound, EffectRequest, MOTOR_OFF_PLAY_TIME,
+    };
     use crate::core::config::LidState;
 
     const OUTPUT_SAMPLE_RATE: u32 = 48_000;
     const OUTPUT_CHANNELS: u16 = 2;
     const OUTPUT_BITS: u16 = 16;
-    const BUFFER_FRAMES: usize = 240; // 5 ms at 48 kHz
+    const BUFFER_FRAMES: usize = 960;
     const BUFFER_COUNT: usize = 4;
-    const TARGET_QUEUED_BUFFERS: usize = 3;
-    const WORKER_POLL: Duration = Duration::from_millis(1);
-    const PRINT_ATTACK: Duration = Duration::from_millis(8);
-    const PRINT_HOLD: Duration = Duration::from_millis(105);
-    const PRINT_RELEASE: Duration = Duration::from_millis(20);
-    const MUTE_FADE: Duration = Duration::from_millis(200);
-    const KEYPRESS_DEBOUNCE: Duration = Duration::from_millis(70);
-    const SHUTDOWN_TAIL: Duration = Duration::from_millis(500);
-    const MAX_EFFECT_VOICES: usize = 12;
-    const EFFECT_BACKGROUND_DUCK: f32 = 0.35;
+    const TARGET_QUEUED_BUFFERS: usize = 2;
+    const WORKER_POLL: Duration = Duration::from_millis(2);
+    const SHUTDOWN_TAIL: Duration = Duration::from_millis(50);
 
     pub(super) fn run(
         controls: Receiver<AudioControl>,
         events: Receiver<AudioEvent>,
         statuses: Sender<AudioAvailability>,
-        mut lid: LidState,
+        lid: LidState,
         muted: bool,
     ) {
         let library = match load_default_library() {
@@ -534,10 +513,9 @@ mod platform {
         let _ = statuses.send(AudioAvailability::Available);
 
         let origin = Instant::now();
-        let mut model = AudioModel::new(muted);
+        let mut state = AudioStateMachine::new(lid, muted, Duration::ZERO);
+        state.start(Duration::ZERO);
         let mut mixer = Mixer::new(&library, lid);
-        mixer.trigger_effect(&library, lid, EffectSound::MotorOn);
-        let mut last_keypress = None;
         let mut shutdown_deadline = None;
         let mut failed = false;
 
@@ -546,32 +524,28 @@ mod platform {
             loop {
                 match controls.try_recv() {
                     Ok(AudioControl::SetMuted(value)) if shutdown_deadline.is_none() => {
-                        model.set_muted(value, now);
+                        state.set_muted(value, now);
                     }
                     Ok(AudioControl::SetLid(value)) if shutdown_deadline.is_none() => {
-                        if value != lid {
-                            lid = value;
-                            mixer.reload_continuous(&library, lid);
-                            mixer.trigger_effect(&library, lid, EffectSound::Lid);
-                        }
+                        state.set_lid(value, now);
                     }
                     Ok(AudioControl::SetTapeReader(value)) if shutdown_deadline.is_none() => {
-                        model.set_tape_reader_running(value);
+                        state.set_tape_reader_running(value);
                     }
                     Ok(AudioControl::Shutdown) => {
                         if shutdown_deadline.is_none() {
-                            mixer.clear_effects();
-                            mixer.trigger_effect(&library, lid, EffectSound::MotorOff);
-                            shutdown_deadline = Some(now + SHUTDOWN_TAIL);
+                            mixer.clear_effect();
+                            state.prepare_shutdown(now);
+                            shutdown_deadline = Some(now + MOTOR_OFF_PLAY_TIME + SHUTDOWN_TAIL);
                         }
                     }
                     Ok(_) => {}
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         if shutdown_deadline.is_none() {
-                            mixer.clear_effects();
-                            mixer.trigger_effect(&library, lid, EffectSound::MotorOff);
-                            shutdown_deadline = Some(now + SHUTDOWN_TAIL);
+                            mixer.clear_effect();
+                            state.prepare_shutdown(now);
+                            shutdown_deadline = Some(now + MOTOR_OFF_PLAY_TIME + SHUTDOWN_TAIL);
                         }
                         break;
                     }
@@ -581,23 +555,14 @@ mod platform {
             if shutdown_deadline.is_none() {
                 for _ in 0..AUDIO_EVENT_CAPACITY {
                     match events.try_recv() {
-                        Ok(AudioEvent::Character(event)) => {
-                            handle_character(event, now, &library, lid, &mut model, &mut mixer);
-                        }
-                        Ok(AudioEvent::Keypress) => {
-                            let accepted = last_keypress
-                                .is_none_or(|last| now.saturating_sub(last) >= KEYPRESS_DEBOUNCE);
-                            if accepted {
-                                last_keypress = Some(now);
-                                mixer.trigger_effect(&library, lid, EffectSound::Key);
-                            }
-                        }
+                        Ok(AudioEvent::Character(event)) => state.process_character(event, now),
+                        Ok(AudioEvent::Keypress) => state.keypress(now),
                         Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                     }
                 }
             }
 
-            if let Err(error) = output.service(&mut mixer, &mut model, now) {
+            if let Err(error) = output.service(&mut mixer, &mut state, &library, now) {
                 failed = true;
                 let _ = statuses.send(AudioAvailability::unavailable(error));
                 break;
@@ -613,194 +578,12 @@ mod platform {
         }
     }
 
-    fn handle_character(
-        event: crate::core::terminal::CharacterEvent,
-        now: Duration,
-        library: &SoundLibrary,
-        lid: LidState,
-        model: &mut AudioModel,
-        mixer: &mut Mixer,
-    ) {
-        model.note_activity(now);
-        match event.character {
-            '\r' => mixer.trigger_effect(library, lid, EffectSound::CarriageReturn),
-            '\n' => mixer.trigger_effect(library, lid, EffectSound::Platen),
-            '\u{7}' => mixer.trigger_effect(library, lid, EffectSound::Bell),
-            character if character <= ' ' || character > '~' => {
-                if model.select_print(ContinuousSound::PrintSpaces, now) {
-                    mixer.rewind_print(ContinuousSound::PrintSpaces);
-                }
-            }
-            _ => {
-                if model.select_print(ContinuousSound::PrintChars, now) {
-                    mixer.rewind_print(ContinuousSound::PrintChars);
-                }
-            }
-        }
-        if event.column == 62 {
-            mixer.trigger_effect(library, lid, EffectSound::Bell);
-        }
-    }
-
     fn wait_for_shutdown(controls: Receiver<AudioControl>) {
         while let Ok(command) = controls.recv() {
             if matches!(command, AudioControl::Shutdown) {
                 break;
             }
         }
-    }
-
-    #[derive(Clone, Copy)]
-    struct GainFade {
-        start: Duration,
-        duration: Duration,
-        from: [f32; 3],
-        to: [f32; 3],
-    }
-
-    #[derive(Clone, Copy)]
-    struct ScalarFade {
-        start: Duration,
-        from: f32,
-        to: f32,
-    }
-
-    #[derive(Clone, Copy)]
-    struct AudioSnapshot {
-        print_chars: f32,
-        print_spaces: f32,
-        hum: f32,
-        tape: f32,
-        effects: f32,
-    }
-
-    struct AudioModel {
-        mode: ContinuousSound,
-        gains: [f32; 3],
-        targets: [f32; 3],
-        fade: Option<GainFade>,
-        last_activity: Duration,
-        tape_reader_running: bool,
-        muted: bool,
-        mute_gain: f32,
-        mute_fade: Option<ScalarFade>,
-    }
-
-    impl AudioModel {
-        fn new(muted: bool) -> Self {
-            Self {
-                mode: ContinuousSound::Hum,
-                gains: [0.0, 0.0, 1.0],
-                targets: [0.0, 0.0, 1.0],
-                fade: None,
-                last_activity: Duration::ZERO,
-                tape_reader_running: false,
-                muted,
-                mute_gain: if muted { 0.0 } else { 1.0 },
-                mute_fade: None,
-            }
-        }
-
-        fn note_activity(&mut self, now: Duration) {
-            self.last_activity = now;
-        }
-
-        fn select_print(&mut self, sound: ContinuousSound, now: Duration) -> bool {
-            self.last_activity = now;
-            if self.mode == sound {
-                return false;
-            }
-            self.advance(now);
-            self.mode = sound;
-            let target = match sound {
-                ContinuousSound::PrintChars => [1.0, 0.0, 0.0],
-                ContinuousSound::PrintSpaces => [0.0, 1.0, 0.0],
-                ContinuousSound::Hum => [0.0, 0.0, 1.0],
-            };
-            self.start_fade(target, now, PRINT_ATTACK);
-            true
-        }
-
-        fn set_tape_reader_running(&mut self, running: bool) {
-            self.tape_reader_running = running;
-        }
-
-        fn set_muted(&mut self, muted: bool, now: Duration) {
-            if muted == self.muted {
-                return;
-            }
-            self.advance(now);
-            self.muted = muted;
-            self.mute_fade = Some(ScalarFade {
-                start: now,
-                from: self.mute_gain,
-                to: if muted { 0.0 } else { 1.0 },
-            });
-        }
-
-        fn snapshot(&mut self, now: Duration) -> AudioSnapshot {
-            self.advance(now);
-            if self.mode != ContinuousSound::Hum
-                && now.saturating_sub(self.last_activity) >= PRINT_HOLD
-            {
-                self.mode = ContinuousSound::Hum;
-                self.start_fade([0.0, 0.0, 1.0], now, PRINT_RELEASE);
-            }
-            self.advance(now);
-            AudioSnapshot {
-                print_chars: self.gains[0] * self.mute_gain,
-                print_spaces: self.gains[1] * self.mute_gain,
-                hum: self.gains[2] * self.mute_gain,
-                tape: if self.tape_reader_running {
-                    self.mute_gain
-                } else {
-                    0.0
-                },
-                effects: self.mute_gain,
-            }
-        }
-
-        fn start_fade(&mut self, target: [f32; 3], now: Duration, duration: Duration) {
-            self.targets = target;
-            self.fade = Some(GainFade {
-                start: now,
-                duration,
-                from: self.gains,
-                to: target,
-            });
-        }
-
-        fn advance(&mut self, now: Duration) {
-            if let Some(fade) = self.fade {
-                let progress = fade_progress(now, fade.start, fade.duration);
-                self.gains = std::array::from_fn(|index| {
-                    lerp(fade.from[index], fade.to[index], progress)
-                });
-                if progress >= 1.0 {
-                    self.gains = self.targets;
-                    self.fade = None;
-                }
-            }
-            if let Some(fade) = self.mute_fade {
-                let progress = fade_progress(now, fade.start, MUTE_FADE);
-                self.mute_gain = lerp(fade.from, fade.to, progress).clamp(0.0, 1.0);
-                if progress >= 1.0 {
-                    self.mute_gain = fade.to;
-                    self.mute_fade = None;
-                }
-            }
-        }
-    }
-
-    fn fade_progress(now: Duration, start: Duration, duration: Duration) -> f32 {
-        if duration.is_zero() {
-            return 1.0;
-        }
-        (now.saturating_sub(start).as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
-    }
-
-    fn lerp(from: f32, to: f32, progress: f32) -> f32 {
-        from + (to - from) * progress
     }
 
     struct LoopVoice {
@@ -814,10 +597,6 @@ mod platform {
                 clip,
                 position: 0.0,
             }
-        }
-
-        fn rewind(&mut self) {
-            self.position = 0.0;
         }
 
         fn next(&mut self) -> (f32, f32) {
@@ -838,15 +617,20 @@ mod platform {
     }
 
     struct EffectVoice {
-        sound: EffectSound,
         clip: Arc<PcmClip>,
         position: f64,
+        output_frames_left: usize,
     }
 
     impl EffectVoice {
         fn next(&mut self) -> Option<(f32, f32)> {
+            if self.output_frames_left == 0 {
+                return None;
+            }
             let frame = self.clip.stereo_frame(self.position)?;
-            self.position += f64::from(self.clip.sample_rate) / f64::from(OUTPUT_SAMPLE_RATE);
+            self.position +=
+                f64::from(self.clip.sample_rate) / f64::from(OUTPUT_SAMPLE_RATE);
+            self.output_frames_left -= 1;
             Some(frame)
         }
     }
@@ -856,7 +640,8 @@ mod platform {
         spaces: LoopVoice,
         hum: LoopVoice,
         tape: LoopVoice,
-        effects: Vec<EffectVoice>,
+        effect: Option<EffectVoice>,
+        lid: LidState,
         variant: usize,
     }
 
@@ -867,15 +652,16 @@ mod platform {
                 spaces: LoopVoice::new(None),
                 hum: LoopVoice::new(None),
                 tape: LoopVoice::new(None),
-                effects: Vec::new(),
+                effect: None,
+                lid,
                 variant: 0,
             };
             mixer.reload_continuous(library, lid);
             mixer
         }
 
-        fn clear_effects(&mut self) {
-            self.effects.clear();
+        fn clear_effect(&mut self) {
+            self.effect = None;
         }
 
         fn reload_continuous(&mut self, library: &SoundLibrary, lid: LidState) {
@@ -884,18 +670,11 @@ mod platform {
             let hum = self.select_continuous(library, lid, ContinuousSound::Hum);
             let tape_variant = self.next_variant();
             let tape = library.select(lid, "tape-reader", tape_variant);
+            self.lid = lid;
             self.chars = LoopVoice::new(chars);
             self.spaces = LoopVoice::new(spaces);
             self.hum = LoopVoice::new(hum);
             self.tape = LoopVoice::new(tape);
-        }
-
-        fn rewind_print(&mut self, sound: ContinuousSound) {
-            match sound {
-                ContinuousSound::PrintChars => self.chars.rewind(),
-                ContinuousSound::PrintSpaces => self.spaces.rewind(),
-                ContinuousSound::Hum => {}
-            }
         }
 
         fn select_continuous(
@@ -914,100 +693,74 @@ mod platform {
             current
         }
 
-        fn trigger_effect(&mut self, library: &SoundLibrary, lid: LidState, sound: EffectSound) {
-            self.effects.retain(|voice| voice.position < voice.clip.frame_count() as f64);
-            if self.effects.len() >= MAX_EFFECT_VOICES {
-                return;
-            }
-            let same_kind = self
-                .effects
-                .iter()
-                .filter(|voice| voice.sound == sound)
-                .count();
-            if same_kind >= effect_polyphony(sound) {
-                return;
-            }
-            let variant = self.next_variant();
-            if let Some(clip) = library.select(lid, effect_key(sound), variant) {
-                self.effects.push(EffectVoice {
-                    sound,
-                    clip,
-                    position: 0.0,
-                });
+        fn start_next_effect(
+            &mut self,
+            state: &mut AudioStateMachine,
+            library: &SoundLibrary,
+        ) {
+            while self.effect.is_none() {
+                let Some(request) = state.take_next_effect() else {
+                    break;
+                };
+                let variant = self.next_variant();
+                if let Some(clip) = library.select(self.lid, effect_key(request.sound), variant) {
+                    self.effect = Some(effect_voice(clip, request));
+                }
             }
         }
 
-        fn render(&mut self, samples: &mut [i16], model: &mut AudioModel, now: Duration) {
-            let snapshot = model.snapshot(now);
+        fn render(
+            &mut self,
+            samples: &mut [i16],
+            state: &mut AudioStateMachine,
+            library: &SoundLibrary,
+            now: Duration,
+        ) {
+            let snapshot = state.snapshot(now);
+            if snapshot.lid != self.lid {
+                self.reload_continuous(library, snapshot.lid);
+            }
             for frame in samples.chunks_exact_mut(2) {
+                if self.effect.is_none() {
+                    self.start_next_effect(state, library);
+                }
                 let (chars_l, chars_r) = self.chars.next();
                 let (spaces_l, spaces_r) = self.spaces.next();
                 let (hum_l, hum_r) = self.hum.next();
                 let (tape_l, tape_r) = self.tape.next();
-
-                let background_gain_sum = snapshot.print_chars
-                    + snapshot.print_spaces
-                    + snapshot.hum
-                    + snapshot.tape;
-                let background_scale = 1.0 / background_gain_sum.max(1.0);
-                let mut background_l = (chars_l * snapshot.print_chars
-                    + spaces_l * snapshot.print_spaces
-                    + hum_l * snapshot.hum
-                    + tape_l * snapshot.tape)
-                    * background_scale;
-                let mut background_r = (chars_r * snapshot.print_chars
-                    + spaces_r * snapshot.print_spaces
-                    + hum_r * snapshot.hum
-                    + tape_r * snapshot.tape)
-                    * background_scale;
-
-                let mut effect_l = 0.0f32;
-                let mut effect_r = 0.0f32;
-                let mut active_effects = 0usize;
-                let mut index = 0usize;
-                while index < self.effects.len() {
-                    if let Some((left, right)) = self.effects[index].next() {
-                        effect_l += left;
-                        effect_r += right;
-                        active_effects += 1;
-                        index += 1;
-                    } else {
-                        self.effects.remove(index);
-                    }
+                let effect_frame = self.effect.as_mut().and_then(EffectVoice::next);
+                if effect_frame.is_none() {
+                    self.effect = None;
                 }
-                if active_effects > 1 {
-                    let scale = 1.0 / active_effects as f32;
-                    effect_l *= scale;
-                    effect_r *= scale;
-                }
-                effect_l *= snapshot.effects;
-                effect_r *= snapshot.effects;
-
-                if active_effects != 0 {
-                    let peak = effect_l.abs().max(effect_r.abs());
-                    let duck = (1.0 - peak * (1.0 - EFFECT_BACKGROUND_DUCK))
-                        .clamp(EFFECT_BACKGROUND_DUCK, 1.0);
-                    background_l *= duck;
-                    background_r *= duck;
-                }
-
-                frame[0] = float_to_i16(priority_mix(background_l, effect_l));
-                frame[1] = float_to_i16(priority_mix(background_r, effect_r));
+                let (effect_l, effect_r) = effect_frame.unwrap_or((0.0, 0.0));
+                let left = chars_l * snapshot.print_chars_gain
+                    + spaces_l * snapshot.print_spaces_gain
+                    + hum_l * snapshot.hum_gain
+                    + tape_l * snapshot.tape_reader_gain
+                    + effect_l * snapshot.effects_gain;
+                let right = chars_r * snapshot.print_chars_gain
+                    + spaces_r * snapshot.print_spaces_gain
+                    + hum_r * snapshot.hum_gain
+                    + tape_r * snapshot.tape_reader_gain
+                    + effect_r * snapshot.effects_gain;
+                frame[0] = float_to_i16(left);
+                frame[1] = float_to_i16(right);
             }
         }
     }
 
-    fn effect_polyphony(sound: EffectSound) -> usize {
-        match sound {
-            EffectSound::Key => 2,
-            EffectSound::Bell => 2,
-            EffectSound::CarriageReturn | EffectSound::Platen => 2,
-            EffectSound::MotorOn | EffectSound::MotorOff | EffectSound::Lid => 1,
+    fn effect_voice(clip: Arc<PcmClip>, request: EffectRequest) -> EffectVoice {
+        let output_frames_left =
+            (request.max_play_time.as_secs_f64() * f64::from(OUTPUT_SAMPLE_RATE)).ceil() as usize;
+        EffectVoice {
+            clip,
+            position: 0.0,
+            output_frames_left,
         }
     }
 
     fn float_to_i16(sample: f32) -> i16 {
-        (sample.clamp(-1.0, 1.0) * 32_767.0).round() as i16
+        (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16
     }
 
     struct OutputBuffer {
@@ -1062,12 +815,13 @@ mod platform {
             &mut self,
             handle: HWAVEOUT,
             mixer: &mut Mixer,
-            model: &mut AudioModel,
+            state: &mut AudioStateMachine,
+            library: &SoundLibrary,
             now: Duration,
         ) -> Result<(), String> {
             debug_assert!(!self.queued);
             debug_assert!(!self.prepared);
-            mixer.render(&mut self.samples, model, now);
+            mixer.render(&mut self.samples, state, library, now);
             let prepare = unsafe {
                 waveOutPrepareHeader(handle, self.header.as_mut(), size_of::<WAVEHDR>() as u32)
             };
@@ -1126,6 +880,7 @@ mod platform {
                 cbSize: 0,
             };
             let mut handle: HWAVEOUT = ptr::null_mut();
+            // WAVE_MAPPER is UINT(-1); CALLBACK_NULL is zero.
             let result = unsafe { waveOutOpen(&mut handle, u32::MAX, &format, 0, 0, 0) };
             if result != 0 {
                 return Err(format!("waveOutOpen failed with MMRESULT {result}"));
@@ -1141,7 +896,8 @@ mod platform {
         fn service(
             &mut self,
             mixer: &mut Mixer,
-            model: &mut AudioModel,
+            state: &mut AudioStateMachine,
+            library: &SoundLibrary,
             now: Duration,
         ) -> Result<(), String> {
             let handle = self.handle;
@@ -1157,7 +913,7 @@ mod platform {
                 else {
                     break;
                 };
-                buffer.queue(handle, mixer, model, now)?;
+                buffer.queue(handle, mixer, state, library, now)?;
                 queued += 1;
             }
             Ok(())
@@ -1297,15 +1053,6 @@ mod tests {
         let clip = parse_pcm_wave(&make_pcm_wave(1, 44_100, &[1234])).expect("mono WAV");
         let (left, right) = clip.stereo_frame(0.0).expect("first frame");
         assert_eq!(left, right);
-    }
-
-    #[test]
-    fn priority_mix_preserves_a_standalone_effect_and_never_overflows() {
-        assert!((priority_mix(0.0, 0.75) - 0.75).abs() < 0.0001);
-        for (background, effect) in [(0.9, 0.8), (-0.9, -0.8), (0.8, -0.6), (-0.8, 0.6)] {
-            let mixed = priority_mix(background, effect);
-            assert!((-1.0..=1.0).contains(&mixed));
-        }
     }
 
     #[test]
