@@ -13,14 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-eframe = { version = "0.36.1", default-features = false, features = [
-    "default_fonts",
-    "links",
-    "wayland",
-    "web_screen_reader",
-    "wgpu",
-    "x11",
-] }
+eframe = "0.36.1"
 serde = { version = "1.0", features = ["derive"] }
 serde-saphyr = "1.0"
 serialport = { version = "4.9", default-features = false }
