@@ -378,7 +378,13 @@ fn badge(ui: &mut egui::Ui, class: ChangeClass) {
     ui.label(egui::RichText::new(short).monospace().weak())
         .on_hover_text(explanation);
 }
-fn row(ui: &mut egui::Ui, label: &str, class: ChangeClass, add: impl FnOnce(&mut egui::Ui)) {
+fn row(
+    ui: &mut egui::Ui,
+    label: &str,
+    help: &str,
+    class: ChangeClass,
+    add: impl FnOnce(&mut egui::Ui),
+) {
     let body = ui.text_style_height(&egui::TextStyle::Body);
     let row_height = ui.spacing().interact_size.y.max(body * 2.0);
     let label_width = ui.spacing().indent;
@@ -390,7 +396,9 @@ fn row(ui: &mut egui::Ui, label: &str, class: ChangeClass, add: impl FnOnce(&mut
         egui::vec2(ui.available_width(), row_height),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.add_sized([label_width, row_height], egui::Label::new(label));
+            ui.add_sized([label_width, row_height], egui::Label::new(label))
+                .on_hover_cursor(egui::CursorIcon::Help)
+                .on_hover_text(help);
             ui.allocate_ui_with_layout(
                 egui::vec2(control_width, row_height),
                 egui::Layout::left_to_right(egui::Align::Center),
@@ -444,71 +452,160 @@ fn general(
 ) {
     ui.heading("General / Appearance");
     section(ui, metrics, "Appearance");
-    row(ui, "Theme", ChangeClass::Live, |ui| {
-        ui.selectable_value(theme, ThemeKind::Light, "Light");
-        ui.selectable_value(theme, ThemeKind::Dark, "Dark");
-    });
+    row(
+        ui,
+        "Theme",
+        "Selects the application's light or dark visual theme.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(theme, ThemeKind::Light, "Light");
+            ui.selectable_value(theme, ThemeKind::Dark, "Dark");
+        },
+    );
     section(ui, metrics, "Compatibility");
+    let legacy_frontend = match state.draft_config.frontend.kind {
+        FrontendConfigValue::LegacyTkinter => "tkinter",
+        FrontendConfigValue::LegacyPygame => "pygame",
+    };
     ui.label(format!(
-        "frontend.type = {:?} (read-only; Rust always uses egui)",
-        state.draft_config.frontend.kind
-    ));
+        "frontend.type = {legacy_frontend} (read-only; Rust always uses egui)"
+    ))
+    .on_hover_cursor(egui::CursorIcon::Help)
+    .on_hover_text("Legacy frontend selection from Python. The Rust application always uses egui.");
 }
 fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.terminal.config;
     ui.heading("Terminal");
     section(ui, metrics, "Behavior");
-    row(ui, "Communication", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.mode, TerminalMode::Line, "LINE");
-        ui.selectable_value(&mut t.mode, TerminalMode::Local, "LOCAL");
-    });
-    row(ui, "Autowrap", ChangeClass::Restart, |ui| {
-        ui.checkbox(&mut t.autowrap, "");
-    });
+    row(
+        ui,
+        "Communication",
+        "LINE uses the external connection. LOCAL loops input back to the emulated terminal.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(&mut t.mode, TerminalMode::Line, "LINE");
+            ui.selectable_value(&mut t.mode, TerminalMode::Local, "LOCAL");
+        },
+    );
+    row(
+        ui,
+        "Autowrap",
+        "Controls whether printing past the final column continues on the next line.",
+        ChangeClass::Restart,
+        |ui| {
+            ui.checkbox(&mut t.autowrap, "");
+        },
+    );
     let mut enabled = !t.no_print;
-    row(ui, "Printer enabled", ChangeClass::Live, |ui| {
-        if ui.checkbox(&mut enabled, "").changed() {
-            t.no_print = !enabled;
-        }
-    });
+    row(
+        ui,
+        "Printer enabled",
+        "Enables terminal-paper printing. Paper-punch forwarding remains independent.",
+        ChangeClass::Live,
+        |ui| {
+            if ui.checkbox(&mut enabled, "").changed() {
+                t.no_print = !enabled;
+            }
+        },
+    );
     section(ui, metrics, "Keyboard");
-    row(ui, "Uppercase only", ChangeClass::Live, |ui| {
-        ui.checkbox(&mut t.keyboard_uppercase_only, "");
-    });
-    row(ui, "Keyboard parity", ChangeClass::Live, |ui| {
-        for (x, n) in [
-            (KeyboardParityMode::Mark, "Mark"),
-            (KeyboardParityMode::Space, "Space"),
-            (KeyboardParityMode::Even, "Even"),
-        ] {
-            ui.selectable_value(&mut t.keyboard_parity_mode, x, n);
-        }
-    });
-    row(ui, "Input return", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.input_return_mode, InputReturnMode::Cr, "Raw");
-        ui.selectable_value(&mut t.input_return_mode, InputReturnMode::CrLf, "CR+LF");
-    });
+    row(
+        ui,
+        "Uppercase only",
+        "Converts keyboard text to uppercase, matching typical ASR-33 operation.",
+        ChangeClass::Live,
+        |ui| {
+            ui.checkbox(&mut t.keyboard_uppercase_only, "");
+        },
+    );
+    row(
+        ui,
+        "Keyboard parity",
+        "Selects the parity bit applied to keyboard characters before transmission.",
+        ChangeClass::Live,
+        |ui| {
+            for (x, n) in [
+                (KeyboardParityMode::Mark, "Mark"),
+                (KeyboardParityMode::Space, "Space"),
+                (KeyboardParityMode::Even, "Even"),
+            ] {
+                let help = match x {
+                    KeyboardParityMode::Mark => "Always sets bit 7.",
+                    KeyboardParityMode::Space => "Always clears bit 7.",
+                    KeyboardParityMode::Even => "Sets bit 7 as needed for even parity.",
+                };
+                ui.selectable_value(&mut t.keyboard_parity_mode, x, n)
+                    .on_hover_text(help);
+            }
+        },
+    );
+    row(
+        ui,
+        "Input return",
+        "Controls how keyboard Return and paper-tape line endings are emitted.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(&mut t.input_return_mode, InputReturnMode::Cr, "Raw")
+                .on_hover_text("Preserves tape CR/LF exactly; keyboard Return sends CR only.");
+            ui.selectable_value(&mut t.input_return_mode, InputReturnMode::CrLf, "CR+LF")
+                .on_hover_text("Normalizes keyboard Return and tape line endings to CR+LF.");
+        },
+    );
     section(ui, metrics, "Dimensions and font");
-    row(ui, "Columns", ChangeClass::Restart, |ui| {
-        ui.add(egui::DragValue::new(&mut t.columns).range(1..=10000));
-    });
-    row(ui, "Rows", ChangeClass::Restart, |ui| {
-        ui.add(egui::DragValue::new(&mut t.rows).range(1..=10000));
-    });
-    row(ui, "Scrollback", ChangeClass::Restart, |ui| {
-        ui.add(egui::DragValue::new(&mut t.scrollback));
-    });
-    row(ui, "Font path", ChangeClass::Restart, |ui| {
-        optional_path(ui, &mut t.font_path)
-    });
-    row(ui, "Font size", ChangeClass::Live, |ui| {
-        ui.add(egui::DragValue::new(&mut t.font_size).range(1..=200));
-    });
+    row(
+        ui,
+        "Columns",
+        "Number of printable character columns in the emulated terminal.",
+        ChangeClass::Restart,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.columns).range(1..=10000));
+        },
+    );
+    row(
+        ui,
+        "Rows",
+        "Number of terminal rows used by the logical display.",
+        ChangeClass::Restart,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.rows).range(1..=10000));
+        },
+    );
+    row(
+        ui,
+        "Scrollback",
+        "Maximum number of previous terminal lines retained for history.",
+        ChangeClass::Restart,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.scrollback));
+        },
+    );
+    row(
+        ui,
+        "Font path",
+        "Path to the font used to render terminal text.",
+        ChangeClass::Restart,
+        |ui| optional_path(ui, &mut t.font_path),
+    );
+    row(
+        ui,
+        "Font size",
+        "Size of the font used to render the terminal paper.",
+        ChangeClass::Live,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.font_size).range(1..=200));
+        },
+    );
     section(ui, metrics, "Startup");
-    row(ui, "Send CR at startup", ChangeClass::Restart, |ui| {
-        ui.checkbox(&mut t.send_cr_at_startup, "")
-            .on_hover_text("Takes effect on the next application session");
-    });
+    row(
+        ui,
+        "Send CR at startup",
+        "Sends one literal carriage return when the first LINE connection of a new session is established.",
+        ChangeClass::Restart,
+        |ui| {
+            ui.checkbox(&mut t.send_cr_at_startup, "")
+                .on_hover_text("Takes effect on the next application session");
+        },
+    );
 }
 fn connection(
     ui: &mut egui::Ui,
@@ -534,133 +631,262 @@ fn connection(
     }
     section(ui, metrics, "Serial connection");
     let s = &mut c.backend.serial_config;
-    row(ui, "Port", ChangeClass::Reconnect, |ui| {
-        ui.text_edit_singleline(&mut s.port);
-        egui::ComboBox::from_id_salt("settings-ports")
-            .selected_text("Available")
-            .show_ui(ui, |ui| {
-                for p in ports {
-                    ui.selectable_value(&mut s.port, p.clone(), p);
-                }
-            });
-    });
-    row(ui, "Baudrate", ChangeClass::Reconnect, |ui| {
-        ui.add(egui::DragValue::new(&mut s.baudrate).range(1..=u32::MAX));
-    });
-    row(ui, "Data bits", ChangeClass::Reconnect, |ui| {
-        for (x, n) in [
-            (DataBits::Five, "5"),
-            (DataBits::Six, "6"),
-            (DataBits::Seven, "7"),
-            (DataBits::Eight, "8"),
-        ] {
-            ui.selectable_value(&mut s.databits, x, n);
-        }
-    });
-    row(ui, "Parity", ChangeClass::Reconnect, |ui| {
-        for (x, n) in [
-            (SerialParity::None, "N"),
-            (SerialParity::Even, "E"),
-            (SerialParity::Odd, "O"),
-            (SerialParity::Mark, "M"),
-            (SerialParity::Space, "S"),
-        ] {
-            ui.selectable_value(&mut s.parity, x, n);
-        }
-    });
-    row(ui, "Stop bits", ChangeClass::Reconnect, |ui| {
-        for (x, n) in [
-            (StopBits::One, "1"),
-            (StopBits::OnePointFive, "1.5"),
-            (StopBits::Two, "2"),
-        ] {
-            ui.selectable_value(&mut s.stopbits, x, n);
-        }
-    });
+    row(
+        ui,
+        "Port",
+        "Serial port used for the external connection, for example COM4 on Windows.",
+        ChangeClass::Reconnect,
+        |ui| {
+            ui.text_edit_singleline(&mut s.port);
+            egui::ComboBox::from_id_salt("settings-ports")
+                .selected_text("Available")
+                .show_ui(ui, |ui| {
+                    for p in ports {
+                        ui.selectable_value(&mut s.port, p.clone(), p);
+                    }
+                });
+        },
+    );
+    row(
+        ui,
+        "Baudrate",
+        "Serial line speed in bits per second.",
+        ChangeClass::Reconnect,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut s.baudrate).range(1..=u32::MAX));
+        },
+    );
+    row(
+        ui,
+        "Data bits",
+        "Number of data bits in each serial character.",
+        ChangeClass::Reconnect,
+        |ui| {
+            for (x, n) in [
+                (DataBits::Five, "5"),
+                (DataBits::Six, "6"),
+                (DataBits::Seven, "7"),
+                (DataBits::Eight, "8"),
+            ] {
+                ui.selectable_value(&mut s.databits, x, n);
+            }
+        },
+    );
+    row(
+        ui,
+        "Parity",
+        "Serial-port parity mode used by the external connection.",
+        ChangeClass::Reconnect,
+        |ui| {
+            for (x, n) in [
+                (SerialParity::None, "N"),
+                (SerialParity::Even, "E"),
+                (SerialParity::Odd, "O"),
+                (SerialParity::Mark, "M"),
+                (SerialParity::Space, "S"),
+            ] {
+                let help = match x {
+                    SerialParity::None => "No serial parity bit.",
+                    SerialParity::Even => "Uses even serial parity.",
+                    SerialParity::Odd => "Uses odd serial parity.",
+                    SerialParity::Mark => "Always marks the serial parity bit.",
+                    SerialParity::Space => "Always spaces the serial parity bit.",
+                };
+                ui.selectable_value(&mut s.parity, x, n).on_hover_text(help);
+            }
+        },
+    );
+    row(
+        ui,
+        "Stop bits",
+        "Number of serial stop bits sent after each character.",
+        ChangeClass::Reconnect,
+        |ui| {
+            for (x, n) in [
+                (StopBits::One, "1"),
+                (StopBits::OnePointFive, "1.5"),
+                (StopBits::Two, "2"),
+            ] {
+                ui.selectable_value(&mut s.stopbits, x, n);
+            }
+        },
+    );
     section(ui, metrics, "Backend");
-    row(ui, "Backend type", ChangeClass::Unavailable, |ui| {
-        ui.selectable_value(&mut c.backend.kind, BackendKind::Serial, "Serial");
-        ui.selectable_value(&mut c.backend.kind, BackendKind::Ssh, "SSH (not migrated)");
-    });
+    row(
+        ui,
+        "Backend type",
+        "Selects the external backend. Serial is available; SSH is not migrated yet.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.selectable_value(&mut c.backend.kind, BackendKind::Serial, "Serial");
+            ui.selectable_value(&mut c.backend.kind, BackendKind::Ssh, "SSH (not migrated)");
+        },
+    );
 }
 fn throttle(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.data_throttle.config;
     ui.heading("Data Rate / Throttle");
     section(ui, metrics, "Pacing");
-    row(ui, "Mode", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.mode, ThrottleMode::Throttled, "Throttled");
-        ui.selectable_value(&mut t.mode, ThrottleMode::Unthrottled, "Unthrottled");
-    });
-    row(ui, "Send rate (cps)", ChangeClass::Live, |ui| {
-        ui.add(egui::DragValue::new(&mut t.send_rate_cps).range(1..=i64::MAX));
-    });
-    row(ui, "Receive rate (cps)", ChangeClass::Live, |ui| {
-        ui.add(egui::DragValue::new(&mut t.receive_rate_cps).range(1..=i64::MAX));
-    });
+    row(
+        ui,
+        "Mode",
+        "Enables authentic character-rate pacing or removes artificial delay.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(&mut t.mode, ThrottleMode::Throttled, "Throttled");
+            ui.selectable_value(&mut t.mode, ThrottleMode::Unthrottled, "Unthrottled");
+        },
+    );
+    row(
+        ui,
+        "Send rate (cps)",
+        "Maximum transmit rate in characters per second while throttling is enabled.",
+        ChangeClass::Live,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.send_rate_cps).range(1..=i64::MAX));
+        },
+    );
+    row(
+        ui,
+        "Receive rate (cps)",
+        "Maximum receive rate in characters per second while throttling is enabled.",
+        ChangeClass::Live,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.receive_rate_cps).range(1..=i64::MAX));
+        },
+    );
 }
 fn tape_reader(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.tape_reader.config;
     ui.heading("Paper Tape Reader");
     section(ui, metrics, "Behavior");
-    for (label, v) in [
-        ("Skip leading nulls", &mut t.skip_leading_nulls),
-        ("Auto-stop trailers", &mut t.auto_stop),
-        ("Set MSB", &mut t.set_msb),
+    for (label, help, v) in [
+        (
+            "Skip leading nulls",
+            "When starting at the beginning, skips leading 0x00 bytes before reading data.",
+            &mut t.skip_leading_nulls,
+        ),
+        (
+            "Auto-stop trailers",
+            "Stops automatically when the detected trailing leader or trailer pattern is reached.",
+            &mut t.auto_stop,
+        ),
+        (
+            "Set MSB",
+            "Sets bit 7 on each byte emitted by the paper-tape reader.",
+            &mut t.set_msb,
+        ),
     ] {
-        row(ui, label, ChangeClass::Live, |ui| {
+        row(ui, label, help, ChangeClass::Live, |ui| {
             ui.checkbox(v, "");
         });
     }
     section(ui, metrics, "Display");
-    row(ui, "Max visible rows", ChangeClass::Live, |ui| {
-        ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
-    });
-    for (label, v) in [
-        ("Ghost outline", &mut t.ghost_outline),
-        ("ASCII masks MSB", &mut t.ascii_char_mask_msb),
+    row(
+        ui,
+        "Max visible rows",
+        "Legacy reader display limit retained for compatibility; the full Rust reader tape remains inspectable.",
+        ChangeClass::Live,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
+        },
+    );
+    for (label, help, v) in [
+        (
+            "Ghost outline",
+            "Shows outlines for unpunched holes to make the tape pattern easier to read.",
+            &mut t.ghost_outline,
+        ),
+        (
+            "ASCII masks MSB",
+            "Ignores bit 7 when displaying the ASCII character beside each tape byte.",
+            &mut t.ascii_char_mask_msb,
+        ),
     ] {
-        row(ui, label, ChangeClass::Live, |ui| {
+        row(ui, label, help, ChangeClass::Live, |ui| {
             ui.checkbox(v, "");
         });
     }
-    row(ui, "Bit label base", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
-        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
-    });
+    row(
+        ui,
+        "Bit label base",
+        "Chooses whether tape data-hole labels start from 0 or 1.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
+            ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
+        },
+    );
     section(ui, metrics, "Files");
-    row(ui, "Initial file path", ChangeClass::Live, |ui| {
-        path(ui, &mut t.initial_file_path)
-    });
+    row(
+        ui,
+        "Initial file path",
+        "Initial directory used when opening the paper-tape file chooser.",
+        ChangeClass::Live,
+        |ui| path(ui, &mut t.initial_file_path),
+    );
     ui.weak("Behavioral changes affect future bytes and never reposition loaded tape.");
 }
 fn tape_punch(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.tape_punch.config;
     ui.heading("Paper Tape Punch");
     section(ui, metrics, "Behavior");
-    row(ui, "Next file mode", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.mode, PunchConfigMode::Append, "Append");
-        ui.selectable_value(&mut t.mode, PunchConfigMode::Overwrite, "Overwrite");
-    });
+    row(
+        ui,
+        "Next file mode",
+        "Selects how the next punch file opens; changing it never reopens the current file.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(&mut t.mode, PunchConfigMode::Append, "Append")
+                .on_hover_text("Preserves existing bytes and appends newly punched data.");
+            ui.selectable_value(&mut t.mode, PunchConfigMode::Overwrite, "Overwrite")
+                .on_hover_text("Truncates the next selected file when it is opened.");
+        },
+    );
     section(ui, metrics, "Display");
-    row(ui, "Max visible rows", ChangeClass::Live, |ui| {
-        ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
-    });
-    for (label, v) in [
-        ("Ghost outline", &mut t.ghost_outline),
-        ("ASCII masks MSB", &mut t.ascii_char_mask_msb),
+    row(
+        ui,
+        "Max visible rows",
+        "Limits newest punched rows shown in the preview without discarding stored bytes.",
+        ChangeClass::Live,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut t.max_rows).range(1..=10000));
+        },
+    );
+    for (label, help, v) in [
+        (
+            "Ghost outline",
+            "Shows outlines for unpunched hole positions in the tape preview.",
+            &mut t.ghost_outline,
+        ),
+        (
+            "ASCII masks MSB",
+            "Ignores bit 7 when displaying the ASCII character beside each punched byte.",
+            &mut t.ascii_char_mask_msb,
+        ),
     ] {
-        row(ui, label, ChangeClass::Live, |ui| {
+        row(ui, label, help, ChangeClass::Live, |ui| {
             ui.checkbox(v, "");
         });
     }
-    row(ui, "Bit label base", ChangeClass::Live, |ui| {
-        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
-        ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
-    });
+    row(
+        ui,
+        "Bit label base",
+        "Chooses whether tape data-hole labels start from 0 or 1.",
+        ChangeClass::Live,
+        |ui| {
+            ui.selectable_value(&mut t.bit_label_base, BitLabelBase::Zero, "0");
+            ui.selectable_value(&mut t.bit_label_base, BitLabelBase::One, "1");
+        },
+    );
     section(ui, metrics, "Files");
-    row(ui, "Initial file path", ChangeClass::Live, |ui| {
-        path(ui, &mut t.initial_file_path)
-    });
+    row(
+        ui,
+        "Initial file path",
+        "Initial directory used when selecting the paper-tape output file.",
+        ChangeClass::Live,
+        |ui| path(ui, &mut t.initial_file_path),
+    );
     ui.weak("Mode and initial path apply to the next selected file; an open file is never reopened or truncated.");
 }
 fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
@@ -668,14 +894,26 @@ fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     ui.heading("Sound");
     ui.weak("Audio backend not migrated yet.");
     section(ui, metrics, "Stored sound preferences");
-    row(ui, "Lid", ChangeClass::Unavailable, |ui| {
-        ui.selectable_value(&mut s.lid, LidState::Up, "Up");
-        ui.selectable_value(&mut s.lid, LidState::Down, "Down");
-    });
-    row(ui, "Mute", ChangeClass::Unavailable, |ui| {
-        ui.selectable_value(&mut s.mute_state, MuteState::Muted, "Muted");
-        ui.selectable_value(&mut s.mute_state, MuteState::Unmuted, "Unmuted");
-    });
+    row(
+        ui,
+        "Lid",
+        "Initial lid state for the legacy mechanical model; Rust audio is not implemented yet.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.selectable_value(&mut s.lid, LidState::Up, "Up");
+            ui.selectable_value(&mut s.lid, LidState::Down, "Down");
+        },
+    );
+    row(
+        ui,
+        "Mute",
+        "Initial audio mute state; Rust audio is not implemented yet.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.selectable_value(&mut s.mute_state, MuteState::Muted, "Muted");
+            ui.selectable_value(&mut s.mute_state, MuteState::Unmuted, "Unmuted");
+        },
+    );
 }
 fn ssh(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let s = &mut c.backend.ssh_config;
@@ -685,44 +923,110 @@ fn ssh(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
         "SSH backend not migrated yet; values can be safely persisted.",
     );
     section(ui, metrics, "Connection");
-    row(ui, "Host", ChangeClass::Unavailable, |ui| {
-        ui.text_edit_singleline(&mut s.host);
-    });
-    row(ui, "Port", ChangeClass::Unavailable, |ui| {
-        ui.add(egui::DragValue::new(&mut s.port).range(1..=u16::MAX));
-    });
-    row(ui, "Username", ChangeClass::Unavailable, |ui| {
-        ui.text_edit_singleline(&mut s.username);
-    });
+    row(
+        ui,
+        "Host",
+        "Hostname or IP address of the SSH server.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.text_edit_singleline(&mut s.host);
+        },
+    );
+    row(
+        ui,
+        "Port",
+        "TCP port used by SSH, normally 22.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut s.port).range(1..=u16::MAX));
+        },
+    );
+    row(
+        ui,
+        "Username",
+        "Username used to authenticate to the SSH server.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.text_edit_singleline(&mut s.username);
+        },
+    );
     section(ui, metrics, "Authentication");
-    row(ui, "Key file", ChangeClass::Unavailable, |ui| {
-        optional_path(ui, &mut s.key_filename)
-    });
-    row(ui, "Password", ChangeClass::Unavailable, |ui| {
-        optional_text(ui, &mut s.password, true);
-    });
-    row(ui, "Use agent", ChangeClass::Unavailable, |ui| {
-        ui.checkbox(&mut s.use_agent, "");
-    });
+    row(
+        ui,
+        "Key file",
+        "Path to the private key used for SSH public-key authentication.",
+        ChangeClass::Unavailable,
+        |ui| optional_path(ui, &mut s.key_filename),
+    );
+    row(
+        ui,
+        "Password",
+        "Password used for SSH authentication when password authentication is enabled.",
+        ChangeClass::Unavailable,
+        |ui| {
+            optional_text(ui, &mut s.password, true);
+        },
+    );
+    row(
+        ui,
+        "Use agent",
+        "Allows authentication through the user's SSH authentication agent.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.checkbox(&mut s.use_agent, "");
+        },
+    );
     section(ui, metrics, "Host verification");
-    row(ui, "Policy", ChangeClass::Unavailable, |ui| {
-        for (x, n) in [
-            (HostKeyPolicy::Strict, "Strict"),
-            (HostKeyPolicy::AcceptNew, "Accept new"),
-            (HostKeyPolicy::Off, "Off"),
-        ] {
-            ui.selectable_value(&mut s.host_key_policy, x, n);
-        }
-    });
-    row(ui, "Expected fingerprint", ChangeClass::Unavailable, |ui| {
-        optional_text(ui, &mut s.expected_fingerprint, false);
-    });
-    row(ui, "Known hosts", ChangeClass::Unavailable, |ui| {
-        path(ui, &mut s.known_hosts_file)
-    });
-    row(ui, "TOFU prompt", ChangeClass::Unavailable, |ui| {
-        ui.checkbox(&mut s.tofu_prompt, "");
-    });
+    row(
+        ui,
+        "Policy",
+        "Controls how unknown or changed SSH host keys are handled.",
+        ChangeClass::Unavailable,
+        |ui| {
+            for (x, n) in [
+                (HostKeyPolicy::Strict, "Strict"),
+                (HostKeyPolicy::AcceptNew, "Accept new"),
+                (HostKeyPolicy::Off, "Off"),
+            ] {
+                let help = match x {
+                    HostKeyPolicy::Strict => {
+                        "Requires a matching key already present in known hosts."
+                    }
+                    HostKeyPolicy::AcceptNew => {
+                        "Accepts new host keys but rejects changed known keys."
+                    }
+                    HostKeyPolicy::Off => "Disables known-host verification.",
+                };
+                ui.selectable_value(&mut s.host_key_policy, x, n)
+                    .on_hover_text(help);
+            }
+        },
+    );
+    row(
+        ui,
+        "Expected fingerprint",
+        "Optional expected SSH host-key fingerprint used to verify the remote server.",
+        ChangeClass::Unavailable,
+        |ui| {
+            optional_text(ui, &mut s.expected_fingerprint, false);
+        },
+    );
+    row(
+        ui,
+        "Known hosts",
+        "Path to the known-hosts file used for SSH host-key verification.",
+        ChangeClass::Unavailable,
+        |ui| path(ui, &mut s.known_hosts_file),
+    );
+    row(
+        ui,
+        "TOFU prompt",
+        "Stores whether first-use host keys should require confirmation once SSH is migrated.",
+        ChangeClass::Unavailable,
+        |ui| {
+            ui.checkbox(&mut s.tofu_prompt, "");
+        },
+    );
 }
 
 #[cfg(test)]
