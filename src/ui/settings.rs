@@ -551,6 +551,15 @@ fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
                 .on_hover_text("Normalizes keyboard Return and tape line endings to CR+LF.");
         },
     );
+    row(
+        ui,
+        "Paste on right click",
+        "Pastes clipboard text into the terminal when its paper is right-clicked, using the current uppercase, parity and Input return settings.",
+        ChangeClass::Live,
+        |ui| {
+            ui.checkbox(&mut t.paste_on_right_click, "");
+        },
+    );
     section(ui, metrics, "Dimensions and font");
     row(
         ui,

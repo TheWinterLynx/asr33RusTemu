@@ -161,6 +161,8 @@ pub struct EguiApp {
     sound_muted: bool,
     lid_state: LidState,
     reader_audio_running: bool,
+    paste_on_right_click: bool,
+    right_click_paste_age: Option<u8>,
 }
 
 impl EguiApp {
@@ -194,6 +196,7 @@ impl EguiApp {
         );
         let lid_state = options.applied_config.sound.config.lid;
         let sound_muted = options.applied_config.sound.config.mute_state == MuteState::Muted;
+        let paste_on_right_click = options.applied_config.terminal.config.paste_on_right_click;
         let audio = AudioEngine::start(lid_state, sound_muted);
         let mut application = Self {
             runtime,
@@ -226,6 +229,8 @@ impl EguiApp {
             sound_muted,
             lid_state,
             reader_audio_running: false,
+            paste_on_right_click,
+            right_click_paste_age: None,
         };
         application.refresh_ports(PortRefreshPolicy::Silent);
         application.theme.apply(&creation_context.egui_ctx);
@@ -325,6 +330,41 @@ impl EguiApp {
         context.request_repaint();
     }
 
+    fn submit_keyboard_input(
+        &mut self,
+        context: &egui::Context,
+        input: KeyboardInput,
+        play_keypress: bool,
+    ) {
+        match encode_input(&input, self.options.keyboard) {
+            Ok(bytes) if !bytes.is_empty() => {
+                if play_keypress {
+                    self.audio.keypress();
+                }
+                self.submit(context, ApplicationCommand::Transmit(bytes));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.transport_error = Some(error.to_string());
+                context.request_repaint();
+            }
+        }
+    }
+
+    fn clear_paper(&mut self, context: &egui::Context) {
+        match self.runtime.clear_paper() {
+            Ok(()) => {
+                self.scroll_top = None;
+                self.scroll_request = true;
+                context.request_repaint();
+            }
+            Err(error) => {
+                self.transport_error = Some(error.to_string());
+                context.request_repaint();
+            }
+        }
+    }
+
     fn change_communication_mode(&mut self, context: &egui::Context, mode: CommunicationMode) {
         if self.options.communication_mode == mode {
             return;
@@ -396,6 +436,7 @@ impl EguiApp {
         self.options.keyboard.uppercase_only = terminal.keyboard_uppercase_only;
         self.options.keyboard.parity = terminal.keyboard_parity_mode;
         self.options.keyboard.return_mode = terminal.input_return_mode;
+        self.paste_on_right_click = terminal.paste_on_right_click;
         self.reader.set_return_mode(terminal.input_return_mode);
         self.options.font_size = terminal.font_size as f32;
         self.options.tape_reader = new.tape_reader.config.clone();
@@ -468,24 +509,30 @@ impl EguiApp {
 
     fn handle_keyboard(&mut self, context: &egui::Context) {
         let events = context.input(|input| input.events.clone());
+        let mut consumed_requested_paste = false;
         for event in &events {
+            if let egui::Event::Paste(text) = event
+                && self.right_click_paste_age.is_some()
+            {
+                consumed_requested_paste = true;
+                self.right_click_paste_age = None;
+                let normalized = normalize_paste_text(text, self.options.keyboard.return_mode);
+                self.submit_keyboard_input(context, KeyboardInput::Text(normalized), false);
+                continue;
+            }
             if self.handle_shortcut(context, event) {
                 continue;
             }
-            let logical = keyboard_input_for_target(self.keyboard_target, event);
-            if let Some(input) = logical {
-                match encode_input(&input, self.options.keyboard) {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        self.audio.keypress();
-                        self.submit(context, ApplicationCommand::Transmit(bytes));
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.transport_error = Some(error.to_string());
-                        context.request_repaint();
-                    }
-                }
+            if let Some(input) = keyboard_input_for_target(self.keyboard_target, event) {
+                self.submit_keyboard_input(context, input, true);
             }
+        }
+        if !consumed_requested_paste {
+            self.right_click_paste_age = match self.right_click_paste_age {
+                Some(0) => Some(1),
+                Some(_) => None,
+                None => None,
+            };
         }
     }
 
@@ -860,6 +907,7 @@ impl EguiApp {
         let throttle_mode = self.options.throttle_mode;
         let printer_enabled = self.options.printer_enabled;
         let keyboard = self.options.keyboard;
+        let paste_on_right_click = self.paste_on_right_click;
         let tape_reader = self.options.tape_reader.clone();
         let mut tape_punch = self.options.tape_punch.clone();
         tape_punch.mode = match self.punch_mode {
@@ -882,6 +930,7 @@ impl EguiApp {
                 config.terminal.config.keyboard_uppercase_only = keyboard.uppercase_only;
                 config.terminal.config.keyboard_parity_mode = keyboard.parity;
                 config.terminal.config.input_return_mode = keyboard.return_mode;
+                config.terminal.config.paste_on_right_click = paste_on_right_click;
                 config.terminal.config.no_print = !printer_enabled;
                 config.data_throttle.config.mode = match throttle_mode {
                     ThrottleMode::Throttled => ConfigThrottleMode::Throttled,
@@ -912,6 +961,14 @@ impl EguiApp {
         if focus_response.clicked() {
             focus_response.request_focus();
             self.keyboard_target = KeyboardTarget::Terminal;
+        }
+        if focus_response.secondary_clicked() && self.paste_on_right_click {
+            focus_response.request_focus();
+            self.keyboard_target = KeyboardTarget::Terminal;
+            self.right_click_paste_age = Some(0);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            ui.ctx().request_repaint();
         }
         let wheel = ui.ctx().input(|input| input.smooth_scroll_delta.y);
         if ui.rect_contains_pointer(ui.max_rect()) && wheel != 0.0 {
@@ -1482,6 +1539,15 @@ impl eframe::App for EguiApp {
                                     .open(&mut self.settings_state, self.theme);
                                 self.current_view.open_settings();
                             }
+                            if ui
+                                .button("Clear Paper")
+                                .on_hover_text(
+                                    "Clear terminal paper and scrollback locally; no bytes are transmitted",
+                                )
+                                .clicked()
+                            {
+                                self.clear_paper(ui.ctx());
+                            }
                         });
                     });
                 egui::Panel::bottom("operation-bar")
@@ -1685,6 +1751,28 @@ fn history_scroll_target(current: Option<usize>, bottom: usize, wheel: f32) -> O
     (next < bottom).then_some(next)
 }
 
+fn normalize_paste_text(text: &str, mode: InputReturnMode) -> String {
+    let newline = match mode {
+        InputReturnMode::Cr => "\r",
+        InputReturnMode::CrLf => "\r\n",
+    };
+    let mut normalized = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    let _ = characters.next();
+                }
+                normalized.push_str(newline);
+            }
+            '\n' => normalized.push_str(newline),
+            _ => normalized.push(character),
+        }
+    }
+    normalized
+}
+
 fn keyboard_input_for_event(event: &egui::Event) -> Option<KeyboardInput> {
     match event {
         egui::Event::Text(text) => Some(KeyboardInput::Text(text.clone())),
@@ -1825,14 +1913,14 @@ mod tests {
     use super::{
         KeyboardTarget, PortRefreshPolicy, TapeStepDirection, apply_tape_shortcut,
         column_status_label, history_scroll_target, keyboard_input_for_event,
-        keyboard_input_for_target, open_serial_for_explicit_request, port_enumeration_update,
-        punch_status_label, reader_status_label, repaint_delay, should_send_to_terminal,
-        startup_connection_state, stepped_position, toggled_lid,
+        keyboard_input_for_target, normalize_paste_text, open_serial_for_explicit_request,
+        port_enumeration_update, punch_status_label, reader_status_label, repaint_delay,
+        should_send_to_terminal, startup_connection_state, stepped_position, toggled_lid,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
     use crate::core::config::{
-        BackendKind, DataBits, LidState, SerialConfig, SerialParity, StopBits,
+        BackendKind, DataBits, InputReturnMode, LidState, SerialConfig, SerialParity, StopBits,
     };
     use crate::core::paper_tape::{
         PaperTape, PunchMode, PunchState, ReaderOptions, ReaderState, StopCause, TapeReader,
@@ -1958,6 +2046,19 @@ mod tests {
     fn column_status_uses_terminal_column_and_width() {
         assert_eq!(column_status_label(0, 72), "Col 0 / 72");
         assert_eq!(column_status_label(3, 80), "Col 3 / 80");
+    }
+
+    #[test]
+    fn right_click_paste_normalizes_all_host_line_endings_to_keyboard_eol() {
+        let source = "ONE\r\nTWO\nTHREE\rFOUR";
+        assert_eq!(
+            normalize_paste_text(source, InputReturnMode::Cr),
+            "ONE\rTWO\rTHREE\rFOUR"
+        );
+        assert_eq!(
+            normalize_paste_text(source, InputReturnMode::CrLf),
+            "ONE\r\nTWO\r\nTHREE\r\nFOUR"
+        );
     }
 
     #[test]

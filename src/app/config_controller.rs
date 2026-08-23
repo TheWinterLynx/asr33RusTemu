@@ -54,6 +54,11 @@ impl ConfigChangePlan {
             "input return mode",
             ChangeClass::Live,
         );
+        add(
+            a.paste_on_right_click != b.paste_on_right_click,
+            "right-click paste",
+            ChangeClass::Live,
+        );
         add(a.no_print != b.no_print, "printer", ChangeClass::Live);
         add(a.font_size != b.font_size, "font size", ChangeClass::Live);
         add(
@@ -273,11 +278,18 @@ mod tests {
         let mut b = a.clone();
         b.terminal.config.mode = TerminalMode::Local;
         b.terminal.config.input_return_mode = InputReturnMode::CrLf;
+        b.terminal.config.paste_on_right_click = !a.terminal.config.paste_on_right_click;
         assert!(
             ConfigChangePlan::between(&a, &b)
                 .changes
                 .iter()
                 .all(|x| x.class == ChangeClass::Live)
+        );
+        assert!(
+            ConfigChangePlan::between(&a, &b)
+                .changes
+                .iter()
+                .any(|x| x.label == "right-click paste" && x.class == ChangeClass::Live)
         );
         let mut b = a.clone();
         b.backend.serial_config.port = "COM5".into();

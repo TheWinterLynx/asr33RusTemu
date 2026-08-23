@@ -141,6 +141,16 @@ impl Terminal {
         self.printing_enabled = false;
     }
 
+    /// Clear only the visible/retained terminal paper.
+    ///
+    /// This is a local UI operation: it does not emit bytes, alter printer
+    /// enablement, reset escape parsing, or affect transport state.
+    pub fn clear_paper(&mut self) {
+        self.current_column = 0;
+        self.current_line_number = 0;
+        self.line_history.clear(0);
+    }
+
     #[must_use]
     pub fn character_event_count(&self) -> usize {
         self.character_events.len()
@@ -218,4 +228,36 @@ impl Terminal {
 #[must_use]
 pub const fn is_legacy_printable_ascii(byte: u8) -> bool {
     byte >= 0x20 && byte <= 0x7e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Terminal, TerminalOptions};
+
+    #[test]
+    fn clear_paper_resets_text_history_and_cursor_without_changing_printer_state() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            columns: 8,
+            rows: 2,
+            scrollback: 3,
+            autowrap: false,
+        })
+        .expect("terminal");
+        terminal.receive_data(b"ABC\r\nDEF").expect("terminal input");
+        assert!(terminal.line_history().len() > 1);
+        assert_ne!(terminal.cursor_position(), (0, 0));
+        terminal.disable_printing();
+        let queued_audio_events = terminal.character_event_count();
+
+        terminal.clear_paper();
+
+        assert_eq!(terminal.cursor_position(), (0, 0));
+        assert_eq!(terminal.line_history().len(), 1);
+        assert_eq!(
+            terminal.line_history().line(0).expect("blank line").top_characters(),
+            "        "
+        );
+        assert!(!terminal.printing_enabled());
+        assert_eq!(terminal.character_event_count(), queued_audio_events);
+    }
 }

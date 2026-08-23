@@ -90,6 +90,14 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<(), ValidationEr
     }
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedConfig {
     pub file: AppConfig,
@@ -280,6 +288,8 @@ pub struct TerminalConfig {
     pub keyboard_parity_mode: KeyboardParityMode,
     #[serde(default, alias = "keyboard_return_mode")]
     pub input_return_mode: InputReturnMode,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub paste_on_right_click: bool,
     pub send_cr_at_startup: bool,
     pub no_print: bool,
     pub font_path: Option<PathBuf>,
@@ -737,6 +747,24 @@ mod tests {
             config.terminal.config.input_return_mode,
             InputReturnMode::Cr
         );
+    }
+
+    #[test]
+    fn existing_yaml_defaults_right_click_paste_to_enabled() {
+        let mut config = AppConfig::from_yaml_str(include_str!("../../asr33_config.yaml"))
+            .expect("repository YAML remains valid without paste setting");
+        assert!(config.terminal.config.paste_on_right_click);
+        let serialized = config.to_yaml_string().expect("configuration serializes");
+        assert!(
+            !serialized.contains("paste_on_right_click"),
+            "the default true value stays backward-compatible and uncluttered"
+        );
+
+        config.terminal.config.paste_on_right_click = false;
+        let serialized = config.to_yaml_string().expect("disabled setting serializes");
+        assert!(serialized.contains("paste_on_right_click: false"));
+        let roundtrip = AppConfig::from_yaml_str(&serialized).expect("disabled setting parses");
+        assert!(!roundtrip.terminal.config.paste_on_right_click);
     }
 
     #[test]

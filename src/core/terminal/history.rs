@@ -81,6 +81,13 @@ impl LineHistory {
         }
     }
 
+    /// Drop all retained paper and start again with one blank logical line.
+    pub fn clear(&mut self, initial_logical_number: u64) {
+        self.lines.clear();
+        self.lines
+            .push_back(Line::new(self.width, initial_logical_number));
+    }
+
     #[must_use]
     pub fn line(&self, row: usize) -> Option<&Line> {
         self.lines.get(row)

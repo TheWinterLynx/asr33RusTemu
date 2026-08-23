@@ -357,6 +357,13 @@ where
         &self.terminal
     }
 
+    /// Clear local terminal paper/history without routing any bytes.
+    pub fn clear_paper(&mut self) -> Result<(), RuntimeError<T::Error>> {
+        self.require_running()?;
+        self.terminal.clear_paper();
+        Ok(())
+    }
+
     pub fn pop_character_event(&mut self) -> Option<CharacterEvent> {
         self.terminal.pop_character_event()
     }
