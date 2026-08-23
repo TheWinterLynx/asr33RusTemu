@@ -47,6 +47,52 @@ enum TapeStepDirection {
     TowardEnd,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortRefreshPolicy {
+    Silent,
+    ReportErrors,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartupConnectionState {
+    connection_state: ConnectionState,
+    transport_error: Option<String>,
+    active_serial_config: Option<SerialConfig>,
+}
+
+#[must_use]
+const fn startup_connection_state(
+    _backend: BackendKind,
+    _desired_serial: &SerialConfig,
+) -> StartupConnectionState {
+    StartupConnectionState {
+        connection_state: ConnectionState::Disconnected,
+        transport_error: None,
+        active_serial_config: None,
+    }
+}
+
+fn port_enumeration_update(
+    result: Result<Vec<String>, String>,
+    policy: PortRefreshPolicy,
+) -> (Vec<String>, Option<String>) {
+    match result {
+        Ok(ports) => (ports, None),
+        Err(error) if policy == PortRefreshPolicy::ReportErrors => (
+            Vec::new(),
+            Some(format!("port enumeration failed: {error}")),
+        ),
+        Err(_) => (Vec::new(), None),
+    }
+}
+
+fn open_serial_for_explicit_request<T, E>(
+    config: SerialConfig,
+    open: impl FnOnce(SerialConfig) -> Result<T, E>,
+) -> Result<T, E> {
+    open(config)
+}
+
 #[derive(Clone, Debug)]
 pub struct UiOptions {
     pub title: String,
@@ -126,10 +172,16 @@ impl EguiApp {
             options.disk_config.clone(),
             options.applied_config.clone(),
         );
+        let startup_connection =
+            startup_connection_state(options.backend_kind, &options.serial_config);
+        debug_assert_eq!(
+            runtime.connection_state(),
+            &startup_connection.connection_state
+        );
         let mut application = Self {
             runtime,
             options,
-            transport_error: None,
+            transport_error: startup_connection.transport_error,
             shutdown_complete: false,
             reader: ReaderFeed::new(reader, Duration::ZERO, input_return_mode),
             reader_path: None,
@@ -151,27 +203,18 @@ impl EguiApp {
             settings_state,
             settings_view: SettingsView::default(),
             current_view: AppView::Terminal,
-            active_serial_config: None,
+            active_serial_config: startup_connection.active_serial_config,
         };
-        application.refresh_ports();
-        if application.options.backend_kind == BackendKind::Serial {
-            application.connect_selected();
-        } else {
-            application.transport_error =
-                Some("SSH backend not migrated yet; Settings remains available".to_owned());
-        }
+        application.refresh_ports(PortRefreshPolicy::Silent);
         application.theme.apply(&creation_context.egui_ctx);
         application
     }
 
-    fn refresh_ports(&mut self) {
-        match serialport::available_ports() {
-            Ok(ports) => {
-                self.available_ports = ports.into_iter().map(|port| port.port_name).collect();
-                self.port_error = None;
-            }
-            Err(error) => self.port_error = Some(format!("port enumeration failed: {error}")),
-        }
+    fn refresh_ports(&mut self, policy: PortRefreshPolicy) {
+        let result = serialport::available_ports()
+            .map(|ports| ports.into_iter().map(|port| port.port_name).collect())
+            .map_err(|error| error.to_string());
+        (self.available_ports, self.port_error) = port_enumeration_update(result, policy);
     }
 
     fn connect_selected(&mut self) {
@@ -180,7 +223,7 @@ impl EguiApp {
             return;
         }
         let selected = self.options.serial_config.clone();
-        match SerialTransport::open(selected.clone()) {
+        match open_serial_for_explicit_request(selected.clone(), SerialTransport::open) {
             Ok(transport) => match self.runtime.connect(transport) {
                 Ok(()) => {
                     self.transport_error = None;
@@ -352,7 +395,7 @@ impl EguiApp {
                     self.settings_view.error = Some("SSH backend not migrated yet".to_owned());
                 }
             }
-            SettingsAction::RefreshPorts => self.refresh_ports(),
+            SettingsAction::RefreshPorts => self.refresh_ports(PortRefreshPolicy::ReportErrors),
             SettingsAction::Close => self.current_view.show_terminal(),
         }
     }
@@ -654,7 +697,7 @@ impl EguiApp {
                 .on_hover_text("Refresh serial ports")
                 .clicked()
             {
-                self.refresh_ports();
+                self.refresh_ports(PortRefreshPolicy::ReportErrors);
             }
             if !connected
                 && ui
@@ -1669,13 +1712,15 @@ fn apply_tape_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardTarget, TapeStepDirection, apply_tape_shortcut, column_status_label,
-        history_scroll_target, keyboard_input_for_event, keyboard_input_for_target,
+        KeyboardTarget, PortRefreshPolicy, TapeStepDirection, apply_tape_shortcut,
+        column_status_label, history_scroll_target, keyboard_input_for_event,
+        keyboard_input_for_target, open_serial_for_explicit_request, port_enumeration_update,
         punch_status_label, reader_status_label, repaint_delay, should_send_to_terminal,
-        stepped_position,
+        startup_connection_state, stepped_position,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
+    use crate::core::config::{BackendKind, DataBits, SerialConfig, SerialParity, StopBits};
     use crate::core::paper_tape::{
         PaperTape, PunchMode, PunchState, ReaderOptions, ReaderState, StopCause, TapeReader,
     };
@@ -1692,6 +1737,82 @@ mod tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    fn desired_serial(port: &str) -> SerialConfig {
+        SerialConfig {
+            port: port.to_owned(),
+            baudrate: 19_200,
+            databits: DataBits::Eight,
+            parity: SerialParity::None,
+            stopbits: StopBits::One,
+        }
+    }
+
+    #[test]
+    fn startup_never_activates_or_reports_configured_transport() {
+        for (backend, port) in [
+            (BackendKind::Serial, "COM4"),
+            (BackendKind::Serial, "COM999"),
+            (BackendKind::Ssh, "COM4"),
+        ] {
+            let desired = desired_serial(port);
+            let state = startup_connection_state(backend, &desired);
+            assert_eq!(
+                state.connection_state,
+                crate::app::ConnectionState::Disconnected
+            );
+            assert_eq!(state.active_serial_config, None);
+            assert_eq!(state.transport_error, None);
+            assert_eq!(desired.port, port, "desired configuration remains intact");
+        }
+    }
+
+    #[test]
+    fn serial_open_occurs_once_per_explicit_request_and_never_retries() {
+        let attempts = std::cell::Cell::new(0);
+        let desired = desired_serial("COM999");
+        let open = |config: SerialConfig| -> Result<(), &'static str> {
+            attempts.set(attempts.get() + 1);
+            assert_eq!(config, desired);
+            Err("cannot open serial port")
+        };
+
+        let startup = startup_connection_state(BackendKind::Serial, &desired);
+        assert_eq!(attempts.get(), 0);
+        assert_eq!(startup.transport_error, None);
+
+        assert_eq!(
+            open_serial_for_explicit_request(desired.clone(), open),
+            Err("cannot open serial port")
+        );
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            open_serial_for_explicit_request(desired.clone(), open),
+            Err("cannot open serial port")
+        );
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn startup_port_enumeration_is_silent_but_explicit_refresh_reports_failure() {
+        let silent = port_enumeration_update(
+            Err("enumeration unavailable".to_owned()),
+            PortRefreshPolicy::Silent,
+        );
+        assert_eq!(silent, (Vec::new(), None));
+
+        let explicit = port_enumeration_update(
+            Err("enumeration unavailable".to_owned()),
+            PortRefreshPolicy::ReportErrors,
+        );
+        assert_eq!(
+            explicit,
+            (
+                Vec::new(),
+                Some("port enumeration failed: enumeration unavailable".to_owned())
+            )
+        );
     }
 
     #[test]
