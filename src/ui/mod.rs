@@ -3,6 +3,7 @@
 mod egui_app;
 pub mod keyboard;
 pub mod layout;
+pub mod settings;
 pub mod tape_view;
 pub mod theme;
 

@@ -31,14 +31,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let config = loaded.effective;
     config.validate()?;
 
-    if config.backend.kind == BackendKind::Ssh {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the SSH backend has not been migrated to Rust yet",
-        )
-        .into());
-    }
-
     let terminal_config = &config.terminal.config;
     let terminal_options = terminal_options(&config);
     let throttle_config = throttle_config(&config);
@@ -52,7 +44,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let tape_reader = config.tape_reader.config.clone();
     let tape_punch = config.tape_punch.config.clone();
     let font_size = terminal_config.font_size as f32;
-    let backend_label = "serial".to_owned();
+    let backend_label = match config.backend.kind {
+        BackendKind::Serial => "serial",
+        BackendKind::Ssh => "SSH unavailable",
+    }
+    .to_owned();
     let initial_commands =
         initial_commands(&config, communication_mode, throttle_mode, printer_enabled);
 
@@ -76,6 +72,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         tape_reader,
         tape_punch,
         serial_config,
+        backend_kind: config.backend.kind,
+        config_path: cli.config,
+        disk_config: loaded.file,
+        applied_config: config,
     };
     let title = ui_options.title.clone();
     let native_options = eframe::NativeOptions {

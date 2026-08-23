@@ -30,6 +30,10 @@ impl AppConfig {
         serde_saphyr::from_str(source).map_err(ConfigError::Yaml)
     }
 
+    pub fn to_yaml_string(&self) -> Result<String, serde_saphyr::SerializeError> {
+        serde_saphyr::to_string(self)
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         let terminal = &self.terminal.config;
         require_nonzero(terminal.columns, "terminal.config.columns")?;

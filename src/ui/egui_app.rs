@@ -5,13 +5,15 @@ use eframe::egui::{self, Align2, FontData, FontDefinitions, FontFamily, FontId};
 
 use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
+use crate::app::config_controller::{ConfigChangePlan, SettingsState, serial_reconnect_required};
 use crate::app::paper_tape::{FeedResult, READER_FEED_INTERVAL, ReaderFeed};
 use crate::app::{
     AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, Scheduler,
     SystemScheduler,
 };
 use crate::core::config::{
-    InputReturnMode, PunchConfigMode, SerialConfig, TapePunchConfig, TapeReaderConfig,
+    AppConfig, BackendKind, InputReturnMode, PunchConfigMode, SerialConfig, TapePunchConfig,
+    TapeReaderConfig, TerminalMode, ThrottleMode as ConfigThrottleMode,
 };
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use crate::core::paper_tape::{
@@ -22,6 +24,7 @@ use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 use super::layout::{
     DockSplitState, DockWidthState, PanelPlacement, PanelPresentation, TerminalMetrics,
 };
+use super::settings::{SettingsAction, SettingsWindow};
 use super::tape_view::{
     ReaderTapeViewState, TapePanelMetrics, TapeRendererOptions, TapeSourceOrder,
     render_reader_tape, render_tape,
@@ -56,6 +59,10 @@ pub struct UiOptions {
     pub tape_reader: TapeReaderConfig,
     pub tape_punch: TapePunchConfig,
     pub serial_config: SerialConfig,
+    pub backend_kind: BackendKind,
+    pub config_path: PathBuf,
+    pub disk_config: AppConfig,
+    pub applied_config: AppConfig,
 }
 
 #[must_use]
@@ -90,6 +97,9 @@ pub struct EguiApp {
     scroll_request: bool,
     available_ports: Vec<String>,
     port_error: Option<String>,
+    settings_state: SettingsState,
+    settings_window: SettingsWindow,
+    active_serial_config: Option<SerialConfig>,
 }
 
 impl EguiApp {
@@ -110,6 +120,11 @@ impl EguiApp {
             PunchConfigMode::Overwrite => PunchMode::Overwrite,
         };
         let input_return_mode = options.keyboard.return_mode;
+        let settings_state = SettingsState::new(
+            options.config_path.clone(),
+            options.disk_config.clone(),
+            options.applied_config.clone(),
+        );
         let mut application = Self {
             runtime,
             options,
@@ -132,9 +147,17 @@ impl EguiApp {
             scroll_request: false,
             available_ports: Vec::new(),
             port_error: None,
+            settings_state,
+            settings_window: SettingsWindow::default(),
+            active_serial_config: None,
         };
         application.refresh_ports();
-        application.connect_selected();
+        if application.options.backend_kind == BackendKind::Serial {
+            application.connect_selected();
+        } else {
+            application.transport_error =
+                Some("SSH backend not migrated yet; Settings remains available".to_owned());
+        }
         application.theme.apply(&creation_context.egui_ctx);
         application
     }
@@ -150,9 +173,18 @@ impl EguiApp {
     }
 
     fn connect_selected(&mut self) {
-        match SerialTransport::open(self.options.serial_config.clone()) {
+        if self.options.backend_kind != BackendKind::Serial {
+            self.transport_error = Some("SSH backend not migrated yet".to_owned());
+            return;
+        }
+        let selected = self.options.serial_config.clone();
+        match SerialTransport::open(selected.clone()) {
             Ok(transport) => match self.runtime.connect(transport) {
-                Ok(()) => self.transport_error = None,
+                Ok(()) => {
+                    self.transport_error = None;
+                    self.active_serial_config = Some(selected);
+                    self.settings_state.clear_reconnect_required();
+                }
                 Err(error) => self.transport_error = Some(error.to_string()),
             },
             Err(error) => {
@@ -178,6 +210,7 @@ impl EguiApp {
         if let Err(error) = self.runtime.disconnect() {
             self.transport_error = Some(error.to_string());
         }
+        self.active_serial_config = None;
     }
 
     fn submit(&mut self, context: &egui::Context, command: ApplicationCommand) {
@@ -202,6 +235,123 @@ impl EguiApp {
             Err(error) => self.transport_error = Some(error.to_string()),
         }
         context.request_repaint();
+    }
+
+    fn apply_settings(&mut self, context: &egui::Context) -> Result<(), String> {
+        self.settings_state
+            .validate_draft()
+            .map_err(|error| error.to_string())?;
+        let old = self.settings_state.applied_config.clone();
+        let new = self.settings_state.draft_config.clone();
+        let plan = ConfigChangePlan::between(&old, &new);
+        let old_terminal = &old.terminal.config;
+        let terminal = &new.terminal.config;
+        if old_terminal.mode != terminal.mode {
+            self.change_communication_mode(
+                context,
+                match terminal.mode {
+                    TerminalMode::Line => CommunicationMode::Line,
+                    TerminalMode::Local => CommunicationMode::Local,
+                },
+            );
+        }
+        if old.data_throttle.config.mode != new.data_throttle.config.mode {
+            let mode = match new.data_throttle.config.mode {
+                ConfigThrottleMode::Throttled => ThrottleMode::Throttled,
+                ConfigThrottleMode::Unthrottled => ThrottleMode::Unthrottled,
+            };
+            self.submit(context, ApplicationCommand::SetThrottleMode(mode));
+            self.options.throttle_mode = mode;
+        }
+        if old.data_throttle.config.send_rate_cps != new.data_throttle.config.send_rate_cps {
+            self.submit(
+                context,
+                ApplicationCommand::SetTxRate(new.data_throttle.config.send_rate_cps),
+            );
+        }
+        if old.data_throttle.config.receive_rate_cps != new.data_throttle.config.receive_rate_cps {
+            self.submit(
+                context,
+                ApplicationCommand::SetRxRate(new.data_throttle.config.receive_rate_cps),
+            );
+        }
+        if old_terminal.no_print != terminal.no_print {
+            self.options.printer_enabled = !terminal.no_print;
+            self.submit(
+                context,
+                ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
+            );
+        }
+        self.options.keyboard.uppercase_only = terminal.keyboard_uppercase_only;
+        self.options.keyboard.parity = terminal.keyboard_parity_mode;
+        self.options.keyboard.return_mode = terminal.input_return_mode;
+        self.reader.set_return_mode(terminal.input_return_mode);
+        self.options.font_size = terminal.font_size as f32;
+        self.options.tape_reader = new.tape_reader.config.clone();
+        self.reader
+            .reader_mut()
+            .set_auto_stop(self.options.tape_reader.auto_stop);
+        self.reader
+            .reader_mut()
+            .set_skip_leading_nulls(self.options.tape_reader.skip_leading_nulls);
+        self.reader
+            .reader_mut()
+            .set_msb(self.options.tape_reader.set_msb);
+        self.options.tape_punch = new.tape_punch.config.clone();
+        self.punch_mode = match self.options.tape_punch.mode {
+            PunchConfigMode::Append => PunchMode::Append,
+            PunchConfigMode::Overwrite => PunchMode::Overwrite,
+        };
+        self.options.serial_config = new.backend.serial_config.clone();
+        self.options.backend_kind = new.backend.kind;
+        self.theme = self.settings_window.draft_theme;
+        self.theme.apply(context);
+        self.settings_window.applied_theme = self.theme;
+        self.settings_state.commit_apply(&plan);
+        self.settings_state.pending_reconnect = self.options.backend_kind == BackendKind::Serial
+            && serial_reconnect_required(
+                self.active_serial_config.as_ref(),
+                &self.options.serial_config,
+            );
+        context.request_repaint();
+        Ok(())
+    }
+
+    fn handle_settings_action(&mut self, context: &egui::Context, action: SettingsAction) {
+        self.settings_window.error = None;
+        match action {
+            SettingsAction::Apply => {
+                if let Err(error) = self.apply_settings(context) {
+                    self.settings_window.error = Some(error);
+                }
+            }
+            SettingsAction::Save => match self.apply_settings(context) {
+                Ok(()) => {
+                    if let Err(error) = self.settings_state.save_applied() {
+                        self.settings_window.error = Some(format!("Applied, save failed: {error}"));
+                    }
+                }
+                Err(error) => self.settings_window.error = Some(error),
+            },
+            SettingsAction::Cancel => {
+                self.settings_state.cancel();
+                self.settings_window.draft_theme = self.settings_window.applied_theme;
+                self.settings_window.open = false;
+            }
+            SettingsAction::Revert => {
+                self.settings_state.revert();
+                self.settings_window.draft_theme = self.settings_window.applied_theme;
+            }
+            SettingsAction::Reconnect => {
+                if self.options.backend_kind == BackendKind::Serial {
+                    self.disconnect();
+                    self.connect_selected();
+                } else {
+                    self.settings_window.error = Some("SSH backend not migrated yet".to_owned());
+                }
+            }
+            SettingsAction::RefreshPorts => self.refresh_ports(),
+        }
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context) {
@@ -503,7 +653,15 @@ impl EguiApp {
             {
                 self.refresh_ports();
             }
-            if !connected && ui.button("Connect").clicked() {
+            if !connected
+                && ui
+                    .add_enabled(
+                        self.options.backend_kind == BackendKind::Serial,
+                        egui::Button::new("Connect"),
+                    )
+                    .on_disabled_hover_text("SSH backend not migrated yet")
+                    .clicked()
+            {
                 self.connect_selected();
             }
             if connected && ui.button("Disconnect").clicked() {
@@ -547,6 +705,48 @@ impl EguiApp {
                 }
             });
         }
+    }
+
+    fn sync_controls_to_applied(&mut self) {
+        let serial_changed =
+            self.settings_state.applied_config.backend.serial_config != self.options.serial_config;
+        let communication_mode = self.options.communication_mode;
+        let throttle_mode = self.options.throttle_mode;
+        let printer_enabled = self.options.printer_enabled;
+        let keyboard = self.options.keyboard;
+        let tape_reader = self.options.tape_reader.clone();
+        let mut tape_punch = self.options.tape_punch.clone();
+        tape_punch.mode = match self.punch_mode {
+            PunchMode::Append => PunchConfigMode::Append,
+            PunchMode::Overwrite => PunchConfigMode::Overwrite,
+        };
+        let serial = self.options.serial_config.clone();
+        self.settings_state
+            .update_applied_from_live_control(|config| {
+                config.terminal.config.mode = match communication_mode {
+                    CommunicationMode::Line => TerminalMode::Line,
+                    CommunicationMode::Local => TerminalMode::Local,
+                };
+                config.terminal.config.keyboard_uppercase_only = keyboard.uppercase_only;
+                config.terminal.config.keyboard_parity_mode = keyboard.parity;
+                config.terminal.config.input_return_mode = keyboard.return_mode;
+                config.terminal.config.no_print = !printer_enabled;
+                config.data_throttle.config.mode = match throttle_mode {
+                    ThrottleMode::Throttled => ConfigThrottleMode::Throttled,
+                    ThrottleMode::Unthrottled => ConfigThrottleMode::Unthrottled,
+                };
+                config.tape_reader.config = tape_reader;
+                config.tape_punch.config = tape_punch;
+                config.backend.serial_config = serial;
+            });
+        if serial_changed {
+            self.settings_state.pending_reconnect = serial_reconnect_required(
+                self.active_serial_config.as_ref(),
+                &self.options.serial_config,
+            );
+        }
+        self.settings_window.applied_theme = self.theme;
+        self.settings_window.draft_theme = self.theme;
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
@@ -1103,15 +1303,30 @@ impl eframe::App for EguiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let title = match self.runtime.connection_state() {
-            ConnectionState::Connected => format!(
-                "ASR-33 Emulator using {}:{}",
-                self.options.serial_config.port, self.options.serial_config.baudrate
-            ),
+        let title = match (
+            self.runtime.connection_state(),
+            self.active_serial_config.as_ref(),
+        ) {
+            (ConnectionState::Connected, Some(active)) => {
+                format!("ASR-33 Emulator using {}:{}", active.port, active.baudrate)
+            }
             _ => "ASR-33 Emulator — Disconnected".to_owned(),
         };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(title));
+        egui::Panel::top("application-menu")
+            .resizable(false)
+            .show(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    if ui.button("Settings").clicked() {
+                        self.settings_window
+                            .open(&mut self.settings_state, self.theme);
+                    }
+                });
+            });
+        if self.settings_window.open {
+            ui.disable();
+        }
         egui::Panel::bottom("operation-bar")
             .resizable(false)
             .show(ui, |ui| self.controls(ui));
@@ -1138,7 +1353,22 @@ impl eframe::App for EguiApp {
             .frame(egui::Frame::new().fill(self.theme.palette().app_background))
             .show(ui, |ui| self.terminal(ui));
         self.undocked_tapes(ui.ctx());
-        self.handle_keyboard(ui.ctx());
+        let settings_action = self.settings_window.show(
+            ui.ctx(),
+            &mut self.settings_state,
+            &self.available_ports,
+            self.runtime.connection_state() == &ConnectionState::Connected,
+            self.active_serial_config.as_ref(),
+        );
+        if let Some(action) = settings_action {
+            self.handle_settings_action(ui.ctx(), action);
+        }
+        if self.settings_window.open {
+            self.keyboard_target = KeyboardTarget::UiText;
+        } else {
+            self.handle_keyboard(ui.ctx());
+            self.sync_controls_to_applied();
+        }
     }
 
     fn on_exit(&mut self) {

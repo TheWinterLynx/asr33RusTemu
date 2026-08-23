@@ -8,6 +8,8 @@ use std::fmt;
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod config_controller;
+
 use crate::adapters::transport::{Transport, TransportSendError, TransportSendFailure};
 use crate::core::events::{
     ApplicationCommand, CommunicationMode, DataFlow, ThrottleOutput, TransportCommand,
