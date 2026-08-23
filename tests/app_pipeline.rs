@@ -900,8 +900,31 @@ fn local_paper_reader_crlf_mode_starts_the_following_text_at_column_zero() {
 }
 
 #[test]
+fn local_unix_text_tape_normalizes_lf_and_keeps_every_line_at_column_zero() {
+    let mut runtime = disconnected_runtime();
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL");
+    runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled");
+    runtime.tick().expect("configuration applies");
+    let fixture = b"; LINE 1\n; LINE 2\nORG 0000h\n";
+    let mut feed = reader_feed_with_mode(fixture, InputReturnMode::CrLf);
+    drain_reader(&mut feed, &mut runtime, Duration::ZERO);
+    assert_eq!(&line(&runtime, 0)[..8], "; LINE 1");
+    assert_eq!(&line(&runtime, 1)[..8], "; LINE 2");
+    assert_eq!(&line(&runtime, 2)[..9], "ORG 0000h");
+    assert_eq!(runtime.terminal().cursor_position().0, 0);
+}
+
+#[test]
 fn line_paper_reader_crlf_mode_normalizes_without_duplicating_physical_lf() {
-    for tape in [b"A\rB".as_slice(), b"A\r\nB".as_slice()] {
+    for tape in [b"A\nB".as_slice(), b"A\rB".as_slice(), b"A\r\nB".as_slice()] {
         let mut runtime = runtime(false);
         let mut feed = reader_feed_with_mode(tape, InputReturnMode::CrLf);
         drain_reader(&mut feed, &mut runtime, Duration::ZERO);
@@ -936,7 +959,7 @@ fn paper_reader_crlf_reaches_punch_through_terminal_forwarding() {
         ))
         .expect("unthrottled");
     runtime.tick().expect("configuration applies");
-    let mut feed = reader_feed_with_mode(b"A\rB", InputReturnMode::CrLf);
+    let mut feed = reader_feed_with_mode(b"A\nB", InputReturnMode::CrLf);
     drain_reader(&mut feed, &mut runtime, Duration::ZERO);
     while let Some(event) = runtime.pop_event() {
         if let RuntimeEvent::TerminalForwarded(data) = event {

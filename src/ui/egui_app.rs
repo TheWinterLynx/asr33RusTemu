@@ -445,17 +445,17 @@ impl EguiApp {
                     ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
                 );
             }
-            ui.label("Enter");
+            ui.label("EOL");
             for (mode, label, tooltip) in [
                 (
                     InputReturnMode::Cr,
-                    "CR",
-                    "Authentic ASR-33 Return sends CR only",
+                    "Raw",
+                    "Preserve input CR/LF exactly; keyboard Return sends CR",
                 ),
                 (
                     InputReturnMode::CrLf,
                     "CR+LF",
-                    "Convenience mode: CR input emits CR+LF for keyboard and paper tape",
+                    "Normalize keyboard Return and paper-tape line endings to CR+LF",
                 ),
             ] {
                 if ui
@@ -665,8 +665,7 @@ impl EguiApp {
             {
                 match load_reader_file(&path) {
                     Ok(tape) => {
-                        self.reader.clear_pending();
-                        self.reader.reader_mut().load(tape);
+                        self.reader.load(tape);
                         self.reader_view.reset();
                         self.reader_seek_position = 0;
                         self.reader_path = Some(path);
@@ -682,8 +681,7 @@ impl EguiApp {
                 )
                 .clicked()
             {
-                self.reader.clear_pending();
-                self.reader.reader_mut().unload();
+                self.reader.unload();
                 self.reader_view.reset();
                 self.reader_seek_position = 0;
                 self.reader_path = None;
@@ -724,8 +722,7 @@ impl EguiApp {
                 )
                 .clicked()
             {
-                self.reader.clear_pending();
-                self.reader.reader_mut().rewind();
+                self.reader.rewind();
                 self.reader_view.follow_reader();
                 self.reader_seek_position = 0;
             }
@@ -1080,7 +1077,7 @@ impl EguiApp {
             return;
         }
         self.reader.reader_mut().stop();
-        self.reader.reader_mut().unload();
+        self.reader.unload();
         self.punch = None;
         if let Err(error) = self.runtime.shutdown().and_then(|()| self.runtime.join()) {
             self.transport_error = Some(error.to_string());

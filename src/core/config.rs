@@ -253,8 +253,10 @@ pub enum KeyboardParityMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputReturnMode {
+    /// Preserve physical CR/LF bytes; keyboard Return emits CR.
     #[default]
     Cr,
+    /// Normalize local keyboard and paper-tape line endings to CRLF.
     CrLf,
 }
 
