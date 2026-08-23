@@ -12,6 +12,7 @@ use asr33emu::app::{
     AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, RuntimeState,
     Scheduler,
 };
+use asr33emu::core::config::{KeyboardParityMode, KeyboardReturnMode};
 use asr33emu::core::events::{
     ApplicationCommand, CommunicationMode, ThrottleMode, TransportCommand, TransportEvent,
     TransportOperation,
@@ -19,6 +20,7 @@ use asr33emu::core::events::{
 use asr33emu::core::paper_tape::{PaperTape, PunchMode, ReaderOptions, ReaderState, TapeReader};
 use asr33emu::core::terminal::TerminalOptions;
 use asr33emu::core::throttle::ThrottleConfig;
+use asr33emu::ui::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 use tempfile::tempdir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,6 +424,94 @@ fn local_cr_overstrikes_and_local_lf_advances_without_carriage_return() {
     lf_runtime.pump().expect("LF sequence drains");
     assert_eq!(lf_runtime.terminal().cursor_position(), (6, 1));
     assert_eq!(&line(&lf_runtime, 1)[3..6], "DEF");
+}
+
+fn encoded_return(mode: KeyboardReturnMode) -> Vec<u8> {
+    encode_input(
+        &KeyboardInput::Return,
+        KeyboardOptions {
+            uppercase_only: true,
+            parity: KeyboardParityMode::Space,
+            return_mode: mode,
+        },
+    )
+    .expect("Return is ASCII")
+}
+
+#[test]
+fn local_keyboard_return_modes_reach_terminal_through_the_normal_pipeline() {
+    for (mode, expected_cursor) in [
+        (KeyboardReturnMode::Cr, (0, 0)),
+        (KeyboardReturnMode::CrLf, (0, 1)),
+    ] {
+        let mut runtime = disconnected_runtime();
+        runtime
+            .submit(ApplicationCommand::SetCommunicationMode(
+                CommunicationMode::Local,
+            ))
+            .expect("LOCAL");
+        runtime
+            .submit(ApplicationCommand::SetThrottleMode(
+                ThrottleMode::Unthrottled,
+            ))
+            .expect("unthrottled");
+        runtime.tick().expect("configuration applies");
+        runtime
+            .submit(ApplicationCommand::Transmit(encoded_return(mode)))
+            .expect("Return accepted");
+        runtime.pump().expect("Return drains");
+        assert_eq!(runtime.terminal().cursor_position(), expected_cursor);
+    }
+}
+
+#[test]
+fn line_crlf_return_preserves_byte_order_at_the_transport() {
+    let mut runtime = runtime(false);
+    runtime
+        .submit(ApplicationCommand::Transmit(encoded_return(
+            KeyboardReturnMode::CrLf,
+        )))
+        .expect("Return accepted");
+    runtime.pump().expect("Return drains");
+    let sent = connected(&runtime)
+        .sent
+        .iter()
+        .flat_map(|command| match command {
+            TransportCommand::Send(data) => data.iter().copied(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent, b"\r\n");
+}
+
+#[test]
+fn crlf_return_reaches_punch_only_via_terminal_forwarding() {
+    let directory = tempdir().expect("temporary directory");
+    let path = directory.path().join("return.pt");
+    let mut punch = PunchFile::open(&path, PunchMode::Overwrite).expect("punch opens");
+    assert!(punch.start());
+    let mut runtime = disconnected_runtime();
+    runtime
+        .submit(ApplicationCommand::SetCommunicationMode(
+            CommunicationMode::Local,
+        ))
+        .expect("LOCAL");
+    runtime
+        .submit(ApplicationCommand::SetThrottleMode(
+            ThrottleMode::Unthrottled,
+        ))
+        .expect("unthrottled");
+    runtime.tick().expect("configuration applies");
+    runtime
+        .submit(ApplicationCommand::Transmit(encoded_return(
+            KeyboardReturnMode::CrLf,
+        )))
+        .expect("Return accepted");
+    runtime.pump().expect("Return drains");
+    while let Some(RuntimeEvent::TerminalForwarded(data)) = runtime.pop_event() {
+        punch.punch(&data).expect("punch write succeeds");
+    }
+    drop(punch);
+    assert_eq!(std::fs::read(path).expect("punch readable"), b"\r\n");
 }
 
 #[test]

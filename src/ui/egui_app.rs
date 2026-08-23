@@ -10,9 +10,13 @@ use crate::app::{
     AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, Scheduler,
     SystemScheduler,
 };
-use crate::core::config::{PunchConfigMode, SerialConfig, TapePunchConfig, TapeReaderConfig};
+use crate::core::config::{
+    KeyboardReturnMode, PunchConfigMode, SerialConfig, TapePunchConfig, TapeReaderConfig,
+};
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
-use crate::core::paper_tape::{PunchMode, ReaderOptions, ReaderState, TapeReader};
+use crate::core::paper_tape::{
+    PunchMode, PunchState, ReaderOptions, ReaderState, StopCause, TapeReader,
+};
 
 use super::keyboard::{KeyboardInput, KeyboardOptions, encode_input};
 use super::layout::{
@@ -442,6 +446,22 @@ impl EguiApp {
                     ApplicationCommand::SetPrinterEnabled(self.options.printer_enabled),
                 );
             }
+            ui.label("Enter");
+            for (mode, label, tooltip) in [
+                (
+                    KeyboardReturnMode::Cr,
+                    "CR",
+                    "Authentic ASR-33 Return sends CR only",
+                ),
+                (
+                    KeyboardReturnMode::CrLf,
+                    "CR+LF",
+                    "Convenience mode: Return sends CR followed by LF",
+                ),
+            ] {
+                ui.selectable_value(&mut self.options.keyboard.return_mode, mode, label)
+                    .on_hover_text(tooltip);
+            }
             ui.separator();
             let connected = connection == ConnectionState::Connected;
             ui.label(if connected {
@@ -630,6 +650,7 @@ impl EguiApp {
     }
 
     fn reader_contents(&mut self, ui: &mut egui::Ui) {
+        configure_tape_controls(ui);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Load").clicked()
                 && let Some(path) = reader_dialog(&self.options.tape_reader.initial_file_path)
@@ -701,6 +722,7 @@ impl EguiApp {
                 self.reader_seek_position = 0;
             }
         });
+        ui.add_space(3.0);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .checkbox(&mut self.options.tape_reader.auto_stop, "Auto-stop")
@@ -736,16 +758,21 @@ impl EguiApp {
         } else {
             100.0 * self.reader.reader().position() as f32 / length as f32
         };
+        ui.label(
+            egui::RichText::new(format!(
+                "File: {}",
+                display_path(self.reader_path.as_deref())
+            ))
+            .color(self.theme.palette().muted_text),
+        );
+        let status = reader_status_label(
+            self.reader.reader().state(),
+            self.reader.reader().stop_cause(),
+        );
         ui.label(format!(
-            "File: {}",
-            display_path(self.reader_path.as_deref())
-        ));
-        ui.label(format!(
-            "{} bytes, position {}, {:.1}%, {:?}",
-            length,
+            "{length} bytes · position {} · {:.1}% · {status}",
             self.reader.reader().position(),
             percent,
-            self.reader.reader().stop_cause()
         ));
         let stopped = self.reader.reader().state() == ReaderState::Stopped;
         ui.horizontal_wrapped(|ui| {
@@ -757,6 +784,7 @@ impl EguiApp {
                 egui::DragValue::new(&mut self.reader_seek_position).range(0..=length),
             )
             .on_hover_text("Stored byte offset; changing this does not transmit data");
+            ui.label(format!("/ {length}"));
             if ui.add_enabled(stopped, egui::Button::new("Go")).clicked() {
                 self.seek_reader(self.reader_seek_position);
             }
@@ -780,15 +808,20 @@ impl EguiApp {
                     TapeStepDirection::TowardEnd,
                 ));
             }
-            if ui
-                .button("Follow")
-                .on_hover_text("Follow the reader head as the tape advances")
-                .clicked()
-            {
-                self.reader_view.follow_reader();
-            }
-            if !self.reader_view.follows_reader() {
-                ui.label("Viewing tape history");
+            let follows_reader = self.reader_view.follows_reader();
+            let follow =
+                ui.selectable_label(follows_reader, "Follow")
+                    .on_hover_text(if follows_reader {
+                        "Viewport follows the read head; click for free inspection"
+                    } else {
+                        "Free tape inspection; reader position is unchanged; click to follow"
+                    });
+            if follow.clicked() {
+                if follows_reader {
+                    self.reader_view.inspect_manually();
+                } else {
+                    self.reader_view.follow_reader();
+                }
             }
         });
         let requested_seek = if let Some(tape) = self.reader.reader().tape() {
@@ -829,6 +862,7 @@ impl EguiApp {
     }
 
     fn punch_contents(&mut self, ui: &mut egui::Ui) {
+        configure_tape_controls(ui);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Select/Load").clicked()
                 && let Some(path) = punch_dialog(&self.options.tape_punch.initial_file_path)
@@ -866,6 +900,7 @@ impl EguiApp {
                 punch.stop();
             }
         });
+        ui.add_space(3.0);
         ui.horizontal_wrapped(|ui| {
             for (mode, label) in [
                 (PunchMode::Append, "Append"),
@@ -886,11 +921,14 @@ impl EguiApp {
             .punch
             .as_ref()
             .map_or((None, &[][..]), |p| (Some(p.path()), p.bytes()));
-        ui.label(format!("File: {}", display_path(path)));
+        ui.label(
+            egui::RichText::new(format!("File: {}", display_path(path)))
+                .color(self.theme.palette().muted_text),
+        );
         ui.label(format!(
-            "{} bytes, {:?}",
+            "{} bytes · {}",
             bytes.len(),
-            self.punch.as_ref().map(PunchFile::state)
+            punch_status_label(self.punch.as_ref().map(PunchFile::state))
         ));
         render_tape(
             ui,
@@ -1111,6 +1149,33 @@ fn install_font(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
+fn configure_tape_controls(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+    ui.spacing_mut().interact_size.y = 24.0;
+    ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
+}
+
+#[must_use]
+const fn reader_status_label(state: ReaderState, stop_cause: Option<StopCause>) -> &'static str {
+    match (state, stop_cause) {
+        (ReaderState::Unloaded, _) => "No tape loaded",
+        (ReaderState::Running, _) => "Running",
+        (ReaderState::Stopped, Some(StopCause::EndOfTape)) => "Stopped: end of tape",
+        (ReaderState::Stopped, Some(StopCause::TrailingOctal200)) => "Stopped: trailer (octal 200)",
+        (ReaderState::Stopped, Some(StopCause::TrailingNull)) => "Stopped: null trailer",
+        (ReaderState::Stopped, None) => "Stopped",
+    }
+}
+
+#[must_use]
+const fn punch_status_label(state: Option<PunchState>) -> &'static str {
+    match state {
+        None | Some(PunchState::Unloaded) => "No tape loaded",
+        Some(PunchState::Stopped) => "Stopped",
+        Some(PunchState::Running) => "Running",
+    }
+}
+
 fn display_path(path: Option<&Path>) -> String {
     path.map_or_else(|| "(none)".to_owned(), |path| path.display().to_string())
 }
@@ -1302,12 +1367,14 @@ fn apply_tape_shortcut(
 mod tests {
     use super::{
         KeyboardTarget, TapeStepDirection, apply_tape_shortcut, history_scroll_target,
-        keyboard_input_for_event, keyboard_input_for_target, repaint_delay,
-        should_send_to_terminal, stepped_position,
+        keyboard_input_for_event, keyboard_input_for_target, punch_status_label,
+        reader_status_label, repaint_delay, should_send_to_terminal, stepped_position,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
-    use crate::core::paper_tape::{PaperTape, PunchMode, ReaderOptions, ReaderState, TapeReader};
+    use crate::core::paper_tape::{
+        PaperTape, PunchMode, PunchState, ReaderOptions, ReaderState, StopCause, TapeReader,
+    };
     use crate::ui::keyboard::KeyboardInput;
     use crate::ui::layout::{PanelPlacement, PanelPresentation};
     use eframe::egui::{Event, Key, Modifiers};
@@ -1341,6 +1408,21 @@ mod tests {
             repaint_delay(PumpStatus::Backpressured),
             Some(Duration::from_millis(10))
         );
+    }
+
+    #[test]
+    fn tape_statuses_are_user_facing_and_never_debug_options() {
+        assert_eq!(
+            reader_status_label(ReaderState::Unloaded, None),
+            "No tape loaded"
+        );
+        assert_eq!(reader_status_label(ReaderState::Running, None), "Running");
+        assert_eq!(
+            reader_status_label(ReaderState::Stopped, Some(StopCause::TrailingOctal200)),
+            "Stopped: trailer (octal 200)"
+        );
+        assert_eq!(punch_status_label(None), "No tape loaded");
+        assert_eq!(punch_status_label(Some(PunchState::Running)), "Running");
     }
 
     #[test]

@@ -47,6 +47,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let keyboard = KeyboardOptions {
         uppercase_only: terminal_config.keyboard_uppercase_only,
         parity: terminal_config.keyboard_parity_mode,
+        return_mode: terminal_config.keyboard_return_mode,
     };
     let tape_reader = config.tape_reader.config.clone();
     let tape_punch = config.tape_punch.config.clone();

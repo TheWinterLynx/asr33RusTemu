@@ -250,6 +250,14 @@ pub enum KeyboardParityMode {
     Even,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyboardReturnMode {
+    #[default]
+    Cr,
+    CrLf,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSection {
     pub config: TerminalConfig,
@@ -264,6 +272,8 @@ pub struct TerminalConfig {
     pub autowrap: bool,
     pub keyboard_uppercase_only: bool,
     pub keyboard_parity_mode: KeyboardParityMode,
+    #[serde(default)]
+    pub keyboard_return_mode: KeyboardReturnMode,
     pub send_cr_at_startup: bool,
     pub no_print: bool,
     pub font_path: Option<PathBuf>,
@@ -665,7 +675,7 @@ impl Error for ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, StopBits, ValidationError};
+    use super::{AppConfig, KeyboardReturnMode, StopBits, ValidationError};
 
     #[test]
     fn rejects_zero_terminal_columns() {
@@ -710,6 +720,35 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&StopBits::Two).expect("serializes"),
             "2"
+        );
+    }
+
+    #[test]
+    fn existing_yaml_defaults_return_to_authentic_cr() {
+        let config = AppConfig::from_yaml_str(include_str!("../../asr33_config.yaml"))
+            .expect("repository YAML remains valid without the new key");
+        assert_eq!(
+            config.terminal.config.keyboard_return_mode,
+            KeyboardReturnMode::Cr
+        );
+    }
+
+    #[test]
+    fn explicit_crlf_return_mode_roundtrips_through_yaml() {
+        let source = include_str!("../../asr33_config.yaml").replace(
+            "keyboard_parity_mode: \"space\"",
+            "keyboard_parity_mode: \"space\"\n    keyboard_return_mode: \"crlf\"",
+        );
+        let config = AppConfig::from_yaml_str(&source).expect("explicit CRLF parses");
+        assert_eq!(
+            config.terminal.config.keyboard_return_mode,
+            KeyboardReturnMode::CrLf
+        );
+        let serialized = serde_saphyr::to_string(&config).expect("configuration serializes");
+        let roundtrip = AppConfig::from_yaml_str(&serialized).expect("serialized YAML parses");
+        assert_eq!(
+            roundtrip.terminal.config.keyboard_return_mode,
+            KeyboardReturnMode::CrLf
         );
     }
 }

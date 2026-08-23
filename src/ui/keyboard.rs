@@ -4,7 +4,7 @@
 //! [`KeyboardEncodingError`] instead; the UI displays it without submitting a
 //! partial payload or terminating the application.
 
-use crate::core::config::KeyboardParityMode;
+use crate::core::config::{KeyboardParityMode, KeyboardReturnMode};
 use crate::core::terminal::encode_even_parity;
 use std::error::Error;
 use std::fmt;
@@ -22,6 +22,7 @@ pub enum KeyboardInput {
 pub struct KeyboardOptions {
     pub uppercase_only: bool,
     pub parity: KeyboardParityMode,
+    pub return_mode: KeyboardReturnMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,7 +54,13 @@ pub fn encode_input(
             }
             Ok(bytes)
         }
-        KeyboardInput::Return => encode_character('\r', options),
+        KeyboardInput::Return => {
+            let mut bytes = encode_character('\r', options)?;
+            if options.return_mode == KeyboardReturnMode::CrLf {
+                bytes.extend(encode_character('\n', options)?);
+            }
+            Ok(bytes)
+        }
         KeyboardInput::Backspace => encode_character('\x08', options),
         KeyboardInput::Tab => encode_character('\t', options),
         KeyboardInput::Control(character) => {
@@ -95,12 +102,13 @@ fn encode_bytes(bytes: &[u8], parity: KeyboardParityMode) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{KeyboardInput, KeyboardOptions, encode_input};
-    use crate::core::config::KeyboardParityMode;
+    use crate::core::config::{KeyboardParityMode, KeyboardReturnMode};
 
     fn options(parity: KeyboardParityMode) -> KeyboardOptions {
         KeyboardOptions {
             uppercase_only: false,
             parity,
+            return_mode: KeyboardReturnMode::Cr,
         }
     }
 
@@ -180,6 +188,37 @@ mod tests {
         );
         assert_eq!(
             encode_input(&KeyboardInput::Control('J'), mark).expect("marked LF"),
+            b"\x8a"
+        );
+    }
+
+    #[test]
+    fn crlf_return_encodes_each_character_individually_for_every_parity() {
+        let mut space = options(KeyboardParityMode::Space);
+        space.return_mode = KeyboardReturnMode::CrLf;
+        assert_eq!(
+            encode_input(&KeyboardInput::Return, space).expect("CRLF"),
+            b"\r\n"
+        );
+
+        let mut mark = options(KeyboardParityMode::Mark);
+        mark.return_mode = KeyboardReturnMode::CrLf;
+        assert_eq!(
+            encode_input(&KeyboardInput::Return, mark).expect("marked CRLF"),
+            b"\x8d\x8a"
+        );
+
+        let mut even = options(KeyboardParityMode::Even);
+        even.return_mode = KeyboardReturnMode::CrLf;
+        assert_eq!(
+            encode_input(&KeyboardInput::Return, even).expect("even CRLF"),
+            [
+                crate::core::terminal::encode_even_parity(b"\r")[0],
+                crate::core::terminal::encode_even_parity(b"\n")[0]
+            ]
+        );
+        assert_eq!(
+            encode_input(&KeyboardInput::Control('J'), mark).expect("Ctrl+J remains LF"),
             b"\x8a"
         );
     }

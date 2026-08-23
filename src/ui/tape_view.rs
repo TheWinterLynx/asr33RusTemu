@@ -16,6 +16,13 @@ const NATURAL_METADATA_GAP: f32 = 6.0;
 const NATURAL_OFFSET_WIDTH: f32 = 44.0;
 const NATURAL_ASCII_WIDTH: f32 = 18.0;
 const NATURAL_NUMERIC_WIDTH: f32 = 88.0;
+const MIN_LABEL_FONT_SIZE: f32 = 9.5;
+const MIN_DATA_FONT_SIZE: f32 = 10.5;
+const MIN_NUMERIC_FONT_SIZE: f32 = 10.0;
+const MIN_OFFSET_FONT_SIZE: f32 = 9.5;
+const MIN_OFFSET_WIDTH: f32 = MIN_OFFSET_FONT_SIZE * 4.0;
+const MIN_ASCII_WIDTH: f32 = NATURAL_ASCII_WIDTH * MIN_SCALE;
+const MIN_NUMERIC_WIDTH: f32 = MIN_NUMERIC_FONT_SIZE * 6.4;
 const HEAD_HOLE_GAP: f32 = 4.0;
 pub const READER_SCROLL_ID: &str = "paper-tape-reader-scroll";
 pub const PUNCH_SCROLL_ID: &str = "paper-tape-punch-scroll";
@@ -32,6 +39,7 @@ pub struct TapeRenderMetrics {
     pub label_font_size: f32,
     pub data_font_size: f32,
     pub numeric_font_size: f32,
+    pub offset_font_size: f32,
     pub metadata_gap: f32,
     pub offset_width: f32,
     pub ascii_width: f32,
@@ -48,7 +56,13 @@ impl TapeRenderMetrics {
         + NATURAL_OFFSET_WIDTH
         + NATURAL_ASCII_WIDTH
         + NATURAL_NUMERIC_WIDTH;
-    pub const MINIMUM_FIT_WIDTH: f32 = Self::NATURAL_WIDTH * MIN_SCALE;
+    pub const MINIMUM_FIT_WIDTH: f32 = NATURAL_PADDING * MIN_SCALE * 2.0
+        + NATURAL_HEAD_GUTTER * MIN_SCALE
+        + NATURAL_PITCH * 9.0 * MIN_SCALE
+        + NATURAL_METADATA_GAP * MIN_SCALE * 3.0
+        + MIN_OFFSET_WIDTH
+        + MIN_ASCII_WIDTH
+        + MIN_NUMERIC_WIDTH;
 
     #[must_use]
     pub fn for_available_width(available_width: f32) -> Self {
@@ -59,25 +73,60 @@ impl TapeRenderMetrics {
         } else {
             0.0
         };
-        let scale = (width / Self::NATURAL_WIDTH).clamp(MIN_SCALE, NATURAL_SCALE);
+        if width >= Self::NATURAL_WIDTH {
+            return Self::from_scale(NATURAL_SCALE, false);
+        }
+        if width < Self::MINIMUM_FIT_WIDTH {
+            return Self::from_scale(MIN_SCALE, true);
+        }
+
+        let mut low = MIN_SCALE;
+        let mut high = NATURAL_SCALE;
+        for _ in 0..20 {
+            let candidate = (low + high) * 0.5;
+            if Self::from_scale(candidate, false).total_width <= width {
+                low = candidate;
+            } else {
+                high = candidate;
+            }
+        }
+        Self::from_scale(low, false)
+    }
+
+    fn from_scale(scale: f32, requires_horizontal_scroll: bool) -> Self {
         let scaled = |value: f32| value * scale;
+        let padding = scaled(NATURAL_PADDING);
+        let head_gutter_width = scaled(NATURAL_HEAD_GUTTER);
+        let tape_width = scaled(NATURAL_PITCH * 9.0);
+        let metadata_gap = scaled(NATURAL_METADATA_GAP);
+        let offset_width = scaled(NATURAL_OFFSET_WIDTH).max(MIN_OFFSET_WIDTH);
+        let ascii_width = scaled(NATURAL_ASCII_WIDTH).max(MIN_ASCII_WIDTH);
+        let numeric_width = scaled(NATURAL_NUMERIC_WIDTH).max(MIN_NUMERIC_WIDTH);
+        let total_width = padding * 2.0
+            + head_gutter_width
+            + tape_width
+            + metadata_gap * 3.0
+            + offset_width
+            + ascii_width
+            + numeric_width;
         Self {
             scale,
-            requires_horizontal_scroll: width + f32::EPSILON < Self::MINIMUM_FIT_WIDTH,
-            head_gutter_width: scaled(NATURAL_HEAD_GUTTER),
+            requires_horizontal_scroll,
+            head_gutter_width,
             pitch: scaled(NATURAL_PITCH),
             data_radius: scaled(NATURAL_DATA_RADIUS),
             sprocket_radius: scaled(NATURAL_SPROCKET_RADIUS),
             row_height: scaled(NATURAL_ROW_HEIGHT),
-            label_font_size: scaled(11.0),
-            data_font_size: scaled(12.0),
-            numeric_font_size: scaled(11.0),
-            metadata_gap: scaled(NATURAL_METADATA_GAP),
-            offset_width: scaled(NATURAL_OFFSET_WIDTH),
-            ascii_width: scaled(NATURAL_ASCII_WIDTH),
-            tape_width: scaled(NATURAL_PITCH * 9.0),
-            total_width: scaled(Self::NATURAL_WIDTH),
-            padding: scaled(NATURAL_PADDING),
+            label_font_size: scaled(11.0).max(MIN_LABEL_FONT_SIZE),
+            data_font_size: scaled(12.0).max(MIN_DATA_FONT_SIZE),
+            numeric_font_size: scaled(11.0).max(MIN_NUMERIC_FONT_SIZE),
+            offset_font_size: scaled(11.0).max(MIN_OFFSET_FONT_SIZE),
+            metadata_gap,
+            offset_width,
+            ascii_width,
+            tape_width,
+            total_width,
+            padding,
         }
     }
 
@@ -563,7 +612,7 @@ pub fn render_reader_tape(
                     egui::pos2(text_x, center_y),
                     Align2::LEFT_CENTER,
                     offset.to_string(),
-                    FontId::monospace(metrics.numeric_font_size),
+                    FontId::monospace(metrics.offset_font_size),
                     options.palette.text,
                 );
                 painter.text(
@@ -587,7 +636,7 @@ pub fn render_reader_tape(
                         egui::pos2(numeric_x, center_y + 8.0 * metrics.scale),
                         Align2::LEFT_CENTER,
                         format!("TX {}", format_tape_numeric(byte | 0x80)),
-                        FontId::monospace(8.5 * metrics.scale),
+                        FontId::monospace(metrics.offset_font_size),
                         options.palette.muted_text,
                     );
                 }
@@ -786,6 +835,16 @@ mod tests {
             assert!(metrics.pitch > 2.0 * metrics.data_radius);
             previous = metrics.scale;
         }
+    }
+
+    #[test]
+    fn responsive_metrics_keep_metadata_legible_at_minimum_scale() {
+        let metrics = TapeRenderMetrics::for_available_width(TapeRenderMetrics::MINIMUM_FIT_WIDTH);
+        assert!(metrics.label_font_size >= MIN_LABEL_FONT_SIZE);
+        assert!(metrics.data_font_size >= MIN_DATA_FONT_SIZE);
+        assert!(metrics.numeric_font_size >= MIN_NUMERIC_FONT_SIZE);
+        assert!(metrics.offset_font_size >= MIN_OFFSET_FONT_SIZE);
+        assert!(metrics.total_width <= TapeRenderMetrics::MINIMUM_FIT_WIDTH + 0.01);
     }
 
     #[test]

@@ -16,8 +16,14 @@ fn compare_python_and_rust(config_filename: &str, overrides: &[&str]) {
 
     let cli = ConfigCli::try_parse_from(rust_args).expect("shared CLI case is valid in Rust");
     let loaded = LoadedConfig::load(&cli).expect("shared YAML is valid in Rust");
-    let rust_value =
+    let mut rust_value =
         serde_json::to_value(&loaded.effective).expect("typed Rust config serializes to JSON");
+    // This Rust-only, serde-defaulted option is intentionally absent from the
+    // unchanged legacy YAML/Python model; every legacy field remains differential.
+    rust_value["terminal"]["config"]
+        .as_object_mut()
+        .expect("terminal config is an object")
+        .remove("keyboard_return_mode");
 
     let python = std::env::var_os("PYTHON")
         .map(PathBuf::from)
