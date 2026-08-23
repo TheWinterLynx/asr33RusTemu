@@ -35,6 +35,7 @@ use super::theme::ThemeKind;
 const FONT_NAME: &str = "teletype-33";
 const IDLE_POLL: Duration = Duration::from_millis(16);
 const BACKPRESSURE_RETRY: Duration = Duration::from_millis(10);
+const PASTE_REQUEST_TIMEOUT_SECONDS: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KeyboardTarget {
@@ -162,7 +163,7 @@ pub struct EguiApp {
     lid_state: LidState,
     reader_audio_running: bool,
     paste_on_right_click: bool,
-    right_click_paste_age: Option<u8>,
+    right_click_paste_requested_at: Option<f64>,
 }
 
 impl EguiApp {
@@ -230,7 +231,7 @@ impl EguiApp {
             lid_state,
             reader_audio_running: false,
             paste_on_right_click,
-            right_click_paste_age: None,
+            right_click_paste_requested_at: None,
         };
         application.refresh_ports(PortRefreshPolicy::Silent);
         application.theme.apply(&creation_context.egui_ctx);
@@ -508,17 +509,18 @@ impl EguiApp {
     }
 
     fn handle_keyboard(&mut self, context: &egui::Context) {
-        let events = context.input(|input| input.events.clone());
-        let mut consumed_requested_paste = false;
+        let (events, now) = context.input(|input| (input.events.clone(), input.time));
+        if !paste_request_is_live(self.right_click_paste_requested_at, now) {
+            self.right_click_paste_requested_at = None;
+        }
         for event in &events {
-            if let egui::Event::Paste(text) = event
-                && self.right_click_paste_age.is_some()
-            {
-                consumed_requested_paste = true;
-                self.right_click_paste_age = None;
-                let normalized = normalize_paste_text(text, self.options.keyboard.return_mode);
-                self.submit_keyboard_input(context, KeyboardInput::Text(normalized), false);
-                continue;
+            if let egui::Event::Paste(text) = event {
+                let requested_at = self.right_click_paste_requested_at.take();
+                if paste_request_is_live(requested_at, now) {
+                    let normalized = normalize_paste_text(text, self.options.keyboard.return_mode);
+                    self.submit_keyboard_input(context, KeyboardInput::Text(normalized), false);
+                    continue;
+                }
             }
             if self.handle_shortcut(context, event) {
                 continue;
@@ -526,13 +528,6 @@ impl EguiApp {
             if let Some(input) = keyboard_input_for_target(self.keyboard_target, event) {
                 self.submit_keyboard_input(context, input, true);
             }
-        }
-        if !consumed_requested_paste {
-            self.right_click_paste_age = match self.right_click_paste_age {
-                Some(0) => Some(1),
-                Some(_) => None,
-                None => None,
-            };
         }
     }
 
@@ -953,19 +948,26 @@ impl EguiApp {
     }
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
-        let focus_response = ui.interact(
-            ui.available_rect_before_wrap(),
-            ui.id().with("terminal-keyboard-target"),
-            egui::Sense::click(),
-        );
-        if focus_response.clicked() {
-            focus_response.request_focus();
+        let terminal_rect = ui.max_rect();
+        let terminal_focus_id = ui.id().with("terminal-keyboard-target");
+        let (primary_clicked, secondary_clicked, click_time) = ui.ctx().input(|input| {
+            let inside = input
+                .pointer
+                .interact_pos()
+                .is_some_and(|position| terminal_rect.contains(position));
+            (
+                inside && input.pointer.button_clicked(egui::PointerButton::Primary),
+                inside && input.pointer.button_clicked(egui::PointerButton::Secondary),
+                input.time,
+            )
+        });
+        if primary_clicked || secondary_clicked {
+            ui.ctx()
+                .memory_mut(|memory| memory.request_focus(terminal_focus_id));
             self.keyboard_target = KeyboardTarget::Terminal;
         }
-        if focus_response.secondary_clicked() && self.paste_on_right_click {
-            focus_response.request_focus();
-            self.keyboard_target = KeyboardTarget::Terminal;
-            self.right_click_paste_age = Some(0);
+        if secondary_clicked && self.paste_on_right_click {
+            self.right_click_paste_requested_at = Some(click_time);
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             ui.ctx().request_repaint();
@@ -1751,6 +1753,12 @@ fn history_scroll_target(current: Option<usize>, bottom: usize, wheel: f32) -> O
     (next < bottom).then_some(next)
 }
 
+fn paste_request_is_live(requested_at: Option<f64>, now: f64) -> bool {
+    requested_at.is_some_and(|requested_at| {
+        now >= requested_at && now - requested_at <= PASTE_REQUEST_TIMEOUT_SECONDS
+    })
+}
+
 fn normalize_paste_text(text: &str, mode: InputReturnMode) -> String {
     let newline = match mode {
         InputReturnMode::Cr => "\r",
@@ -1911,11 +1919,12 @@ fn apply_tape_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardTarget, PortRefreshPolicy, TapeStepDirection, apply_tape_shortcut,
-        column_status_label, history_scroll_target, keyboard_input_for_event,
+        KeyboardTarget, PASTE_REQUEST_TIMEOUT_SECONDS, PortRefreshPolicy, TapeStepDirection,
+        apply_tape_shortcut, column_status_label, history_scroll_target, keyboard_input_for_event,
         keyboard_input_for_target, normalize_paste_text, open_serial_for_explicit_request,
-        port_enumeration_update, punch_status_label, reader_status_label, repaint_delay,
-        should_send_to_terminal, startup_connection_state, stepped_position, toggled_lid,
+        paste_request_is_live, port_enumeration_update, punch_status_label, reader_status_label,
+        repaint_delay, should_send_to_terminal, startup_connection_state, stepped_position,
+        toggled_lid,
     };
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
@@ -2046,6 +2055,21 @@ mod tests {
     fn column_status_uses_terminal_column_and_width() {
         assert_eq!(column_status_label(0, 72), "Col 0 / 72");
         assert_eq!(column_status_label(3, 80), "Col 3 / 80");
+    }
+
+    #[test]
+    fn right_click_paste_request_survives_backend_round_trip_but_expires() {
+        let requested_at = Some(10.0);
+        assert!(paste_request_is_live(requested_at, 10.0));
+        assert!(paste_request_is_live(
+            requested_at,
+            10.0 + PASTE_REQUEST_TIMEOUT_SECONDS
+        ));
+        assert!(!paste_request_is_live(
+            requested_at,
+            10.0 + PASTE_REQUEST_TIMEOUT_SECONDS + 0.001
+        ));
+        assert!(!paste_request_is_live(None, 10.0));
     }
 
     #[test]

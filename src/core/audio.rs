@@ -11,7 +11,14 @@ use crate::core::config::LidState;
 use crate::core::terminal::CharacterEvent;
 
 pub const STATE_FADE_DURATION: Duration = Duration::from_millis(100);
-pub const INACTIVITY_TIMEOUT: Duration = Duration::from_millis(200);
+/// One ASR-33 character time, plus a small scheduling guard.  The legacy
+/// Python mixer kept its multi-character printer loop audible for 200 ms and
+/// then faded it for another 100 ms; with the bundled 10 cps recordings that
+/// exposed roughly three recorded strikes for one isolated character.  Keep
+/// sustained 10 cps printing continuous, but return isolated activity to hum
+/// after approximately one mechanical character cycle.
+pub const INACTIVITY_TIMEOUT: Duration = Duration::from_millis(110);
+pub const INACTIVITY_FADE_DURATION: Duration = Duration::from_millis(10);
 pub const MUTE_FADE_DURATION: Duration = Duration::from_millis(200);
 pub const DEFAULT_EFFECT_PLAY_TIME: Duration = Duration::from_millis(500);
 pub const MOTOR_ON_PLAY_TIME: Duration = Duration::from_millis(1500);
@@ -21,6 +28,10 @@ pub const BELL_PLAY_TIME: Duration = Duration::from_millis(500);
 pub const PLATEN_PLAY_TIME: Duration = Duration::from_millis(100);
 pub const CARRIAGE_RETURN_PLAY_TIME: Duration = Duration::from_millis(150);
 pub const KEYPRESS_PLAY_TIME: Duration = Duration::from_millis(100);
+/// Mechanical key effects are never allowed to build a rapid duplicate queue.
+/// This is intentionally shorter than one ASR-33 character time so distinct
+/// human key presses remain audible while duplicate host events are coalesced.
+pub const KEYPRESS_DEBOUNCE: Duration = Duration::from_millis(80);
 pub const MAX_PENDING_EFFECTS: usize = 4;
 pub const COLUMN_BELL_COLUMN: usize = 62;
 
@@ -77,6 +88,7 @@ pub struct AudioSnapshot {
 #[derive(Clone, Copy, Debug)]
 struct GainFade {
     start: Duration,
+    duration: Duration,
     from: [f32; 3],
     to: [f32; 3],
 }
@@ -100,6 +112,7 @@ pub struct AudioStateMachine {
     mute_gain: f32,
     mute_fade: Option<ScalarFade>,
     last_event_time: Duration,
+    last_keypress_time: Option<Duration>,
     effects: VecDeque<EffectRequest>,
 }
 
@@ -117,6 +130,7 @@ impl AudioStateMachine {
             mute_gain: if muted { 0.0 } else { 1.0 },
             mute_fade: None,
             last_event_time: now,
+            last_keypress_time: None,
             effects: VecDeque::new(),
         }
     }
@@ -131,7 +145,25 @@ impl AudioStateMachine {
     }
 
     pub fn keypress(&mut self, now: Duration) {
-        self.enqueue_effect(EffectSound::Key, now);
+        self.advance(now);
+        if self
+            .last_keypress_time
+            .is_some_and(|last| now.saturating_sub(last) < KEYPRESS_DEBOUNCE)
+        {
+            return;
+        }
+        self.last_keypress_time = Some(now);
+        self.last_event_time = now;
+        // A real ASR-33 cannot accumulate several independent key mechanisms
+        // in parallel.  If the effect channel is already waiting to play a key
+        // strike, collapse another host-side request into that pending strike.
+        if !self
+            .effects
+            .iter()
+            .any(|request| request.sound == EffectSound::Key)
+        {
+            self.push_effect(EffectSound::Key);
+        }
     }
 
     pub fn process_character(&mut self, event: CharacterEvent, now: Duration) {
@@ -248,6 +280,11 @@ impl AudioStateMachine {
         self.continuous_targets = target;
         self.continuous_fade = Some(GainFade {
             start: now,
+            duration: if sound == ContinuousSound::Hum {
+                INACTIVITY_FADE_DURATION
+            } else {
+                STATE_FADE_DURATION
+            },
             from: self.continuous_gains,
             to: target,
         });
@@ -255,7 +292,7 @@ impl AudioStateMachine {
 
     fn advance(&mut self, now: Duration) {
         if let Some(fade) = self.continuous_fade {
-            let progress = fade_progress(now, fade.start, STATE_FADE_DURATION);
+            let progress = fade_progress(now, fade.start, fade.duration);
             self.continuous_gains = std::array::from_fn(|index| {
                 lerp(fade.from[index], fade.to[index], progress)
             });
@@ -327,33 +364,59 @@ mod tests {
     }
 
     #[test]
-    fn inactivity_switches_to_hum_after_two_hundred_milliseconds() {
+    fn isolated_print_activity_returns_to_hum_after_one_character_cycle() {
         let mut audio = AudioStateMachine::new(LidState::Down, false, Duration::ZERO);
         audio.process_character(event('X', 1), Duration::ZERO);
         audio.tick(INACTIVITY_TIMEOUT - Duration::from_millis(1));
         assert_eq!(audio.current_continuous(), Some(ContinuousSound::PrintChars));
         audio.tick(INACTIVITY_TIMEOUT);
         assert_eq!(audio.current_continuous(), Some(ContinuousSound::Hum));
-        let snapshot = audio.snapshot(INACTIVITY_TIMEOUT + STATE_FADE_DURATION);
+        let snapshot = audio.snapshot(INACTIVITY_TIMEOUT + INACTIVITY_FADE_DURATION);
+        assert_near(snapshot.print_chars_gain, 0.0);
         assert_near(snapshot.hum_gain, 1.0);
+    }
+
+    #[test]
+    fn sustained_ten_cps_activity_does_not_fall_back_to_hum_between_characters() {
+        let mut audio = AudioStateMachine::new(LidState::Up, false, Duration::ZERO);
+        for index in 0..5 {
+            let now = Duration::from_millis(index * 100);
+            audio.process_character(event('A', index as usize + 1), now);
+            audio.tick(now + Duration::from_millis(99));
+            assert_eq!(audio.current_continuous(), Some(ContinuousSound::PrintChars));
+        }
+    }
+
+    #[test]
+    fn rapid_duplicate_keypresses_are_coalesced_instead_of_echoing() {
+        let mut audio = AudioStateMachine::new(LidState::Up, false, Duration::ZERO);
+        audio.keypress(Duration::ZERO);
+        audio.keypress(Duration::from_millis(5));
+        audio.keypress(Duration::from_millis(20));
+        assert_eq!(audio.pending_effect_count(), 1);
+        assert_eq!(audio.take_next_effect().unwrap().sound, EffectSound::Key);
+
+        audio.keypress(KEYPRESS_DEBOUNCE);
+        assert_eq!(audio.pending_effect_count(), 1);
+        assert_eq!(audio.take_next_effect().unwrap().sound, EffectSound::Key);
     }
 
     #[test]
     fn mute_and_unmute_are_two_hundred_millisecond_fades() {
         let mut audio = AudioStateMachine::new(LidState::Up, false, Duration::ZERO);
-        audio.process_character(event('A', 1), Duration::ZERO);
-        let ready = STATE_FADE_DURATION;
-        let _ = audio.snapshot(ready);
-        audio.set_muted(true, ready);
-        let half = audio.snapshot(ready + MUTE_FADE_DURATION / 2);
-        assert_near(half.print_chars_gain, 0.5);
-        let muted = audio.snapshot(ready + MUTE_FADE_DURATION);
-        assert_near(muted.print_chars_gain, 0.0);
+        audio.set_tape_reader_running(true);
+        audio.set_muted(true, Duration::ZERO);
+        let half = audio.snapshot(MUTE_FADE_DURATION / 2);
+        assert_near(half.tape_reader_gain, 0.5);
+        let muted = audio.snapshot(MUTE_FADE_DURATION);
+        assert_near(muted.tape_reader_gain, 0.0);
         assert!(muted.muted);
 
-        audio.set_muted(false, ready + MUTE_FADE_DURATION);
-        let unmuted = audio.snapshot(ready + MUTE_FADE_DURATION * 2);
-        assert_near(unmuted.print_chars_gain, 1.0);
+        audio.set_muted(false, MUTE_FADE_DURATION);
+        let half = audio.snapshot(MUTE_FADE_DURATION + MUTE_FADE_DURATION / 2);
+        assert_near(half.tape_reader_gain, 0.5);
+        let unmuted = audio.snapshot(MUTE_FADE_DURATION * 2);
+        assert_near(unmuted.tape_reader_gain, 1.0);
         assert!(!unmuted.muted);
     }
 
@@ -370,9 +433,11 @@ mod tests {
     #[test]
     fn pending_effect_queue_retains_legacy_cap_of_four() {
         let mut audio = AudioStateMachine::new(LidState::Up, false, Duration::ZERO);
-        for index in 0..10 {
-            audio.keypress(Duration::from_millis(index));
-        }
+        audio.process_character(event('\r', COLUMN_BELL_COLUMN), Duration::ZERO);
+        audio.process_character(event('\n', 0), Duration::from_millis(1));
+        audio.keypress(Duration::from_millis(100));
+        assert_eq!(audio.pending_effect_count(), MAX_PENDING_EFFECTS);
+        audio.process_character(event('\u{7}', 0), Duration::from_millis(101));
         assert_eq!(audio.pending_effect_count(), MAX_PENDING_EFFECTS);
     }
 
