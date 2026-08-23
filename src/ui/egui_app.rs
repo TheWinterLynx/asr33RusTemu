@@ -949,7 +949,6 @@ impl EguiApp {
 
     fn terminal(&mut self, ui: &mut egui::Ui) {
         let terminal_rect = ui.max_rect();
-        let terminal_focus_id = ui.id().with("terminal-keyboard-target");
         let (primary_clicked, secondary_clicked, click_time) = ui.ctx().input(|input| {
             let inside = input
                 .pointer
@@ -962,8 +961,6 @@ impl EguiApp {
             )
         });
         if primary_clicked || secondary_clicked {
-            ui.ctx()
-                .memory_mut(|memory| memory.request_focus(terminal_focus_id));
             self.keyboard_target = KeyboardTarget::Terminal;
         }
         if secondary_clicked && self.paste_on_right_click {
