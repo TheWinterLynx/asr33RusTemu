@@ -10,6 +10,10 @@ Windows is the primary target platform for the Rust migration. Linux support is
 best-effort: preserve it where practical, but do not create additional Linux
 work unless it is trivial or a task explicitly requests it.
 
+The Rust target is deliberately **serial-only**. The legacy Python SSH backend may remain in the repository as historical/reference code while Python is still used as a behavioural oracle, but SSH is intentionally outside the Rust product scope. Do not add an SSH transport, SSH configuration surface, SSH dependencies, or backend selector unless a future task explicitly reverses this decision.
+
+The Rust application also deliberately starts **disconnected**. A configured COM/tty port describes the desired serial connection but must only be opened after an explicit Connect/Reconnect action. Do not restore the Python constructor-time serial auto-open behaviour.
+
 Do not perform a mechanical line-by-line Python-to-Rust translation. Prefer an idiomatic Rust design with clear ownership, explicit state, narrow interfaces, and testable components.
 
 ## Current application architecture
@@ -25,7 +29,7 @@ Important existing components include:
 - `asr33emu.py`: application composition / entry point.
 - `asr33_config.py`: YAML and CLI configuration merging.
 - `asr33_backend_serial.py`: serial transport.
-- `asr33_backend_ssh.py`: SSH transport and host-key/authentication handling.
+- `asr33_backend_ssh.py`: legacy Python-only SSH transport retained as historical/reference code; intentionally out of Rust scope.
 - `asr33_shim_throttle.py`: send/receive rate limiting and local loopback.
 - `asr33_terminal.py`: terminal state, line history, overstrike, parity handling, cursor movement and escape stripping.
 - `asr33_papertape.py`: paper-tape reader and punch behaviour plus file handling.
@@ -42,7 +46,6 @@ The Python code currently mixes some device logic, threading and UI concerns. In
 Treat the following as compatibility requirements unless the task says otherwise:
 
 - serial backend;
-- SSH backend;
 - configurable terminal rows, columns and scrollback;
 - ASR-33 7-bit character behaviour;
 - keyboard uppercase-only option;
@@ -61,10 +64,16 @@ Treat the following as compatibility requirements unless the task says otherwise
 - sound state machine, mute and lid behaviour;
 - column bell behaviour;
 - YAML configuration plus CLI overrides;
-- bundled Teletype font support;
+- bundled Teletype font support and configured custom font-path support;
 - Windows and Linux behaviour where currently supported.
 
-If a migration step intentionally changes or drops any of these behaviours, state it explicitly before implementing it.
+The following are intentional compatibility differences, not missing migration work:
+
+- SSH is excluded from the Rust target.
+- Rust starts disconnected and opens serial only after explicit Connect/Reconnect.
+- Tkinter/Pygame are consolidated into the Rust egui frontend as long as required observable behaviour is retained.
+
+If a migration step intentionally changes or drops any other behaviour, state it explicitly before implementing it.
 
 ## Migration strategy
 
@@ -94,7 +103,6 @@ Use these as architectural guidance, not as a requirement to create one crate pe
 - `terminal`: pure terminal state and character processing;
 - `transport`: transport abstraction;
 - `transport::serial`: serial implementation;
-- `transport::ssh`: SSH implementation;
 - `throttle`: rate limiting and loopback policy;
 - `paper_tape`: reader/punch state and file semantics without GUI dependencies;
 - `audio`: sound events and audio state;
@@ -105,7 +113,7 @@ Keep emulation/domain logic independent from the chosen GUI toolkit.
 
 The paper-tape core must not depend on GUI widgets or file-dialog APIs. UI code may call into the paper-tape core.
 
-The terminal core should be testable without serial ports, SSH, audio, GUI or real-time sleeps.
+The terminal core should be testable without serial ports, audio, GUI or real-time sleeps.
 
 ## Rust design rules
 
@@ -141,7 +149,7 @@ Do not introduce async Rust merely because it exists. Use it only when it materi
 
 Before adding a major Rust dependency, inspect its maintenance status, platform support and fit for this project.
 
-Do not silently select a GUI, SSH, serial or audio library for the whole migration as part of an unrelated task.
+Do not silently select a GUI, serial or audio library for the whole migration as part of an unrelated task. Do not add an SSH library unless SSH is explicitly brought back into scope by a future task.
 
 Major technology choices should be documented with the alternatives considered and the reason for the selection.
 
@@ -163,9 +171,11 @@ High-priority characterization areas:
 - paper-tape leading-null skipping;
 - paper-tape trailer auto-stop rules;
 - paper-tape punch append/overwrite semantics;
-- configuration merging and CLI overrides.
+- configuration merging and CLI overrides;
+- explicit serial connection lifecycle;
+- custom font loading with bundled-font fallback.
 
-Where practical, use the same fixtures against Python and Rust and compare outputs. Differential tests are preferred for behaviour that is difficult to specify manually.
+Where practical, use the same fixtures against Python and Rust and compare outputs. Differential tests are preferred for behaviour that is difficult to specify manually. Do not include intentionally removed SSH/backend-selection behaviour in Rust/Python differential expectations.
 
 Do not weaken or rewrite a characterization test merely to make a new implementation pass unless the expected behaviour is intentionally being changed.
 
