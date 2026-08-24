@@ -23,7 +23,6 @@ pub enum ChangeClass {
     Live,
     Reconnect,
     Restart,
-    Legacy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,11 +112,6 @@ impl ConfigChangePlan {
             ChangeClass::Reconnect,
         );
         add(old.sound != new.sound, "sound", ChangeClass::Live);
-        add(
-            old.frontend != new.frontend,
-            "legacy frontend",
-            ChangeClass::Legacy,
-        );
         Self { changes }
     }
 

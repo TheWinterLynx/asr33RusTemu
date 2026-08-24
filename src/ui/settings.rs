@@ -306,7 +306,7 @@ impl SettingsView {
         active_serial: Option<&SerialConfig>,
     ) {
         match self.page {
-            SettingsPage::General => general(ui, metrics, state, &mut self.draft_theme),
+            SettingsPage::General => general(ui, metrics, &mut self.draft_theme),
             SettingsPage::Terminal => terminal(ui, metrics, &mut state.draft_config),
             SettingsPage::Connection => connection(
                 ui,
@@ -369,7 +369,6 @@ fn badge(ui: &mut egui::Ui, class: ChangeClass) {
         ChangeClass::Live => ("LIVE", "Applies to the current session"),
         ChangeClass::Reconnect => ("RECONNECT", "Requires an explicit serial reconnect"),
         ChangeClass::Restart => ("RESTART", "Takes effect after restarting the application"),
-        ChangeClass::Legacy => ("LEGACY", "Legacy compatibility input"),
     };
     ui.label(egui::RichText::new(short).monospace().weak())
         .on_hover_text(explanation);
@@ -431,12 +430,7 @@ fn optional_path(ui: &mut egui::Ui, value: &mut Option<std::path::PathBuf>) {
     }
 }
 
-fn general(
-    ui: &mut egui::Ui,
-    metrics: SettingsUiMetrics,
-    state: &mut SettingsState,
-    theme: &mut ThemeKind,
-) {
+fn general(ui: &mut egui::Ui, metrics: SettingsUiMetrics, theme: &mut ThemeKind) {
     ui.heading("General / Appearance");
     section(ui, metrics, "Appearance");
     row(
@@ -449,16 +443,6 @@ fn general(
             ui.selectable_value(theme, ThemeKind::Dark, "Dark");
         },
     );
-    section(ui, metrics, "Compatibility");
-    let legacy_frontend = match state.draft_config.frontend.kind {
-        FrontendConfigValue::LegacyTkinter => "tkinter",
-        FrontendConfigValue::LegacyPygame => "pygame",
-    };
-    ui.label(format!(
-        "frontend.type = {legacy_frontend} (read-only; Rust always uses egui)"
-    ))
-    .on_hover_cursor(egui::CursorIcon::Help)
-    .on_hover_text("Legacy frontend selection from Python. The Rust application always uses egui.");
 }
 fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.terminal.config;
