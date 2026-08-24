@@ -98,6 +98,10 @@ const fn is_true(value: &bool) -> bool {
     *value
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedConfig {
     pub file: AppConfig,
@@ -286,6 +290,8 @@ pub struct TerminalConfig {
     pub autowrap: bool,
     pub keyboard_uppercase_only: bool,
     pub keyboard_parity_mode: KeyboardParityMode,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keyboard_repeat: bool,
     #[serde(default, alias = "keyboard_return_mode")]
     pub input_return_mode: InputReturnMode,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -747,6 +753,24 @@ mod tests {
             config.terminal.config.input_return_mode,
             InputReturnMode::Cr
         );
+    }
+
+    #[test]
+    fn existing_yaml_defaults_keyboard_repeat_to_disabled() {
+        let mut config = AppConfig::from_yaml_str(include_str!("../../asr33_config.yaml"))
+            .expect("repository YAML remains valid without repeat setting");
+        assert!(!config.terminal.config.keyboard_repeat);
+        let serialized = config.to_yaml_string().expect("configuration serializes");
+        assert!(
+            !serialized.contains("keyboard_repeat"),
+            "the default false value stays backward-compatible and uncluttered"
+        );
+
+        config.terminal.config.keyboard_repeat = true;
+        let serialized = config.to_yaml_string().expect("enabled setting serializes");
+        assert!(serialized.contains("keyboard_repeat: true"));
+        let roundtrip = AppConfig::from_yaml_str(&serialized).expect("enabled setting parses");
+        assert!(roundtrip.terminal.config.keyboard_repeat);
     }
 
     #[test]
