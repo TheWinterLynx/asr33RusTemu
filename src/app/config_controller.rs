@@ -14,7 +14,7 @@ pub fn keyboard_repeat_enabled() -> bool {
     KEYBOARD_REPEAT_ENABLED.load(Ordering::Relaxed)
 }
 
-fn set_keyboard_repeat_enabled(enabled: bool) {
+pub fn set_keyboard_repeat_enabled(enabled: bool) {
     KEYBOARD_REPEAT_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
@@ -225,7 +225,11 @@ impl SettingsState {
     }
     pub fn update_applied_from_live_control(&mut self, update: impl FnOnce(&mut AppConfig)) {
         update(&mut self.applied_config);
-        set_keyboard_repeat_enabled(self.applied_config.terminal.config.keyboard_repeat);
+        // The quick repeat control lives outside the legacy EguiApp fields, so
+        // the atomic live policy is authoritative for this one setting. This
+        // copies it into the applied/draft config on the same terminal frame,
+        // preserving normal dirty/Save semantics.
+        self.applied_config.terminal.config.keyboard_repeat = keyboard_repeat_enabled();
         self.draft_config = self.applied_config.clone();
     }
     pub fn clear_reconnect_required(&mut self) {
