@@ -16,7 +16,7 @@ use crate::app::{
     SystemScheduler,
 };
 use crate::core::config::{
-    AppConfig, BackendKind, InputReturnMode, LidState, MuteState, PunchConfigMode, SerialConfig,
+    AppConfig, InputReturnMode, LidState, MuteState, PunchConfigMode, SerialConfig,
     TapePunchConfig, TapeReaderConfig, TerminalMode, ThrottleMode as ConfigThrottleMode,
 };
 use crate::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
@@ -66,10 +66,7 @@ struct StartupConnectionState {
 }
 
 #[must_use]
-const fn startup_connection_state(
-    _backend: BackendKind,
-    _desired_serial: &SerialConfig,
-) -> StartupConnectionState {
+const fn startup_connection_state(_desired_serial: &SerialConfig) -> StartupConnectionState {
     StartupConnectionState {
         connection_state: ConnectionState::Disconnected,
         transport_error: None,
@@ -118,7 +115,6 @@ pub struct UiOptions {
     pub tape_reader: TapeReaderConfig,
     pub tape_punch: TapePunchConfig,
     pub serial_config: SerialConfig,
-    pub backend_kind: BackendKind,
     pub config_path: PathBuf,
     pub disk_config: AppConfig,
     pub applied_config: AppConfig,
@@ -192,8 +188,7 @@ impl EguiApp {
             options.disk_config.clone(),
             options.applied_config.clone(),
         );
-        let startup_connection =
-            startup_connection_state(options.backend_kind, &options.serial_config);
+        let startup_connection = startup_connection_state(&options.serial_config);
         debug_assert_eq!(
             runtime.connection_state(),
             &startup_connection.connection_state
@@ -287,10 +282,6 @@ impl EguiApp {
     }
 
     fn connect_selected(&mut self) {
-        if self.options.backend_kind != BackendKind::Serial {
-            self.transport_error = Some("SSH backend not migrated yet".to_owned());
-            return;
-        }
         let selected = self.options.serial_config.clone();
         match open_serial_for_explicit_request(selected.clone(), SerialTransport::open) {
             Ok(transport) => match self.runtime.connect(transport) {
@@ -459,16 +450,14 @@ impl EguiApp {
             PunchConfigMode::Overwrite => PunchMode::Overwrite,
         };
         self.options.serial_config = new.backend.serial_config.clone();
-        self.options.backend_kind = new.backend.kind;
         self.theme = self.settings_view.draft_theme;
         self.theme.apply(context);
         self.settings_view.applied_theme = self.theme;
         self.settings_state.commit_apply(&plan);
-        self.settings_state.pending_reconnect = self.options.backend_kind == BackendKind::Serial
-            && serial_reconnect_required(
-                self.active_serial_config.as_ref(),
-                &self.options.serial_config,
-            );
+        self.settings_state.pending_reconnect = serial_reconnect_required(
+            self.active_serial_config.as_ref(),
+            &self.options.serial_config,
+        );
         context.request_repaint();
         Ok(())
     }
@@ -499,12 +488,8 @@ impl EguiApp {
                 self.settings_view.draft_theme = self.settings_view.applied_theme;
             }
             SettingsAction::Reconnect => {
-                if self.options.backend_kind == BackendKind::Serial {
-                    self.disconnect();
-                    self.connect_selected();
-                } else {
-                    self.settings_view.error = Some("SSH backend not migrated yet".to_owned());
-                }
+                self.disconnect();
+                self.connect_selected();
             }
             SettingsAction::RefreshPorts => self.refresh_ports(PortRefreshPolicy::ReportErrors),
             SettingsAction::Close => self.current_view.show_terminal(),
@@ -852,15 +837,7 @@ impl EguiApp {
             {
                 self.refresh_ports(PortRefreshPolicy::ReportErrors);
             }
-            if !connected
-                && ui
-                    .add_enabled(
-                        self.options.backend_kind == BackendKind::Serial,
-                        egui::Button::new("Connect"),
-                    )
-                    .on_disabled_hover_text("SSH backend not migrated yet")
-                    .clicked()
-            {
+            if !connected && ui.button("Connect").clicked() {
                 self.connect_selected();
             }
             if connected && ui.button("Disconnect").clicked() {
@@ -1939,7 +1916,7 @@ mod tests {
     use crate::adapters::paper_tape::PunchFile;
     use crate::app::PumpStatus;
     use crate::core::config::{
-        BackendKind, DataBits, InputReturnMode, LidState, SerialConfig, SerialParity, StopBits,
+        DataBits, InputReturnMode, LidState, SerialConfig, SerialParity, StopBits,
     };
     use crate::core::paper_tape::{
         PaperTape, PunchMode, PunchState, ReaderOptions, ReaderState, StopCause, TapeReader,
@@ -1971,13 +1948,9 @@ mod tests {
 
     #[test]
     fn startup_never_activates_or_reports_configured_transport() {
-        for (backend, port) in [
-            (BackendKind::Serial, "COM4"),
-            (BackendKind::Serial, "COM999"),
-            (BackendKind::Ssh, "COM4"),
-        ] {
+        for port in ["COM4", "COM999"] {
             let desired = desired_serial(port);
-            let state = startup_connection_state(backend, &desired);
+            let state = startup_connection_state(&desired);
             assert_eq!(
                 state.connection_state,
                 crate::app::ConnectionState::Disconnected
@@ -1998,7 +1971,7 @@ mod tests {
             Err("cannot open serial port")
         };
 
-        let startup = startup_connection_state(BackendKind::Serial, &desired);
+        let startup = startup_connection_state(&desired);
         assert_eq!(attempts.get(), 0);
         assert_eq!(startup.transport_error, None);
 
