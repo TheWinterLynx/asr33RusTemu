@@ -2,201 +2,116 @@
 
 ## Project purpose
 
-This repository implements an ASR-33 Teletype emulator in Python and Rust. The Python implementation remains the behavioural reference while the Rust migration is completed.
+This repository implements an ASR-33 Teletype emulator in Rust with egui. Windows is the primary target platform; Linux support is best-effort unless a task explicitly requires it.
 
-Windows is the primary target platform for the Rust application. Linux support is best-effort unless a task explicitly requires it.
+The application supports **serial transport only**. Do not introduce an alternate transport, network transport dependency, transport selector, or alternate transport configuration unless a future task explicitly changes that product decision.
 
-The application supports **serial transport only**. Do not introduce an alternate transport, alternate transport configuration, network transport dependency, or transport selector unless a future task explicitly changes that product decision.
+The application deliberately starts **disconnected**. A configured COM/tty port describes the desired serial connection but must only be opened after an explicit Connect/Reconnect action. Do not restore constructor-time serial auto-open behaviour or hidden reconnect loops.
 
-The Rust application deliberately starts **disconnected**. A configured COM/tty port describes the desired serial connection but must only be opened after an explicit Connect/Reconnect action. Do not restore constructor-time serial auto-open behaviour.
+## Current architecture
 
-Do not perform a mechanical line-by-line Python-to-Rust translation. Prefer idiomatic Rust with clear ownership, explicit state, narrow interfaces, and testable components.
+The main Rust boundaries are:
 
-## Current application architecture
+- `src/core/config.rs`: typed YAML/CLI configuration;
+- `src/core/terminal`: terminal state, history, control characters and parity handling;
+- `src/core/throttle.rs`: deterministic rate-control policy;
+- `src/core/paper_tape`: reader/punch device semantics;
+- `src/core/audio.rs`: deterministic audio state and events;
+- `src/adapters/transport/serial`: serial transport and platform settings;
+- `src/adapters/audio_margin.rs` + `audio_rodio_crlf.rs`: audio policy and playback;
+- `src/adapters/embedded_sounds.rs`: compile-time bundled WAV assets;
+- `src/app`: application composition and lifecycle;
+- `src/ui`: egui rendering, settings, keyboard/repeat and paper-tape visualization.
 
-The legacy Python application is assembled roughly as:
+Keep emulation/domain logic independent from GUI widgets, file dialogs, serial ports, audio devices and wall-clock sleeps wherever practical.
 
-`serial transport -> data throttle -> terminal core -> frontend`
+## Product behaviour that must not be lost silently
 
-Important existing components include:
-
-- `asr33emu.py`: application composition / entry point.
-- `asr33_config.py`: YAML and CLI configuration merging.
-- `asr33_backend_serial.py`: serial transport.
-- `asr33_shim_throttle.py`: send/receive rate limiting and local loopback.
-- `asr33_terminal.py`: terminal state, line history, overstrike, parity handling, cursor movement and escape stripping.
-- `asr33_papertape.py`: paper-tape reader and punch behaviour plus file handling.
-- `asr33_pt_animate_tk.py`: Tk paper-tape visualization.
-- `asr33_sounds_sm.py`: ASR-33 audio state machine and playback.
-- `asr33_frontend_tk.py`: Tk frontend.
-- `asr33_frontend_pygame.py`: Pygame frontend.
-- `asr33_config.yaml`: default configuration and feature surface.
-
-The Python code mixes some device logic, threading and UI concerns. In particular, paper-tape behaviour is coupled to Tk UI code, and the Pygame frontend creates a hidden Tk root to reuse paper-tape widgets. Do not preserve that coupling in the Rust design.
-
-## Behaviour that must not be lost silently
-
-Treat the following as compatibility requirements unless the task says otherwise:
+Treat the following as compatibility requirements unless a task explicitly changes them:
 
 - serial transport;
-- configurable terminal rows, columns and scrollback;
+- explicit Connect/Disconnect/Reconnect lifecycle;
+- configurable rows, columns and scrollback;
 - ASR-33 7-bit character behaviour;
 - keyboard uppercase-only option;
 - mark, space and even parity modes;
-- carriage return, line feed, vertical tab, backspace, tab and form-feed handling as currently implemented;
-- optional autowrap;
-- overstrike support;
+- carriage return, line feed, vertical tab, backspace, tab and form-feed handling;
+- optional autowrap and overstrike;
 - ANSI CSI/OSC stripping used for modern-host compatibility;
 - authentic throttled operation, normally 10 characters per second;
 - unthrottled mode;
-- local/loopback mode;
+- Line/Local mode;
 - printer enable/disable state;
 - paper-tape reader and punch;
-- tape reader leading-null skipping, MSB option and trailer auto-stop behaviour;
-- paper-tape append/overwrite behaviour;
-- sound state machine, mute and lid behaviour;
-- column bell behaviour;
+- leading-null skipping, MSB option and trailer auto-stop behaviour;
+- punch append/overwrite semantics;
+- sound state machine, mute, lid and margin-bell behaviour;
 - YAML configuration plus CLI overrides;
-- bundled Teletype font support and configured custom font-path support;
-- Windows and Linux behaviour where currently supported.
+- bundled Teletype font and optional custom font path;
+- single-file Windows release behaviour: default config, font and sounds embedded in `asr33emu.exe`.
 
-Intentional compatibility differences:
+Intentional design decisions:
 
-- Rust exposes one serial transport and no transport selector.
-- Rust starts disconnected and opens serial only after explicit Connect/Reconnect.
-- Tkinter/Pygame are consolidated into the Rust egui frontend as long as required observable behaviour is retained.
-
-If a migration step intentionally changes or drops any other behaviour, state it explicitly before implementing it.
-
-## Migration strategy
-
-For non-trivial migration work, first:
-
-1. inspect the relevant Python implementation;
-2. identify callers, consumers and cross-module dependencies;
-3. identify observable behaviour and edge cases;
-4. locate existing tests;
-5. add characterization tests where practical before replacing behaviour;
-6. propose the Rust boundary and ownership model;
-7. implement one coherent migration slice at a time.
-
-Keep the Python implementation runnable during the migration unless a task explicitly authorizes removing it.
-
-Prefer incremental vertical slices over a big-bang rewrite. A migration step should leave the repository usable and independently reviewable.
-
-## Suggested Rust boundaries
-
-Use these as architectural guidance, not as a requirement to create one crate per item:
-
-- `config`: typed configuration and CLI parsing;
-- `terminal`: pure terminal state and character processing;
-- `transport`: transport abstraction;
-- `transport::serial`: serial implementation;
-- `throttle`: rate limiting and loopback policy;
-- `paper_tape`: reader/punch state and file semantics without GUI dependencies;
-- `audio`: sound events and audio state;
-- `ui`: rendering, keyboard/mouse input and windows;
-- `app`: composition and lifecycle.
-
-Keep emulation/domain logic independent from the chosen GUI toolkit.
-
-The paper-tape core must not depend on GUI widgets or file-dialog APIs. UI code may call into the paper-tape core.
-
-The terminal core should be testable without serial ports, audio, GUI or real-time sleeps.
+- one serial transport, no transport selector;
+- startup remains disconnected until explicit Connect/Reconnect;
+- parsed-file configuration and effective configuration are independently owned;
+- `input_return_mode` is part of the native Rust configuration surface.
 
 ## Rust design rules
 
-Prefer idiomatic Rust.
+Prefer idiomatic Rust with explicit ownership, narrow interfaces and deterministic tests.
 
 Avoid:
 
-- translating every Python class directly into a Rust struct;
 - unnecessary `clone()` calls;
 - pervasive `Arc<Mutex<T>>`;
 - global mutable state;
 - `unwrap()` / `expect()` on normal production error paths;
-- stringly typed state when an enum is appropriate;
-- speculative traits and generic abstractions;
-- coupling domain logic to GUI toolkit types;
-- sleeps embedded in logic that should be deterministic under tests.
+- stringly typed finite state where an enum is appropriate;
+- speculative traits and abstractions;
+- coupling device/core logic to GUI toolkit types;
+- sleeps embedded in logic that should be testable deterministically;
+- dead compatibility modules kept after their replacement is complete.
 
 Prefer:
 
-- explicit ownership;
-- enums for finite states such as terminal mode, parity mode, lid state and throttle mode;
-- typed configuration via `serde` or equivalent;
+- enums for finite states;
+- typed configuration via serde;
 - `Result`-based error propagation;
-- channels/message passing where it simplifies ownership between I/O workers and UI/core;
-- monotonic time for rate-control logic;
-- dependency injection of time or scheduling where useful for deterministic tests;
+- bounded channels/message passing where it simplifies worker ownership;
+- monotonic time or injected scheduling for rate control;
 - small cohesive modules;
-- explicit lifecycle and shutdown semantics for worker threads/tasks.
+- explicit startup/shutdown semantics for worker threads.
 
 Do not introduce async Rust merely because it exists. Use it only when it materially simplifies lifecycle architecture.
 
-## Dependency selection
-
-Before adding a major Rust dependency, inspect its maintenance status, platform support and fit for this project.
-
-Do not silently select a GUI, serial or audio library for the whole migration as part of an unrelated task. Do not add a second transport stack unless a future task explicitly changes the serial-only product decision.
-
-Major technology choices should be documented with the alternatives considered and the reason for the selection.
-
 ## Testing and compatibility
 
-Treat automated test coverage as a migration requirement.
-
-High-priority characterization areas:
+Automated test coverage is a release requirement. High-priority areas include:
 
 - parity encoding and masking;
 - escape-sequence stripping;
-- cursor and line-history behaviour;
-- autowrap and overstrike;
+- cursor, line-history, autowrap and overstrike behaviour;
 - tab/CR/LF/control-character handling;
-- throttle timing policy without wall-clock sleeps where possible;
-- loopback behaviour;
-- paper-tape leading-null skipping;
-- paper-tape trailer auto-stop rules;
-- paper-tape punch append/overwrite semantics;
+- throttled and unthrottled scheduling;
+- Line/Local routing;
+- paper-tape reader/punch edge cases;
 - configuration merging and CLI overrides;
 - explicit serial connection lifecycle;
-- custom font loading with bundled-font fallback.
+- REPT/typematic behaviour;
+- custom font loading with bundled fallback;
+- deterministic audio state;
+- embedded configuration/font/audio deployment behaviour.
 
-Where practical, use the same fixtures against Python and Rust and compare outputs. Differential tests are preferred for behaviour that is difficult to specify manually. Removed transport-selection behaviour is not part of shared differential expectations.
-
-Do not weaken a characterization test merely to make a new implementation pass unless the expected behaviour is intentionally being changed.
-
-## UI migration
-
-Do not reproduce Tkinter/Pygame implementation details unless they are required for observable behaviour.
-
-Separate terminal/device state, input commands, render state, and actual toolkit widgets/windows.
-
-The current two-front-end design may be consolidated in Rust as long as required features remain observable.
-
-## Concurrency and thread safety
-
-Before translating a threaded component, identify ownership, data-flow direction, blocking points, backpressure behaviour, startup/shutdown ordering, and UI-thread requirements.
-
-Prefer worker components communicating through bounded channels while the UI owns UI state.
-
-Do not add locks around local temporary objects and assume that provides cross-thread synchronization. Synchronization must protect the actual shared state.
+The final migration configuration behaviour is frozen natively in `tests/config_compat.rs`. Do not weaken that snapshot merely to make a change pass; update it only when the configuration contract is intentionally changed.
 
 ## Scope discipline
 
-Keep diffs tightly scoped to the requested task.
+Keep diffs tightly scoped. Do not perform unrelated refactors, rename unrelated symbols/files, reformat unrelated code or fix unrelated warnings unless they block the requested work.
 
-Do not perform unrelated refactors, rename unrelated symbols/files, reformat unrelated code, or fix unrelated warnings unless they block the requested work.
-
-If an unrelated problem is discovered, report it instead of silently folding it into the change.
-
-## Root-cause rule
-
-For bug fixes, identify the root cause before implementing the fix. Do not hide symptoms with special cases or workarounds when the underlying problem can reasonably be corrected.
+For bug fixes, identify and correct the root cause rather than hiding symptoms with special cases.
 
 ## Validation
-
-For Python-only changes, run relevant checks and at minimum ensure changed Python files parse/compile.
 
 For Rust changes, the default completion checks are:
 
@@ -204,21 +119,23 @@ For Rust changes, the default completion checks are:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
+cargo build --release
 ```
 
-If a check cannot be run because of missing hardware, credentials, GUI/display support or an external service, report that explicitly.
+For single-file deployment changes, also launch a release `asr33emu.exe` copied into an otherwise empty directory on Windows.
+
+If a check cannot be run because of missing hardware, GUI/display support or an external service, report that explicitly.
 
 ## Final review
 
-Before finishing a code-changing task, review the complete diff for accidental behaviour changes, missing compatibility behaviour, unnecessary complexity, duplicated logic, inappropriate shared ownership, race conditions, shutdown problems, hidden GUI dependencies, unbounded queues, dead code, weak error handling, missing tests and scope creep.
+Before finishing a code-changing task, review the complete diff for accidental behaviour changes, missing compatibility behaviour, unnecessary complexity, duplicated logic, race conditions, shutdown problems, hidden GUI dependencies, unbounded queues, dead code, weak error handling, missing tests and scope creep.
 
 ## Completion report
 
-When finishing a migration task, report:
+Report:
 
 1. what changed;
-2. which Python behaviour it replaces or preserves;
-3. important architectural decisions;
-4. tests and validation commands executed;
-5. known limitations or behaviours not yet migrated;
-6. the recommended next migration slice.
+2. important architectural decisions;
+3. tests/validation performed;
+4. known limitations;
+5. the recommended next step.

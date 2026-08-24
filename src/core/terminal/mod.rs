@@ -243,7 +243,9 @@ mod tests {
             autowrap: false,
         })
         .expect("terminal");
-        terminal.receive_data(b"ABC\r\nDEF").expect("terminal input");
+        terminal
+            .receive_data(b"ABC\r\nDEF")
+            .expect("terminal input");
         assert!(terminal.line_history().len() > 1);
         assert_ne!(terminal.cursor_position(), (0, 0));
         terminal.disable_printing();
@@ -254,7 +256,11 @@ mod tests {
         assert_eq!(terminal.cursor_position(), (0, 0));
         assert_eq!(terminal.line_history().len(), 1);
         assert_eq!(
-            terminal.line_history().line(0).expect("blank line").top_characters(),
+            terminal
+                .line_history()
+                .line(0)
+                .expect("blank line")
+                .top_characters(),
             "        "
         );
         assert!(!terminal.printing_enabled());

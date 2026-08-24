@@ -1,73 +1,135 @@
 use asr33emu::core::config::{ConfigCli, LoadedConfig};
 use clap::Parser;
-use serde_json::Value;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use serde_json::{Value, json};
+use std::path::Path;
 
 fn repository_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn compare_python_and_rust(config_filename: &str, overrides: &[&str]) {
+fn frozen_legacy_snapshot(strict: bool) -> Value {
+    let mut snapshot = json!({
+        "sound": {
+            "config": {
+                "lid": "up",
+                "mute_state": "unmuted"
+            }
+        },
+        "terminal": {
+            "config": {
+                "mode": "line",
+                "columns": 72,
+                "rows": 24,
+                "scrollback": 200,
+                "autowrap": true,
+                "keyboard_uppercase_only": false,
+                "keyboard_parity_mode": "space",
+                "send_cr_at_startup": false,
+                "no_print": false,
+                "font_path": null,
+                "font_size": 20
+            }
+        },
+        "backend": {
+            "serial_config": {
+                "port": "COM4",
+                "baudrate": 19200,
+                "databits": 8,
+                "parity": "N",
+                "stopbits": 1
+            }
+        },
+        "data_throttle": {
+            "config": {
+                "mode": "throttled",
+                "send_rate_cps": 10,
+                "receive_rate_cps": 10
+            }
+        },
+        "tape_reader": {
+            "config": {
+                "max_rows": 200,
+                "initial_file_path": ".",
+                "skip_leading_nulls": true,
+                "auto_stop": true,
+                "set_msb": false,
+                "ghost_outline": true,
+                "bit_label_base": 1,
+                "ascii_char_mask_msb": true
+            }
+        },
+        "tape_punch": {
+            "config": {
+                "max_rows": 200,
+                "initial_file_path": ".",
+                "mode": "overwrite",
+                "ghost_outline": true,
+                "bit_label_base": 1,
+                "ascii_char_mask_msb": true
+            }
+        }
+    });
+
+    if strict {
+        snapshot["terminal"]["config"]["autowrap"] = json!(false);
+        snapshot["terminal"]["config"]["keyboard_uppercase_only"] = json!(true);
+        snapshot["terminal"]["config"]["keyboard_parity_mode"] = json!("mark");
+        snapshot["backend"]["serial_config"]["baudrate"] = json!(110);
+    }
+
+    snapshot
+}
+
+fn compare_rust_to_frozen_legacy(config_filename: &str, overrides: &[&str], expected: Value) {
     let config_path = repository_root().join(config_filename);
     let mut rust_args = vec!["asr33emu".to_owned(), "--config".to_owned()];
     rust_args.push(config_path.to_string_lossy().into_owned());
     rust_args.extend(overrides.iter().map(|argument| (*argument).to_owned()));
 
-    let cli = ConfigCli::try_parse_from(rust_args).expect("shared CLI case is valid in Rust");
-    let loaded = LoadedConfig::load(&cli).expect("shared YAML is valid in Rust");
+    let cli = ConfigCli::try_parse_from(rust_args).expect("compatibility CLI case is valid");
+    let loaded = LoadedConfig::load(&cli).expect("compatibility YAML is valid");
     let mut rust_value =
         serde_json::to_value(&loaded.effective).expect("typed Rust config serializes to JSON");
-    // These Rust-only, serde-defaulted options are intentionally absent from
-    // the unchanged legacy Python model; every remaining legacy field stays
-    // differential. Backend selection is intentionally no longer part of the
-    // Rust surface and therefore is not exercised as a shared override.
+
+    // `input_return_mode` was introduced by the Rust implementation after the
+    // legacy behaviour was frozen. Everything else remains locked to the last
+    // characterized configuration surface from the removed implementation.
     rust_value["terminal"]["config"]
         .as_object_mut()
         .expect("terminal config is an object")
         .remove("input_return_mode");
 
-    let python = std::env::var_os("PYTHON")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("python"));
-    let mut command = Command::new(python);
-    command
-        .current_dir(repository_root())
-        .arg(repository_root().join("tests/python_config_snapshot.py"))
-        .arg("--config")
-        .arg(&config_path)
-        .args(overrides);
-    let output = command
-        .output()
-        .expect("Python interpreter runs the differential helper");
-    assert!(
-        output.status.success(),
-        "Python config helper failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let python_value: Value =
-        serde_json::from_slice(&output.stdout).expect("Python helper emits valid JSON");
-
-    assert_eq!(rust_value, python_value);
+    assert_eq!(rust_value, expected);
 }
 
 #[test]
-fn default_yaml_matches_python_without_overrides() {
-    compare_python_and_rust("asr33_config.yaml", &[]);
+fn default_yaml_matches_frozen_legacy_snapshot() {
+    compare_rust_to_frozen_legacy("asr33_config.yaml", &[], frozen_legacy_snapshot(false));
 }
 
 #[test]
-fn strict_yaml_matches_python_without_overrides() {
-    compare_python_and_rust("asr33_strict.yaml", &[]);
+fn strict_yaml_matches_frozen_legacy_snapshot() {
+    compare_rust_to_frozen_legacy("asr33_strict.yaml", &[], frozen_legacy_snapshot(true));
 }
 
 #[test]
-fn default_yaml_with_all_shared_cli_overrides_matches_python() {
-    compare_python_and_rust(
+fn default_yaml_with_all_shared_cli_overrides_matches_frozen_legacy_snapshot() {
+    let mut expected = frozen_legacy_snapshot(false);
+    expected["terminal"]["config"]["mode"] = json!("local");
+    expected["terminal"]["config"]["columns"] = json!(80);
+    expected["terminal"]["config"]["rows"] = json!(30);
+    expected["terminal"]["config"]["scrollback"] = json!(400);
+    expected["data_throttle"]["config"]["send_rate_cps"] = json!(37);
+    expected["data_throttle"]["config"]["receive_rate_cps"] = json!(37);
+    expected["sound"]["config"]["mute_state"] = json!("muted");
+    expected["backend"]["serial_config"]["baudrate"] = json!(9600);
+    expected["backend"]["serial_config"]["databits"] = json!(7);
+    expected["backend"]["serial_config"]["parity"] = json!("E");
+    expected["backend"]["serial_config"]["stopbits"] = json!(2);
+
+    compare_rust_to_frozen_legacy(
         "asr33_config.yaml",
         &[
-            "--frontend",
-            "pygame",
             "--term_mode",
             "local",
             "--columns",
@@ -88,16 +150,26 @@ fn default_yaml_with_all_shared_cli_overrides_matches_python() {
             "--stopbits",
             "2",
         ],
+        expected,
     );
 }
 
 #[test]
-fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_python() {
-    compare_python_and_rust(
+fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_frozen_legacy_snapshot() {
+    let mut expected = frozen_legacy_snapshot(true);
+    expected["terminal"]["config"]["columns"] = json!(81);
+    expected["terminal"]["config"]["rows"] = json!(25);
+    expected["terminal"]["config"]["scrollback"] = json!(201);
+    expected["data_throttle"]["config"]["send_rate_cps"] = json!(0);
+    expected["data_throttle"]["config"]["receive_rate_cps"] = json!(0);
+    expected["backend"]["serial_config"]["baudrate"] = json!(19200);
+    expected["backend"]["serial_config"]["databits"] = json!(5);
+    expected["backend"]["serial_config"]["parity"] = json!("M");
+    expected["backend"]["serial_config"]["stopbits"] = json!(1);
+
+    compare_rust_to_frozen_legacy(
         "asr33_strict.yaml",
         &[
-            "--frontend",
-            "tkinter",
             "--term_mode",
             "line",
             "--columns",
@@ -117,6 +189,7 @@ fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_python() {
             "--stopbits",
             "1",
         ],
+        expected,
     );
 }
 
@@ -146,8 +219,8 @@ fn rust_keeps_file_and_effective_configuration_independent() {
     .expect("test CLI is valid");
     let loaded = LoadedConfig::load(&cli).expect("default YAML is valid");
 
-    // Intentional difference from Python's characterized shallow-copy legacy
-    // behavior: the parsed file value remains unchanged.
+    // Intentional improvement over the historical shallow-copy behaviour: the
+    // parsed file value remains unchanged after CLI overrides are applied.
     assert_eq!(loaded.file.terminal.config.columns, 72);
     assert_eq!(loaded.effective.terminal.config.columns, 80);
 }

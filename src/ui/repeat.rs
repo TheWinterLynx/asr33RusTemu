@@ -197,7 +197,10 @@ fn filter_and_track_events(
 
 fn key_route_payload(key: egui::Key, modifiers: egui::Modifiers) -> Option<RepeatPayload> {
     if modifiers.ctrl
-        || matches!(key, egui::Key::Enter | egui::Key::Backspace | egui::Key::Tab)
+        || matches!(
+            key,
+            egui::Key::Enter | egui::Key::Backspace | egui::Key::Tab
+        )
     {
         Some(RepeatPayload::Key { key, modifiers })
     } else {

@@ -14,6 +14,9 @@ use asr33emu::ui::keyboard::KeyboardOptions;
 use asr33emu::ui::{EguiApp, UiOptions};
 use clap::Parser;
 
+const DEFAULT_CONFIG_PATH: &str = "asr33_config.yaml";
+const EMBEDDED_DEFAULT_CONFIG: &str = include_str!("../asr33_config.yaml");
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -26,7 +29,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let cli = ConfigCli::parse();
-    let loaded = LoadedConfig::load(&cli)?;
+    let loaded = load_startup_config(&cli)?;
     let config = loaded.effective;
     config.validate()?;
 
@@ -91,6 +94,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn load_startup_config(cli: &ConfigCli) -> Result<LoadedConfig, Box<dyn Error>> {
+    let default_path = std::path::PathBuf::from(DEFAULT_CONFIG_PATH);
+    if cli.config == default_path && !cli.config.exists() {
+        return embedded_default_config(cli);
+    }
+    Ok(LoadedConfig::load(cli)?)
+}
+
+fn embedded_default_config(cli: &ConfigCli) -> Result<LoadedConfig, Box<dyn Error>> {
+    let file = AppConfig::from_yaml_str(EMBEDDED_DEFAULT_CONFIG)?;
+    let mut effective = file.clone();
+    cli.apply_to(&mut effective);
+    effective.validate()?;
+    Ok(LoadedConfig { file, effective })
+}
+
 fn terminal_options(config: &AppConfig) -> TerminalOptions {
     let terminal = &config.terminal.config;
     TerminalOptions {
@@ -140,9 +159,13 @@ fn initial_commands(
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_modes, initial_commands, terminal_options, throttle_config};
-    use asr33emu::core::config::{AppConfig, KeyboardParityMode};
+    use super::{
+        configured_modes, embedded_default_config, initial_commands, terminal_options,
+        throttle_config,
+    };
+    use asr33emu::core::config::{AppConfig, ConfigCli, KeyboardParityMode};
     use asr33emu::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
+    use clap::Parser;
 
     #[test]
     fn default_yaml_maps_to_runtime_dimensions_rates_and_modes() {
@@ -160,6 +183,21 @@ mod tests {
             configured_modes(&config),
             (CommunicationMode::Line, ThrottleMode::Throttled)
         );
+    }
+
+    #[test]
+    fn embedded_default_config_accepts_cli_overrides_without_disk_file() {
+        let cli =
+            ConfigCli::try_parse_from(["asr33emu", "--columns", "80", "--baud", "9600", "--mute"])
+                .expect("CLI is valid");
+        let loaded = embedded_default_config(&cli).expect("embedded default config loads");
+        assert_eq!(loaded.file.terminal.config.columns, 72);
+        assert_eq!(loaded.effective.terminal.config.columns, 80);
+        assert_eq!(loaded.effective.backend.serial_config.baudrate, 9600);
+        assert!(matches!(
+            loaded.effective.sound.config.mute_state,
+            asr33emu::core::config::MuteState::Muted
+        ));
     }
 
     #[test]

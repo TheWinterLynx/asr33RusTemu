@@ -1,9 +1,9 @@
 //! Native Rust user interface.
 
 mod egui_app;
-mod repeat;
 pub mod keyboard;
 pub mod layout;
+mod repeat;
 pub mod settings;
 pub mod tape_view;
 pub mod theme;
@@ -59,7 +59,10 @@ impl EguiApp {
     }
 }
 
-fn install_custom_terminal_font(context: &eframe::egui::Context, path: &Path) -> Result<(), String> {
+fn install_custom_terminal_font(
+    context: &eframe::egui::Context,
+    path: &Path,
+) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     if bytes.is_empty() {
         return Err("font file is empty".to_owned());
