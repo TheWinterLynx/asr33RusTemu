@@ -6,6 +6,10 @@
 //! file and [`LoadedConfig::effective`] is an independently owned clone with
 //! CLI overrides. This difference must be approved before Rust configuration
 //! is connected to the application.
+//!
+//! The Rust target is deliberately serial-only. The legacy Python SSH backend
+//! remains only as historical/reference code while the migration is being
+//! closed out; it is not part of the Rust configuration surface.
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -45,19 +49,9 @@ impl AppConfig {
         )?;
         require_nonzero(terminal.font_size, "terminal.config.font_size")?;
 
-        match self.backend.kind {
-            BackendKind::Serial => {
-                let serial = &self.backend.serial_config;
-                require_nonempty(&serial.port, "backend.serial_config.port")?;
-                require_nonzero(serial.baudrate, "backend.serial_config.baudrate")?;
-            }
-            BackendKind::Ssh => {
-                let ssh = &self.backend.ssh_config;
-                require_nonempty(&ssh.username, "backend.ssh_config.username")?;
-                require_nonempty(&ssh.host, "backend.ssh_config.host")?;
-                require_nonzero(ssh.port, "backend.ssh_config.port")?;
-            }
-        }
+        let serial = &self.backend.serial_config;
+        require_nonempty(&serial.port, "backend.serial_config.port")?;
+        require_nonzero(serial.baudrate, "backend.serial_config.baudrate")?;
 
         require_nonzero(
             self.tape_reader.config.max_rows,
@@ -131,9 +125,6 @@ pub struct ConfigCli {
     #[arg(long, value_enum)]
     pub frontend: Option<FrontendConfigValue>,
 
-    #[arg(long, value_enum)]
-    pub backend: Option<BackendKind>,
-
     #[arg(long = "term_mode", value_enum)]
     pub term_mode: Option<TerminalMode>,
 
@@ -169,9 +160,6 @@ impl ConfigCli {
     pub fn apply_to(&self, config: &mut AppConfig) {
         if let Some(value) = self.frontend {
             config.frontend.kind = value;
-        }
-        if let Some(value) = self.backend {
-            config.backend.kind = value;
         }
         if let Some(value) = self.term_mode {
             config.terminal.config.mode = value;
@@ -302,19 +290,9 @@ pub struct TerminalConfig {
     pub font_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendKind {
-    Serial,
-    Ssh,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendSection {
-    #[serde(rename = "type")]
-    pub kind: BackendKind,
     pub serial_config: SerialConfig,
-    pub ssh_config: SshConfig,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -477,46 +455,6 @@ pub struct SerialConfig {
     pub databits: DataBits,
     pub parity: SerialParity,
     pub stopbits: StopBits,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HostKeyPolicy {
-    Strict,
-    AcceptNew,
-    Off,
-}
-
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SshConfig {
-    pub username: String,
-    pub host: String,
-    pub port: u16,
-    pub key_filename: Option<PathBuf>,
-    pub password: Option<String>,
-    pub use_agent: bool,
-    pub expected_fingerprint: Option<String>,
-    pub host_key_policy: HostKeyPolicy,
-    pub known_hosts_file: PathBuf,
-    pub tofu_prompt: bool,
-}
-
-impl fmt::Debug for SshConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SshConfig")
-            .field("username", &self.username)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("key_filename", &self.key_filename)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field("use_agent", &self.use_agent)
-            .field("expected_fingerprint", &self.expected_fingerprint)
-            .field("host_key_policy", &self.host_key_policy)
-            .field("known_hosts_file", &self.known_hosts_file)
-            .field("tofu_prompt", &self.tofu_prompt)
-            .finish()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -717,16 +655,6 @@ mod tests {
         let source =
             include_str!("../../asr33_config.yaml").replace("mode: \"line\"", "mode: \"remote\"");
         assert!(AppConfig::from_yaml_str(&source).is_err());
-    }
-
-    #[test]
-    fn debug_output_redacts_ssh_password() {
-        let source = include_str!("../../asr33_config.yaml")
-            .replace("password: null", "password: secret-value");
-        let config = AppConfig::from_yaml_str(&source).expect("modified repository YAML is valid");
-        let debug = format!("{:?}", config.backend.ssh_config);
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("secret-value"));
     }
 
     #[test]
