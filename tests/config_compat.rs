@@ -20,8 +20,8 @@ fn compare_python_and_rust(config_filename: &str, overrides: &[&str]) {
         serde_json::to_value(&loaded.effective).expect("typed Rust config serializes to JSON");
     // These Rust-only, serde-defaulted options are intentionally absent from
     // the unchanged legacy Python model; every remaining legacy field stays
-    // differential. SSH/backend selection is intentionally no longer part of
-    // the Rust surface and therefore is not exercised as a shared override.
+    // differential. Backend selection is intentionally no longer part of the
+    // Rust surface and therefore is not exercised as a shared override.
     rust_value["terminal"]["config"]
         .as_object_mut()
         .expect("terminal config is an object")
@@ -121,16 +121,16 @@ fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_python() {
 }
 
 #[test]
-fn rust_cli_rejects_removed_backend_selection() {
+fn rust_cli_rejects_backend_selection() {
     let path = repository_root().join("asr33_config.yaml");
     let result = ConfigCli::try_parse_from([
         "asr33emu",
         "--config",
         path.to_str().expect("repository path is UTF-8"),
         "--backend",
-        "ssh",
+        "serial",
     ]);
-    assert!(result.is_err(), "SSH/backend selection is intentionally gone");
+    assert!(result.is_err(), "backend selection is intentionally gone");
 }
 
 #[test]
