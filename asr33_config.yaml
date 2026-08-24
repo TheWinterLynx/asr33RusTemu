@@ -19,36 +19,18 @@ terminal:
     keyboard_parity_mode: "space"  # Options: "mark" | "space" | "even"
     send_cr_at_startup: false  # Send carriage return on startup
     no_print: false  # Options: true | false (disable printing to console)
-    font_path: null  # Path to custom TrueType font file (optional; null means use default)
+    font_path: null  # Path to custom TrueType/OpenType font file; null uses bundled Teletype33.ttf
     font_size: 20  # Font size for terminal display
 
+# Rust target is deliberately serial-only. The application starts disconnected
+# and opens this port only after an explicit Connect action.
 backend:
-  type: "serial"  # "serial" | "ssh"
-
   serial_config:
     port: "COM4"  # e.g., "COM1" on Windows or "/dev/ttyUSB0" on Linux
     baudrate: 19200
     databits: 8  # 5 | 6 | 7 | 8
     parity: "N"  # "N" | "E" | "O" | "M" | "S"
     stopbits: 1  # 1 | 2
-
-  ssh_config:
-    username: "your_username"
-    host: "your_host_address"
-    port: 22
-
-  # Authentication
-    key_filename: "~/.ssh/id_ed25519"   # optional
-    password: null                      # optional; null means prompt if needed
-    use_agent: true                     # try ssh-agent / Pageant
-
-    # Host key verification
-    expected_fingerprint: null          # optional SHA256:xxxx... fingerprint
-    host_key_policy: "accept-new"       # "strict" | "accept-new" | "off"
-    known_hosts_file: "~/.ssh/known_hosts"
-
-    # TOFU (Trust On First Use)
-    tofu_prompt: true                   # show yes/no/once prompt for unknown hosts
 
 data_throttle:
   config:
