@@ -12,11 +12,13 @@ pub use egui_app::{UiOptions, repaint_delay};
 
 /// Thin input-policy wrapper around the established egui application.
 ///
-/// Keeping repeat filtering here means the terminal/paste routing in
-/// `egui_app.rs` remains untouched. The filter runs before the inner app sees
-/// the frame's egui input events.
+/// Keeping repeat policy here means the terminal/paste routing in
+/// `egui_app.rs` remains untouched. Host typematic is filtered before the
+/// inner app sees the frame, and optional ASR-paced repeat is synthesized at
+/// the same boundary.
 pub struct EguiApp {
     inner: egui_app::EguiApp,
+    repeat: repeat::RepeatController,
 }
 
 impl EguiApp {
@@ -31,6 +33,7 @@ impl EguiApp {
     ) -> Self {
         Self {
             inner: egui_app::EguiApp::new(creation_context, runtime, options),
+            repeat: repeat::RepeatController::default(),
         }
     }
 }
@@ -41,7 +44,7 @@ impl eframe::App for EguiApp {
     }
 
     fn logic(&mut self, context: &eframe::egui::Context, frame: &mut eframe::Frame) {
-        repeat::filter_host_repeat_events(context);
+        self.repeat.process(context);
         <egui_app::EguiApp as eframe::App>::logic(&mut self.inner, context, frame);
     }
 
