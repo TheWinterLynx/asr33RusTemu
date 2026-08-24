@@ -18,8 +18,10 @@ fn compare_python_and_rust(config_filename: &str, overrides: &[&str]) {
     let loaded = LoadedConfig::load(&cli).expect("shared YAML is valid in Rust");
     let mut rust_value =
         serde_json::to_value(&loaded.effective).expect("typed Rust config serializes to JSON");
-    // This Rust-only, serde-defaulted option is intentionally absent from the
-    // unchanged legacy YAML/Python model; every legacy field remains differential.
+    // These Rust-only, serde-defaulted options are intentionally absent from
+    // the unchanged legacy Python model; every remaining legacy field stays
+    // differential. SSH/backend selection is intentionally no longer part of
+    // the Rust surface and therefore is not exercised as a shared override.
     rust_value["terminal"]["config"]
         .as_object_mut()
         .expect("terminal config is an object")
@@ -60,14 +62,12 @@ fn strict_yaml_matches_python_without_overrides() {
 }
 
 #[test]
-fn default_yaml_with_all_cli_overrides_matches_python() {
+fn default_yaml_with_all_shared_cli_overrides_matches_python() {
     compare_python_and_rust(
         "asr33_config.yaml",
         &[
             "--frontend",
             "pygame",
-            "--backend",
-            "ssh",
             "--term_mode",
             "local",
             "--columns",
@@ -98,8 +98,6 @@ fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_python() {
         &[
             "--frontend",
             "tkinter",
-            "--backend",
-            "serial",
             "--term_mode",
             "line",
             "--columns",
@@ -120,6 +118,19 @@ fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_python() {
             "1",
         ],
     );
+}
+
+#[test]
+fn rust_cli_rejects_removed_backend_selection() {
+    let path = repository_root().join("asr33_config.yaml");
+    let result = ConfigCli::try_parse_from([
+        "asr33emu",
+        "--config",
+        path.to_str().expect("repository path is UTF-8"),
+        "--backend",
+        "ssh",
+    ]);
+    assert!(result.is_err(), "SSH/backend selection is intentionally gone");
 }
 
 #[test]
