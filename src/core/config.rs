@@ -392,7 +392,7 @@ impl Serialize for StopBits {
 }
 
 impl<'de> Deserialize<'de> for StopBits {
-    fn deserialize<D>(deserializer: D) -> Result<Self::Value, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
