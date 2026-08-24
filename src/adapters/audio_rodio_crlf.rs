@@ -5,15 +5,13 @@
 //! the mechanical sound state. CR+LF is treated as one carriage-return action
 //! for audio, matching RusTair: the CR one-shot is allowed to ring cleanly and
 //! an immediately following LF does not layer the platen sample on top of it.
+//!
+//! All bundled sound samples are compiled into the executable. Runtime audio
+//! never requires a sibling `sounds` directory or extracts temporary files.
 
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-
-#[cfg(windows)]
-use std::fs::{self, File};
-#[cfg(windows)]
-use std::path::{Path, PathBuf};
 
 use crate::core::config::LidState;
 use crate::core::terminal::CharacterEvent;
@@ -165,65 +163,39 @@ impl Drop for AudioEngine {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Debug)]
-struct LoadedSound {
-    stem: String,
-    path: PathBuf,
-}
-
-#[cfg(windows)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct SoundLibrary {
-    sounds: Vec<LoadedSound>,
+    sounds: &'static [(&'static str, &'static [u8])],
 }
 
 #[cfg(windows)]
 impl SoundLibrary {
-    fn load(directory: &Path) -> Result<Self, String> {
-        let entries = fs::read_dir(directory)
-            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
-        let mut paths = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| {
-                        value.eq_ignore_ascii_case("wav") || value.eq_ignore_ascii_case("mp3")
-                    })
-            })
-            .collect::<Vec<_>>();
-        paths.sort();
-        let sounds = paths
-            .into_iter()
-            .filter_map(|path| {
-                let stem = path.file_stem()?.to_str()?.to_owned();
-                Some(LoadedSound { stem, path })
-            })
-            .collect::<Vec<_>>();
-        if sounds.is_empty() {
-            return Err(format!("no audio files found in {}", directory.display()));
+    fn embedded() -> Self {
+        Self {
+            sounds: super::embedded_sounds::EMBEDDED_SOUNDS,
         }
-        Ok(Self { sounds })
     }
 
-    fn select(&self, lid: LidState, key: &str, variant: usize) -> Option<PathBuf> {
+    fn select(
+        &self,
+        lid: LidState,
+        key: &str,
+        variant: usize,
+    ) -> Option<(&'static str, &'static [u8])> {
         let prefix = format!("{}-{key}", lid_prefix(lid));
-        if let Some(exact) = self.sounds.iter().find(|sound| sound.stem == prefix) {
-            return Some(exact.path.clone());
+        if let Some(sound) = self.sounds.iter().find(|(stem, _)| *stem == prefix) {
+            return Some(*sound);
         }
         let variant_prefix = format!("{prefix}-");
         let matches = self
             .sounds
             .iter()
-            .filter(|sound| sound.stem.starts_with(&variant_prefix))
+            .filter(|(stem, _)| stem.starts_with(&variant_prefix))
             .collect::<Vec<_>>();
         if matches.is_empty() {
             return None;
         }
-        matches
-            .get(variant % matches.len())
-            .map(|sound| sound.path.clone())
+        matches.get(variant % matches.len()).map(|sound| **sound)
     }
 }
 
@@ -236,53 +208,15 @@ fn lid_prefix(lid: LidState) -> &'static str {
 }
 
 #[cfg(windows)]
-fn default_sound_directories() -> Vec<PathBuf> {
-    fn push_unique(directories: &mut Vec<PathBuf>, path: PathBuf) {
-        if !directories.contains(&path) {
-            directories.push(path);
-        }
-    }
-
-    let mut directories = Vec::new();
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-    {
-        push_unique(&mut directories, parent.join("sounds"));
-    }
-    if let Ok(current) = std::env::current_dir() {
-        push_unique(&mut directories, current.join("sounds"));
-    }
-    push_unique(
-        &mut directories,
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sounds"),
-    );
-    directories
-}
-
-#[cfg(windows)]
-fn load_default_library() -> Result<SoundLibrary, String> {
-    let mut errors = Vec::new();
-    for directory in default_sound_directories() {
-        match SoundLibrary::load(&directory) {
-            Ok(library) => return Ok(library),
-            Err(error) => errors.push(error),
-        }
-    }
-    Err(errors.join("; "))
-}
-
-#[cfg(windows)]
 mod platform {
     use std::collections::VecDeque;
+    use std::io::Cursor;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 
-    use super::{
-        AudioAvailability, AudioControl, AudioEvent, File, SoundLibrary, is_crlf_pair,
-        load_default_library,
-    };
+    use super::{AudioAvailability, AudioControl, AudioEvent, SoundLibrary, is_crlf_pair};
     use crate::core::audio::{
         AudioSnapshot, AudioStateMachine, ContinuousSound, EffectRequest, EffectSound,
         MOTOR_OFF_PLAY_TIME,
@@ -300,14 +234,7 @@ mod platform {
         lid: LidState,
         muted: bool,
     ) {
-        let library = match load_default_library() {
-            Ok(library) => library,
-            Err(error) => {
-                let _ = statuses.send(AudioAvailability::unavailable(error));
-                wait_for_shutdown(controls);
-                return;
-            }
-        };
+        let library = SoundLibrary::embedded();
         let mut output = match RodioOutput::open(&library, lid) {
             Ok(output) => output,
             Err(error) => {
@@ -525,11 +452,9 @@ mod platform {
             let sink = Sink::connect_new(self.stream.mixer());
             sink.set_volume(0.0);
             let variant = self.next_variant();
-            if let Some(path) = library.select(lid, key, variant) {
-                let file = File::open(&path)
-                    .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-                let source = Decoder::try_from(file)
-                    .map_err(|error| format!("cannot decode {}: {error}", path.display()))?;
+            if let Some((name, bytes)) = library.select(lid, key, variant) {
+                let source = Decoder::try_from(Cursor::new(bytes))
+                    .map_err(|error| format!("cannot decode embedded sound {name}: {error}"))?;
                 sink.append(source.repeat_infinite());
             }
             Ok(sink)
@@ -552,13 +477,11 @@ mod platform {
                 EffectSound::Lid => "lid",
             };
             let variant = self.next_variant();
-            let Some(path) = library.select(lid, key, variant) else {
+            let Some((name, bytes)) = library.select(lid, key, variant) else {
                 return Ok(());
             };
-            let file = File::open(&path)
-                .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-            let source = Decoder::try_from(file)
-                .map_err(|error| format!("cannot decode {}: {error}", path.display()))?;
+            let source = Decoder::try_from(Cursor::new(bytes))
+                .map_err(|error| format!("cannot decode embedded sound {name}: {error}"))?;
             let sink = Sink::connect_new(self.stream.mixer());
             sink.set_volume(volume);
 
@@ -663,5 +586,15 @@ mod tests {
             AudioAvailability::unavailable("no output device"),
             AudioAvailability::Unavailable("no output device".to_owned())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn embedded_sound_library_contains_both_lid_profiles() {
+        let library = SoundLibrary::embedded();
+        assert!(library.select(LidState::Up, "bell", 0).is_some());
+        assert!(library.select(LidState::Down, "bell", 0).is_some());
+        assert!(library.select(LidState::Up, "tape-reader", 0).is_some());
+        assert!(library.select(LidState::Down, "print-chars", 1).is_some());
     }
 }
