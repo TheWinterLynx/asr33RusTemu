@@ -7,67 +7,82 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  exact-clippy-fix:
-    name: Apply exact clippy fix to audit branch
+  windows-validation:
+    name: Windows Rust + Python parity gate
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout audit branch
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: agent/final-parity-audit
 
-      - name: Replace while-let lint exactly once
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python reference dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML pyserial pygame-ce pillow fonttools
+
+      - name: Set up stable Rust with rustfmt and clippy
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+
+      - name: Reject obsolete transport references
         shell: pwsh
         run: |
           @'
-          from pathlib import Path
+          import pathlib
+          import re
+          import subprocess
+          import sys
 
-          path = Path('src/adapters/audio_rodio_crlf.rs')
-          data = path.read_bytes()
-          nl = b'\r\n' if b'\r\n' in data else b'\n'
-
-          old_import = b'use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};'
-          new_import = b'use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};'
-          if data.count(old_import) != 1:
-              raise SystemExit(f'expected one TryRecvError import, found {data.count(old_import)}')
-          data = data.replace(old_import, new_import, 1)
-
-          old_lines = [
-              b'        loop {',
-              b'            match self.statuses.try_recv() {',
-              b'                Ok(status) => {',
-              b'                    self.availability = status.clone();',
-              b'                    changed = Some(status);',
-              b'                }',
-              b'                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,',
-              b'            }',
-              b'        }',
-          ]
-          new_lines = [
-              b'        while let Ok(status) = self.statuses.try_recv() {',
-              b'            self.availability = status.clone();',
-              b'            changed = Some(status);',
-              b'        }',
-          ]
-          old = nl.join(old_lines)
-          new = nl.join(new_lines)
-          if data.count(old) != 1:
-              raise SystemExit(f'expected one refresh_status loop, found {data.count(old)}')
-          data = data.replace(old, new, 1)
-          path.write_bytes(data)
+          excluded = {'.github/workflows/final-parity-validation.yml'}
+          pattern = re.compile(r'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh', re.IGNORECASE)
+          hits = []
+          for name in subprocess.check_output(['git', 'ls-files'], text=True).splitlines():
+              if name in excluded:
+                  continue
+              path = pathlib.Path(name)
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for line_number, line in enumerate(text.splitlines(), 1):
+                  if pattern.search(line):
+                      hits.append(f'{name}:{line_number}:{line}')
+          if hits:
+              print('\n'.join(hits))
+              sys.exit('Obsolete transport reference found in tracked product files.')
+          print('No obsolete transport references found.')
           '@ | python -
 
-      - name: Commit exact fix
+      - name: Rust formatting gate
+        run: cargo fmt --check
+
+      - name: Rust clippy gate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rust unit and integration tests
+        run: cargo test --all
+
+      - name: Python characterization oracle tests
+        run: python -m unittest discover -s tests -p "test_*characterization.py"
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Windows binary CLI smoke test
         shell: pwsh
-        run: |
-          git diff -- src/adapters/audio_rodio_crlf.rs
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/adapters/audio_rodio_crlf.rs
-          git commit -m 'Fix clippy while-let warning [skip ci]'
-          git push origin HEAD:agent/final-parity-audit
+        run: .\target\release\asr33emu.exe --help
