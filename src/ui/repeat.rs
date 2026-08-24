@@ -12,9 +12,9 @@ use crate::app::config_controller::keyboard_repeat_enabled;
 
 pub(super) fn filter_host_repeat_events(context: &egui::Context) {
     // This policy belongs to the ASR keyboard, not to Settings/COM/SSH text
-    // editors. egui keeps this flag true while a text-edit style widget owns
-    // keyboard input, so leave those events untouched.
-    if context.wants_keyboard_input() {
+    // editors. egui 0.36.1 exposes this integration-aware query under the
+    // `egui_wants_keyboard_input` name.
+    if context.egui_wants_keyboard_input() {
         return;
     }
 

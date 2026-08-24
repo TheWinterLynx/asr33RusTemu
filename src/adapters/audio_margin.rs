@@ -8,7 +8,7 @@
 use crate::core::config::LidState;
 use crate::core::terminal::CharacterEvent;
 
-pub use super::audio_rodio_crlf::{AudioAvailability, WavError};
+pub use super::audio_rodio_crlf::AudioAvailability;
 
 const LEGACY_AUDIO_BELL_COLUMN: usize = 62;
 const ASR33_MARGIN_BELL_POST_COLUMN: usize = 65;
