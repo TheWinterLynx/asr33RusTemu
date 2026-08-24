@@ -5,12 +5,14 @@
 //! consume them; forwarding those events fills the TX throttle and makes the
 //! machine keep typing after the physical key has been released.
 //!
-//! When Repeat is enabled we therefore track one held terminal key and create
-//! our own paced repeat events. There is an initial typematic delay, then at
-//! most one event per ASR character interval, with no catch-up burst after a
-//! delayed frame. Releasing the key cancels future repeats immediately. A
-//! character already in the mechanical/TX pipeline may still complete, just
-//! as an in-flight mechanical cycle would on real hardware.
+//! The real Model 33 has a REPT key: while REPT and another key are held, the
+//! selected character repeats at the machine cadence. Our Repeat ON control is
+//! treated as a latched REPT function. We therefore track one held terminal
+//! key and create our own paced repeat events at 10 cps. There is no host-style
+//! typematic burst and no catch-up after a delayed frame. Releasing the key
+//! cancels future repeats immediately. A character already in the mechanical/
+//! TX pipeline may still complete, just as an in-flight cycle would on the
+//! electromechanical machine.
 
 use std::time::Duration;
 
@@ -18,10 +20,10 @@ use eframe::egui;
 
 use crate::app::config_controller::keyboard_repeat_enabled;
 
-/// Convenience typematic delay. The real ASR-33 keyboard did not have the
-/// very fast PC typematic behaviour we get from Windows; a short deliberate
-/// delay also prevents accidental repeats while typing normally.
-const INITIAL_REPEAT_DELAY_SECONDS: f64 = 0.45;
+/// A Model 33 character cycle is 100 ms at 110 baud / 10 characters per
+/// second, so the first repeated character follows one normal character cycle
+/// after the initial keypress.
+const INITIAL_REPEAT_DELAY_SECONDS: f64 = 0.10;
 
 /// ASR-33 nominal print/transmit cadence: ten characters per second.
 const REPEAT_INTERVAL_SECONDS: f64 = 0.10;
@@ -272,7 +274,7 @@ mod tests {
         assert!(held.is_some());
 
         let mut release = vec![key(egui::Key::A, false, false)];
-        filter_and_track_events(&mut release, true, 3.2, &mut held);
+        filter_and_track_events(&mut release, true, 3.05, &mut held);
         assert!(held.is_none());
         assert_eq!(release.len(), 1);
     }
