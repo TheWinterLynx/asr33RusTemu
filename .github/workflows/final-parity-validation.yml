@@ -1,9 +1,9 @@
 name: Final parity validation
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/final-parity-audit
+      - master
   workflow_dispatch:
 
 permissions:
