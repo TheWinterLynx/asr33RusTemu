@@ -45,13 +45,31 @@ jobs:
       - name: Reject obsolete transport references
         shell: pwsh
         run: |
-          git grep -niE 'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh' -- . ':(exclude).github/workflows/final-parity-validation.yml'
-          if ($LASTEXITCODE -eq 0) {
-            throw 'Obsolete transport reference found in tracked product files.'
-          }
-          if ($LASTEXITCODE -ne 1) {
-            exit $LASTEXITCODE
-          }
+          @'
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          excluded = {'.github/workflows/final-parity-validation.yml'}
+          pattern = re.compile(r'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh', re.IGNORECASE)
+          hits = []
+          for name in subprocess.check_output(['git', 'ls-files'], text=True).splitlines():
+              if name in excluded:
+                  continue
+              path = pathlib.Path(name)
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for line_number, line in enumerate(text.splitlines(), 1):
+                  if pattern.search(line):
+                      hits.append(f'{name}:{line_number}:{line}')
+          if hits:
+              print('\n'.join(hits))
+              sys.exit('Obsolete transport reference found in tracked product files.')
+          print('No obsolete transport references found.')
+          '@ | python -
 
       - name: Rust formatting gate
         run: cargo fmt --check
