@@ -11,17 +11,47 @@ pub(super) const EMBEDDED_SOUNDS: &[(&str, &[u8])] = &[
     ("down-cr-02", include_bytes!("../../sounds/down-cr-02.wav")),
     ("down-cr-03", include_bytes!("../../sounds/down-cr-03.wav")),
     ("down-hum", include_bytes!("../../sounds/down-hum.wav")),
-    ("down-key-01", include_bytes!("../../sounds/down-key-01.wav")),
-    ("down-key-02", include_bytes!("../../sounds/down-key-02.wav")),
-    ("down-key-03", include_bytes!("../../sounds/down-key-03.wav")),
-    ("down-key-04", include_bytes!("../../sounds/down-key-04.wav")),
-    ("down-key-05", include_bytes!("../../sounds/down-key-05.wav")),
-    ("down-key-06", include_bytes!("../../sounds/down-key-06.wav")),
-    ("down-key-07", include_bytes!("../../sounds/down-key-07.wav")),
+    (
+        "down-key-01",
+        include_bytes!("../../sounds/down-key-01.wav"),
+    ),
+    (
+        "down-key-02",
+        include_bytes!("../../sounds/down-key-02.wav"),
+    ),
+    (
+        "down-key-03",
+        include_bytes!("../../sounds/down-key-03.wav"),
+    ),
+    (
+        "down-key-04",
+        include_bytes!("../../sounds/down-key-04.wav"),
+    ),
+    (
+        "down-key-05",
+        include_bytes!("../../sounds/down-key-05.wav"),
+    ),
+    (
+        "down-key-06",
+        include_bytes!("../../sounds/down-key-06.wav"),
+    ),
+    (
+        "down-key-07",
+        include_bytes!("../../sounds/down-key-07.wav"),
+    ),
     ("down-lid", include_bytes!("../../sounds/down-lid.wav")),
-    ("down-motor-off", include_bytes!("../../sounds/down-motor-off.wav")),
-    ("down-motor-on", include_bytes!("../../sounds/down-motor-on.wav")),
-    ("down-platen", include_bytes!("../../sounds/down-platen.wav")),
+    (
+        "down-motor-off",
+        include_bytes!("../../sounds/down-motor-off.wav"),
+    ),
+    (
+        "down-motor-on",
+        include_bytes!("../../sounds/down-motor-on.wav"),
+    ),
+    (
+        "down-platen",
+        include_bytes!("../../sounds/down-platen.wav"),
+    ),
     (
         "down-print-chars-01",
         include_bytes!("../../sounds/down-print-chars-01.wav"),
@@ -58,8 +88,14 @@ pub(super) const EMBEDDED_SOUNDS: &[(&str, &[u8])] = &[
     ("up-key-06", include_bytes!("../../sounds/up-key-06.wav")),
     ("up-key-07", include_bytes!("../../sounds/up-key-07.wav")),
     ("up-lid", include_bytes!("../../sounds/up-lid.wav")),
-    ("up-motor-off", include_bytes!("../../sounds/up-motor-off.wav")),
-    ("up-motor-on", include_bytes!("../../sounds/up-motor-on.wav")),
+    (
+        "up-motor-off",
+        include_bytes!("../../sounds/up-motor-off.wav"),
+    ),
+    (
+        "up-motor-on",
+        include_bytes!("../../sounds/up-motor-on.wav"),
+    ),
     ("up-platen", include_bytes!("../../sounds/up-platen.wav")),
     (
         "up-print-chars-01",
