@@ -1,88 +1,83 @@
-# Final parity and acceptance audit
+# Final migration and acceptance audit
 
-Branch: `agent/final-parity-audit`
+Branch: `agent/self-contained-exe`
 Base: `master`
 Primary target: Windows
 
-## Purpose
+## Status
 
-This is the closing validation for the Python-to-Rust migration. It distinguishes behavior that can be certified automatically from behavior that requires an interactive Windows machine or a real/virtual serial endpoint.
+The application migration is complete on this branch. The repository application and automated test suite are Rust-only; the former reference implementation and its test harness have been removed after compatibility expectations were frozen in native Rust tests.
 
-## Automated gate
+The Windows release executable has also been validated as a single-file deployment: it starts from an otherwise empty directory with its default configuration, Teletype33 font and ASR-33 sound samples embedded.
 
-The workflow `.github/workflows/final-parity-validation.yml` runs on `windows-latest` and requires all of the following to pass:
+## Local release gate
 
-- no tracked obsolete alternate-transport references;
+The required local gate is:
+
 - `cargo fmt --check`;
 - `cargo clippy --all-targets --all-features -- -D warnings`;
 - `cargo test --all`;
-- the retained Python characterization suite;
 - `cargo build --release`;
-- `asr33emu.exe --help` as a Windows release-binary smoke test.
+- launch a copied `asr33emu.exe` from an otherwise empty directory.
 
-## Python -> Rust parity matrix
+No hosted automation is required for this branch.
 
-| Area | Rust evidence | Status before CI |
+## Compatibility matrix
+
+| Area | Rust evidence | Status |
 | --- | --- | --- |
-| Serial-only product surface | typed Rust serial config and transport; obsolete transport grep gate | Covered |
-| Explicit Connect/Disconnect/Reconnect lifecycle | `AppRuntime::new_disconnected`, connection-state integration tests, explicit `SerialTransport::open` path | Covered |
-| Failed connect and retry | `connect_failure_disconnect_and_reconnect_do_not_stop_runtime` | Covered |
-| No stale TX after disconnect/reconnect | app pipeline disconnect/backpressure tests | Covered |
-| Terminal 7-bit behavior and parity masking | `tests/terminal_compat.rs`, keyboard tests | Covered |
-| CR/LF/BS/TAB/VT/FF behavior | terminal compatibility tests and app-pipeline return-mode tests | Covered |
+| Serial-only product surface | typed serial config and transport | Covered |
+| Explicit Connect/Disconnect/Reconnect | `AppRuntime::new_disconnected`, connection lifecycle tests | Covered |
+| Failed connect and retry | app pipeline connection-failure tests | Covered |
+| No stale TX after reconnect | app pipeline disconnect/backpressure tests | Covered |
+| Terminal 7-bit and parity masking | `tests/terminal_compat.rs` and keyboard tests | Covered |
+| CR/LF/BS/TAB/VT/FF | terminal and app-pipeline tests | Covered |
 | Autowrap, overstrike and scrollback | `tests/terminal_compat.rs` | Covered |
-| Printer enable/disable and forwarding | terminal/app pipeline tests | Covered |
-| LINE / LOCAL routing and mode changes | app pipeline FIFO/routing tests | Covered |
-| Throttled and unthrottled operation | throttle/core and app pipeline tests | Covered |
-| ASR REPT / host typematic suppression | `src/ui/repeat.rs` tests, 100 ms ASR cadence | Covered |
+| Printer state and forwarding | terminal/app pipeline tests | Covered |
+| Line / Local routing | app pipeline routing tests | Covered |
+| Throttled/unthrottled operation | throttle/core and app pipeline tests | Covered |
+| ASR REPT / typematic suppression | `src/ui/repeat.rs` tests | Covered |
 | Keyboard uppercase/parity/Return modes | `src/ui/keyboard.rs` and app pipeline tests | Covered |
-| Paper tape reader leader/trailer/autostop/MSB | `tests/paper_tape_compat.rs` and reader-feed pipeline tests | Covered |
-| Paper tape punch append/overwrite and forwarding | paper-tape compatibility and app pipeline tests | Covered |
-| Audio state: print/space/hum, CR/LF/bell, column bell | deterministic `src/core/audio.rs` tests | Covered |
-| Mute/lid/tape-reader/key effect state | deterministic audio state machine and egui integration | Covered |
-| Settings and YAML/CLI compatibility | Rust config tests plus retained Python differential config tests | Covered |
-| Custom `font_path` with bundled fallback | Rust UI font loader tests | Covered |
-| Release build on Windows | GitHub Actions gate | Pending CI |
+| Paper reader leader/trailer/autostop/MSB | `tests/paper_tape_compat.rs` and pipeline tests | Covered |
+| Punch append/overwrite | paper-tape compatibility and pipeline tests | Covered |
+| Audio state and margin bell | deterministic core audio tests plus audio adapter tests | Covered |
+| Mute/lid/tape-reader/key audio states | deterministic audio state and UI integration | Covered |
+| Settings and YAML/CLI | native config tests plus frozen final compatibility snapshot | Covered |
+| Custom font with bundled fallback | Rust UI font loader tests | Covered |
+| Embedded default configuration | startup config tests and standalone EXE acceptance | Covered |
+| Embedded font | compile-time `include_bytes!` plus standalone EXE acceptance | Covered |
+| Embedded sound library | compile-time WAV embedding and Windows adapter test | Covered |
+| Single-file Windows release | local isolated-directory acceptance | Covered |
 
-## Intentional differences from Python
+## Frozen configuration contract
 
-These are approved product/design decisions and are not parity defects:
+`tests/config_compat.rs` now contains the final characterized configuration snapshot directly in Rust. The test compares the entire shared configuration structure, with the native `input_return_mode` extension excluded from the historical snapshot by design.
 
-- Rust is serial-only; there is no alternate transport selector.
-- Rust starts disconnected and opens the configured serial endpoint only after explicit Connect/Reconnect.
-- Tkinter/Pygame implementation details are not preserved; egui is the native Rust frontend.
-- Rust configuration keeps parsed-file and effective configuration independently owned rather than reproducing Python's shallow-copy mutation artifact.
-- `input_return_mode` is a Rust-side extension and is excluded from the shared legacy configuration snapshot comparison.
+This preserves regression protection without executing any external reference runtime.
 
-## Windows acceptance
+## Intentional design decisions
 
-### Automatically certifiable in Actions
+- One serial transport; no transport selector.
+- Startup remains disconnected until explicit Connect/Reconnect.
+- The native egui frontend is the only frontend.
+- Parsed-file and effective configurations are independently owned.
+- `input_return_mode` is a native extension.
+- Default configuration, Teletype33 and all runtime sound samples are embedded into the Windows executable.
+- Explicit custom configuration files, custom fonts and paper tapes remain user-supplied external files.
 
-- release-mode compilation on Windows;
-- CLI startup/help path;
-- configuration parsing and validation;
-- terminal/keyboard/throttle/paper-tape behavior;
-- connection lifecycle using the transport abstraction;
-- serial settings conversion/platform code compilation;
-- deterministic audio behavior;
-- no obsolete alternate-transport references.
+## Interactive Windows acceptance
 
-### Requires one interactive Windows pass
+The following were accepted on a Windows workstation as the final deployment-level checks:
 
-GitHub-hosted runners do not provide a physical COM endpoint, an interactive desktop suitable for judging egui behavior, speakers, or an ASR-connected peer. The following therefore cannot honestly be certified by Actions:
+- release build succeeds;
+- single EXE launches from an empty directory;
+- embedded default configuration is used when no YAML exists;
+- bundled font renders without a sibling font file;
+- bundled sounds work without a sibling `sounds` directory;
+- Settings can persist `asr33_config.yaml` beside the executable and that file is read on the next launch.
 
-- select a real or virtual COM port in Settings and Connect;
-- verify bidirectional bytes against a second endpoint/device;
-- Disconnect and Reconnect the same port;
-- verify a nonexistent or busy port reports an error without terminating the emulator;
-- change baud/data/parity/stop settings and reconnect;
-- exercise F1-F9, scrolling, right-click paste and REPT interactively;
-- load/run/rewind paper tape and create a punch file from the GUI;
-- audibly verify key, print, CR/LF, bell, lid, motor and tape-reader sounds;
-- visually verify configured custom font and bundled-font fallback.
-
-This residual checklist is an environmental acceptance test, not missing migration code.
+Serial hardware/virtual-COM behaviour should still be exercised whenever serial lifecycle code changes, because it depends on an actual Windows endpoint.
 
 ## Closure criterion
 
-Points 1 and 2 are complete when the Windows CI gate is green and this matrix has no unexplained gaps. Point 3 is complete to the maximum extent possible in CI when the release binary and all lifecycle/core tests pass; full physical/visual/audio acceptance requires the short interactive checklist above on a Windows workstation.
+Migration closure is reached when the Rust-only tree passes the local release gate after removal of the reference files. Any future changes are normal product maintenance rather than migration work.
