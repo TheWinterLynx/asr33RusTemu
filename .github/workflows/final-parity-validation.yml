@@ -1,6 +1,9 @@
 name: Final parity validation
 
 on:
+  push:
+    branches:
+      - agent/final-parity-audit
   pull_request:
     branches:
       - master
