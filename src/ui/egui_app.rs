@@ -6,7 +6,10 @@ use eframe::egui::{self, Align2, FontData, FontDefinitions, FontFamily, FontId};
 use crate::adapters::audio::{AudioAvailability, AudioEngine};
 use crate::adapters::paper_tape::{PunchFile, load_reader_file};
 use crate::adapters::transport::serial::SerialTransport;
-use crate::app::config_controller::{ConfigChangePlan, SettingsState, serial_reconnect_required};
+use crate::app::config_controller::{
+    ConfigChangePlan, SettingsState, keyboard_repeat_enabled, serial_reconnect_required,
+    set_keyboard_repeat_enabled,
+};
 use crate::app::paper_tape::{FeedResult, READER_FEED_INTERVAL, ReaderFeed};
 use crate::app::{
     AppRuntime, ConnectionState, ImmediateTransmit, PumpStatus, RuntimeEvent, Scheduler,
@@ -802,6 +805,16 @@ impl EguiApp {
                     self.reader.set_return_mode(mode);
                 }
             }
+            ui.label("Repeat");
+            let repeat_enabled = keyboard_repeat_enabled();
+            if ui
+                .button(if repeat_enabled { "ON" } else { "OFF" })
+                .on_hover_text("Allow a held ASR-33 key to repeat; default is OFF")
+                .clicked()
+            {
+                set_keyboard_repeat_enabled(!repeat_enabled);
+                ui.ctx().request_repaint();
+            }
             ui.label(column_status_label(
                 self.runtime.terminal().cursor_position().0,
                 self.runtime.terminal().width(),
@@ -1225,10 +1238,10 @@ impl EguiApp {
             let follow =
                 ui.selectable_label(follows_reader, "Follow")
                     .on_hover_text(if follows_reader {
-                        "Viewport follows the read head; click for free inspection"
-                    } else {
-                        "Free tape inspection; reader position is unchanged; click to follow"
-                    });
+                    "Viewport follows the read head; click for free inspection"
+                } else {
+                    "Free tape inspection; reader position is unchanged; click to follow"
+                });
             if follow.clicked() {
                 if follows_reader {
                     self.reader_view.inspect_manually();
@@ -2017,7 +2030,7 @@ mod tests {
             explicit,
             (
                 Vec::new(),
-                Some("port enumeration failed: enumeration unavailable".to_owned())
+                Some("port enumeration failed: {error}".replace("{error}", "enumeration unavailable"))
             )
         );
     }
