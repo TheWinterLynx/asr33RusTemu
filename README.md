@@ -18,6 +18,7 @@
 * YAML configuration plus command-line overrides.
 * Teletype33.ttf font, with optional custom TTF/OTF loading in the Rust target.
 * The Rust application starts disconnected; a configured serial port is opened only after an explicit Connect/Reconnect action.
+* Windows release builds are single-file deployments: bundled sounds, Teletype33 and the default YAML configuration are compiled into `asr33emu.exe`, and the MSVC CRT is statically linked.
 
 ***
 
@@ -29,7 +30,9 @@ From the project directory:
 cargo run --release
 ```
 
-The Rust target uses the serial configuration in `asr33_config.yaml`. Use the Settings screen to select the COM/tty port and serial parameters, then connect explicitly.
+The Rust target uses `asr33_config.yaml` when that file exists. If it is absent, the executable automatically uses its embedded default configuration, so `target/release/asr33emu.exe` can be copied by itself to an empty directory and started there. Saving Settings creates/updates `asr33_config.yaml`; an explicit `--config filename.yaml` still selects a user-supplied configuration file.
+
+The bundled ASR-33 sound samples and Teletype33 font are read directly from the executable at runtime. A sibling `sounds` directory or font file is not required. Paper tapes and an explicitly selected custom `font_path` remain normal user files by design.
 
 Recommended validation commands:
 
@@ -37,7 +40,10 @@ Recommended validation commands:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
+cargo build --release
 ```
+
+A useful standalone deployment check on Windows is to copy only `target\release\asr33emu.exe` into an otherwise empty directory and launch it. The program should start with its embedded defaults and bundled audio.
 
 ***
 
