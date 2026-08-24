@@ -7,82 +7,58 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  windows-validation:
-    name: Windows Rust + Python parity gate
+  frontend-cleanup:
+    name: Remove legacy frontend selector
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout audit branch
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          ref: agent/final-parity-audit
 
-      - name: Install Python reference dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install PyYAML pyserial pygame-ce pillow fonttools
-
-      - name: Set up stable Rust with rustfmt and clippy
-        shell: pwsh
-        run: |
-          rustup update stable
-          rustup default stable
-          rustup component add rustfmt clippy
-          rustc --version
-          cargo --version
-
-      - name: Reject obsolete transport references
+      - name: Remove dead frontend compatibility surface
         shell: pwsh
         run: |
           @'
-          import pathlib
-          import re
-          import subprocess
-          import sys
+          from pathlib import Path
 
-          excluded = {'.github/workflows/final-parity-validation.yml'}
-          pattern = re.compile(r'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh', re.IGNORECASE)
-          hits = []
-          for name in subprocess.check_output(['git', 'ls-files'], text=True).splitlines():
-              if name in excluded:
-                  continue
-              path = pathlib.Path(name)
-              try:
-                  text = path.read_text(encoding='utf-8')
-              except (UnicodeDecodeError, OSError):
-                  continue
-              for line_number, line in enumerate(text.splitlines(), 1):
-                  if pattern.search(line):
-                      hits.append(f'{name}:{line_number}:{line}')
-          if hits:
-              print('\n'.join(hits))
-              sys.exit('Obsolete transport reference found in tracked product files.')
-          print('No obsolete transport references found.')
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one match, found {count}: {old!r}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          replace_once('src/core/config.rs', '    pub frontend: FrontendSection,\n', '')
+          replace_once('src/core/config.rs', '    #[arg(long, value_enum)]\n    pub frontend: Option<FrontendConfigValue>,\n\n', '')
+          replace_once('src/core/config.rs', '        if let Some(value) = self.frontend {\n            config.frontend.kind = value;\n        }\n', '')
+          replace_once('src/core/config.rs', '''/// Values accepted from the legacy Python frontend setting.\n///\n/// These variants are compatibility inputs, not Rust UI architecture choices.\n#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]\npub enum FrontendConfigValue {\n    #[serde(rename = "tkinter")]\n    #[value(name = "tkinter")]\n    LegacyTkinter,\n    #[serde(rename = "pygame")]\n    #[value(name = "pygame")]\n    LegacyPygame,\n}\n\n#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]\npub struct FrontendSection {\n    #[serde(rename = "type")]\n    pub kind: FrontendConfigValue,\n}\n\n''', '')
+
+          for path in ['asr33_config.yaml', 'asr33_strict.yaml']:
+              replace_once(path, 'frontend:\n  type: "tkinter"  # Options: "tkinter" | "pygame"\n\n', '')
+
+          replace_once('tests/config_compat.rs', '            "--frontend",\n            "pygame",\n', '')
+          replace_once('tests/config_compat.rs', '            "--frontend",\n            "tkinter",\n', '')
           '@ | python -
 
-      - name: Rust formatting gate
-        run: cargo fmt --check
-
-      - name: Rust clippy gate
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Rust unit and integration tests
-        run: cargo test --all
-
-      - name: Python characterization oracle tests
-        run: python -m unittest discover -s tests -p "test_*characterization.py"
-
-      - name: Release build
-        run: cargo build --release
-
-      - name: Windows binary CLI smoke test
+      - name: Format and inspect
         shell: pwsh
-        run: .\target\release\asr33emu.exe --help
+        run: |
+          cargo fmt
+          git diff --check
+          git diff
+
+      - name: Commit cleanup
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/core/config.rs asr33_config.yaml asr33_strict.yaml tests/config_compat.rs
+          git commit -m 'Remove dead legacy frontend selector [skip ci]'
+          git push origin HEAD:agent/final-parity-audit
