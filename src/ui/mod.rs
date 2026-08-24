@@ -111,7 +111,7 @@ mod tests {
         assert!(install_custom_terminal_font(&context, &missing).is_err());
 
         let empty = dir.path().join("empty.ttf");
-        std::fs::write(&empty, []).expect("empty fixture");
+        std::fs::write(&empty, b"").expect("empty fixture");
         assert!(install_custom_terminal_font(&context, &empty).is_err());
     }
 
