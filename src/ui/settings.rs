@@ -541,6 +541,15 @@ fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     );
     row(
         ui,
+        "Key repeat",
+        "Allows the host operating system to repeat a held key. Disabled by default to match the ASR-33 keyboard unless repeat is explicitly enabled.",
+        ChangeClass::Live,
+        |ui| {
+            ui.checkbox(&mut t.keyboard_repeat, "");
+        },
+    );
+    row(
+        ui,
         "Input return",
         "Controls how keyboard Return and paper-tape line endings are emitted.",
         ChangeClass::Live,
