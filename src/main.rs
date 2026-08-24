@@ -5,8 +5,7 @@ use std::process::ExitCode;
 use asr33emu::adapters::transport::serial::SerialTransport;
 use asr33emu::app::{AppRuntime, SystemScheduler};
 use asr33emu::core::config::{
-    AppConfig, BackendKind, ConfigCli, LoadedConfig, TerminalMode,
-    ThrottleMode as ConfigThrottleMode,
+    AppConfig, ConfigCli, LoadedConfig, TerminalMode, ThrottleMode as ConfigThrottleMode,
 };
 use asr33emu::core::events::{ApplicationCommand, CommunicationMode, ThrottleMode};
 use asr33emu::core::terminal::TerminalOptions;
@@ -44,15 +43,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let tape_reader = config.tape_reader.config.clone();
     let tape_punch = config.tape_punch.config.clone();
     let font_size = terminal_config.font_size as f32;
-    let backend_label = match config.backend.kind {
-        BackendKind::Serial => "serial",
-        BackendKind::Ssh => "SSH unavailable",
-    }
-    .to_owned();
     let initial_commands =
         initial_commands(&config, communication_mode, throttle_mode, printer_enabled);
 
     let serial_config = config.backend.serial_config.clone();
+    // Deliberate policy: configuration describes the desired serial port, but
+    // startup never opens it. A physical/virtual COM port is opened only after
+    // the user explicitly presses Connect. This prevents a missing or busy port
+    // from making the emulator itself fail to start.
     let mut runtime = AppRuntime::<SerialTransport, _>::new_disconnected(
         SystemScheduler::new(),
         terminal_options,
@@ -63,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let ui_options = UiOptions {
         title: "ASR-33 Teletype Emulator".to_owned(),
-        backend_label,
+        backend_label: "serial".to_owned(),
         font_size,
         keyboard,
         communication_mode,
@@ -72,7 +70,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         tape_reader,
         tape_punch,
         serial_config,
-        backend_kind: config.backend.kind,
         config_path: cli.config,
         disk_config: loaded.file,
         applied_config: config,
