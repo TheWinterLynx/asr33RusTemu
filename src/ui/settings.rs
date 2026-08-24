@@ -459,7 +459,6 @@ fn general(
     ))
     .on_hover_cursor(egui::CursorIcon::Help)
     .on_hover_text("Legacy frontend selection from Python. The Rust application always uses egui.");
-    ui.weak("Rust target: serial only. SSH is intentionally out of scope.");
 }
 fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let t = &mut c.terminal.config;
@@ -978,11 +977,5 @@ mod tests {
         assert_eq!(settings.request_close(false), Some(SettingsAction::Close));
         current.show_terminal();
         assert_eq!(current, AppView::Terminal);
-    }
-
-    #[test]
-    fn navigation_has_no_ssh_page() {
-        assert_eq!(pages().len(), 7);
-        assert!(pages().iter().all(|(_, label)| *label != "SSH"));
     }
 }
