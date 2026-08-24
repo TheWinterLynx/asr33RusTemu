@@ -16,7 +16,6 @@ pub enum SettingsPage {
     TapeReader,
     TapePunch,
     Sound,
-    Ssh,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -321,7 +320,6 @@ impl SettingsView {
             SettingsPage::TapeReader => tape_reader(ui, metrics, &mut state.draft_config),
             SettingsPage::TapePunch => tape_punch(ui, metrics, &mut state.draft_config),
             SettingsPage::Sound => sound(ui, metrics, &mut state.draft_config),
-            SettingsPage::Ssh => ssh(ui, metrics, &mut state.draft_config),
         }
     }
 }
@@ -355,7 +353,7 @@ fn apply_settings_style(ui: &mut egui::Ui, metrics: SettingsUiMetrics) {
     ui.set_style(style);
 }
 
-fn pages() -> [(SettingsPage, &'static str); 8] {
+fn pages() -> [(SettingsPage, &'static str); 7] {
     [
         (SettingsPage::General, "General"),
         (SettingsPage::Terminal, "Terminal"),
@@ -364,7 +362,6 @@ fn pages() -> [(SettingsPage, &'static str); 8] {
         (SettingsPage::TapeReader, "Tape Reader"),
         (SettingsPage::TapePunch, "Tape Punch"),
         (SettingsPage::Sound, "Sound"),
-        (SettingsPage::Ssh, "SSH"),
     ]
 }
 fn badge(ui: &mut egui::Ui, class: ChangeClass) {
@@ -372,7 +369,6 @@ fn badge(ui: &mut egui::Ui, class: ChangeClass) {
         ChangeClass::Live => ("LIVE", "Applies to the current session"),
         ChangeClass::Reconnect => ("RECONNECT", "Requires an explicit serial reconnect"),
         ChangeClass::Restart => ("RESTART", "Takes effect after restarting the application"),
-        ChangeClass::Unavailable => ("N/A", "Stored for compatibility; not implemented yet"),
         ChangeClass::Legacy => ("LEGACY", "Legacy compatibility input"),
     };
     ui.label(egui::RichText::new(short).monospace().weak())
@@ -434,15 +430,6 @@ fn optional_path(ui: &mut egui::Ui, value: &mut Option<std::path::PathBuf>) {
         *value = (!text.trim().is_empty()).then(|| text.into());
     }
 }
-fn optional_text(ui: &mut egui::Ui, value: &mut Option<String>, password: bool) {
-    let mut text = value.clone().unwrap_or_default();
-    if ui
-        .add(egui::TextEdit::singleline(&mut text).password(password))
-        .changed()
-    {
-        *value = (!text.is_empty()).then_some(text);
-    }
-}
 
 fn general(
     ui: &mut egui::Ui,
@@ -480,7 +467,7 @@ fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     row(
         ui,
         "Communication",
-        "LINE uses the external connection. LOCAL loops input back to the emulated terminal.",
+        "LINE uses the serial connection. LOCAL loops input back to the emulated terminal.",
         ChangeClass::Live,
         |ui| {
             ui.selectable_value(&mut t.mode, TerminalMode::Line, "LINE");
@@ -600,7 +587,7 @@ fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     row(
         ui,
         "Font path",
-        "Path to the font used to render terminal text.",
+        "Optional TTF/OTF file loaded at startup; empty uses bundled Teletype33.ttf.",
         ChangeClass::Restart,
         |ui| optional_path(ui, &mut t.font_path),
     );
@@ -617,11 +604,11 @@ fn terminal(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     row(
         ui,
         "Send CR at startup",
-        "Sends one literal carriage return when the first LINE connection of a new session is established.",
+        "Sends one literal carriage return when the first explicit LINE connection of a new session is established.",
         ChangeClass::Restart,
         |ui| {
             ui.checkbox(&mut t.send_cr_at_startup, "")
-                .on_hover_text("Takes effect on the next application session");
+                .on_hover_text("Takes effect on the next application session; the serial port still opens only after Connect");
         },
     );
 }
@@ -634,6 +621,7 @@ fn connection(
     active_serial: Option<&SerialConfig>,
 ) {
     ui.heading("Connection");
+    ui.weak("Serial-only target: the configured port is opened only after explicit Connect/Reconnect.");
     section(ui, metrics, "Status");
     ui.label(if connected {
         "Connected"
@@ -727,17 +715,6 @@ fn connection(
             ] {
                 ui.selectable_value(&mut s.stopbits, x, n);
             }
-        },
-    );
-    section(ui, metrics, "Backend");
-    row(
-        ui,
-        "Backend type",
-        "Selects the external backend. Serial is available; SSH is not migrated yet.",
-        ChangeClass::Unavailable,
-        |ui| {
-            ui.selectable_value(&mut c.backend.kind, BackendKind::Serial, "Serial");
-            ui.selectable_value(&mut c.backend.kind, BackendKind::Ssh, "SSH (not migrated)");
         },
     );
 }
@@ -930,119 +907,6 @@ fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
         |ui| {
             ui.selectable_value(&mut s.mute_state, MuteState::Muted, "Muted");
             ui.selectable_value(&mut s.mute_state, MuteState::Unmuted, "Unmuted");
-        },
-    );
-}
-fn ssh(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
-    let s = &mut c.backend.ssh_config;
-    ui.heading("SSH");
-    ui.colored_label(
-        ui.visuals().warn_fg_color,
-        "SSH backend not migrated yet; values can be safely persisted.",
-    );
-    section(ui, metrics, "Connection");
-    row(
-        ui,
-        "Host",
-        "Hostname or IP address of the SSH server.",
-        ChangeClass::Unavailable,
-        |ui| {
-            ui.text_edit_singleline(&mut s.host);
-        },
-    );
-    row(
-        ui,
-        "Port",
-        "TCP port used by SSH, normally 22.",
-        ChangeClass::Unavailable,
-        |ui| {
-            ui.add(egui::DragValue::new(&mut s.port).range(1..=u16::MAX));
-        },
-    );
-    row(
-        ui,
-        "Username",
-        "Username used to authenticate to the SSH server.",
-        ChangeClass::Unavailable,
-        |ui| {
-            ui.text_edit_singleline(&mut s.username);
-        },
-    );
-    section(ui, metrics, "Authentication");
-    row(
-        ui,
-        "Key file",
-        "Path to the private key used for SSH public-key authentication.",
-        ChangeClass::Unavailable,
-        |ui| optional_path(ui, &mut s.key_filename),
-    );
-    row(
-        ui,
-        "Password",
-        "Password used to authenticate to the SSH server when password authentication is enabled.",
-        ChangeClass::Unavailable,
-        |ui| {
-            optional_text(ui, &mut s.password, true);
-        },
-    );
-    row(
-        ui,
-        "Use agent",
-        "Allows authentication through the user's SSH authentication agent.",
-        ChangeClass::Unavailable,
-        |ui| {
-            ui.checkbox(&mut s.use_agent, "");
-        },
-    );
-    section(ui, metrics, "Host verification");
-    row(
-        ui,
-        "Policy",
-        "Controls how unknown or changed SSH host keys are handled.",
-        ChangeClass::Unavailable,
-        |ui| {
-            for (x, n) in [
-                (HostKeyPolicy::Strict, "Strict"),
-                (HostKeyPolicy::AcceptNew, "Accept new"),
-                (HostKeyPolicy::Off, "Off"),
-            ] {
-                let help = match x {
-                    HostKeyPolicy::Strict => {
-                        "Requires a matching key already present in known hosts."
-                    }
-                    HostKeyPolicy::AcceptNew => {
-                        "Accepts new host keys but rejects changed known keys."
-                    }
-                    HostKeyPolicy::Off => "Disables known-host verification.",
-                };
-                ui.selectable_value(&mut s.host_key_policy, x, n)
-                    .on_hover_text(help);
-            }
-        },
-    );
-    row(
-        ui,
-        "Expected fingerprint",
-        "Optional expected SSH host-key fingerprint used to verify the remote server.",
-        ChangeClass::Unavailable,
-        |ui| {
-            optional_text(ui, &mut s.expected_fingerprint, false);
-        },
-    );
-    row(
-        ui,
-        "Known hosts",
-        "Path to the known-hosts file used for SSH host-key verification.",
-        ChangeClass::Unavailable,
-        |ui| path(ui, &mut s.known_hosts_file),
-    );
-    row(
-        ui,
-        "TOFU prompt",
-        "Stores whether first-use host keys should require confirmation once SSH is migrated.",
-        ChangeClass::Unavailable,
-        |ui| {
-            ui.checkbox(&mut s.tofu_prompt, "");
         },
     );
 }

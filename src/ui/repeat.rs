@@ -66,7 +66,7 @@ pub(super) struct RepeatController {
 
 impl RepeatController {
     pub(super) fn process(&mut self, context: &egui::Context) {
-        // Repeat belongs to the ASR keyboard, not to Settings/COM/SSH text
+        // Repeat belongs to the ASR keyboard, not to Settings/serial text
         // editors. Native text editors retain the host's normal typematic.
         if context.egui_wants_keyboard_input() {
             self.held = None;

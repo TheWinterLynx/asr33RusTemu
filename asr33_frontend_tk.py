@@ -22,7 +22,6 @@ from typing import Any, cast
 from fontTools.ttLib import TTFont, TTLibError
 
 from asr33_config import ASR33Config
-from asr33_backend_ssh import SSHV2Backend
 from asr33_backend_serial import SerialBackend
 from asr33_terminal import Terminal
 from asr33_shim_throttle import DataThrottle
@@ -955,25 +954,14 @@ if __name__ == "__main__":
     cfg_data = _config.get_merged_config()
     # Initialize selections as None placeholders first.
     #pylint: disable=invalid-name
-    comm_backend_selection = None
     data_throttle = None
     term_selection = None
     frontend_selection = None
 
-    # Comm backend selection: SSHV2 or Serial
-    backend_type = cfg_data.backend.get("type", default="serial")
-    if backend_type == "ssh":
-        comm_backend_selection = SSHV2Backend(
-            upper_layer=None,
-            config=cfg_data.backend.ssh_config
-        )
-    elif backend_type == "serial": # Serial backend
-        comm_backend_selection = SerialBackend(
-            upper_layer=None,
-            config=cfg_data.backend.serial_config
-        )
-    else:
-        raise ValueError(f"Unsupported backend type: {backend_type}")
+    comm_backend_selection = SerialBackend(
+        upper_layer=None,
+        config=cfg_data.backend.serial_config
+    )
 
     # Comm backend feeds data to DataThrottle, which feeds data to Terminal
     data_throttle = DataThrottle(
