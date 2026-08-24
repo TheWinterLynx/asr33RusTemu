@@ -4,12 +4,14 @@ from typing import Any
 import argparse
 import yaml
 
+
 class ConfigNode:
     """
     Lightweight wrapper that allows attribute-style access to dictionaries.
     Example:
         config.sound.config.lid.upper()
     """
+
     def __init__(self, data):
         self._data = data
 
@@ -35,11 +37,12 @@ class ConfigNode:
 
 class ASR33Config:
     """Class to load and manage ASR-33 configuration."""
+
     def __init__(self, description: str = "Command line options"):
         self.args = self.parse_args(description)
         config_path = self.args.config if self.args.config else "asr33_config.yaml"
         # Load YAML
-        with open(config_path, 'r', encoding="utf-8") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
 
         # Merge CLI args
@@ -57,12 +60,8 @@ class ASR33Config:
             help="Path to custom YAML config file"
         )
         parser.add_argument(
-            "--frontend",choices=["pygame", "tkinter"],
+            "--frontend", choices=["pygame", "tkinter"],
             help="Frontend type"
-        )
-        parser.add_argument(
-            "--backend", choices=["serial", "ssh"],
-            help="Backend type"
         )
         parser.add_argument(
             "--term_mode", choices=["line", "local"],
@@ -98,7 +97,7 @@ class ASR33Config:
             help="Serial backend: number of data bits"
         )
         parser.add_argument(
-            "--parity", type=str, choices=['N', 'E', 'O', 'M', "S"],
+            "--parity", type=str, choices=["N", "E", "O", "M", "S"],
             help="Serial backend: parity: N=None, E=Even, O=Odd, M=Mark, S=Space"
         )
         parser.add_argument(
@@ -114,10 +113,9 @@ class ASR33Config:
         if self.args is None:
             return merged
 
-        # Normal CLI → config path overrides
+        # Normal CLI -> config path overrides
         normal_overrides = {
             "frontend": ("frontend", "type"),
-            "backend": ("backend", "type"),
             "term_mode": ("terminal", "config", "mode"),
             "columns": ("terminal", "config", "columns"),
             "rows": ("terminal", "config", "rows"),
@@ -164,7 +162,7 @@ class ASR33Config:
                     d = merged
                     for key in p[:-1]:
                         d = d[key]
-                    d[p[-1]] = fixed_value
+                    d[path[-1]] = fixed_value
 
         return merged
 
