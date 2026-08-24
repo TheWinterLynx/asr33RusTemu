@@ -2,7 +2,7 @@
 //!
 //! The deterministic terminal reports the post-character carriage column.
 //! RusTair rings the warning bell eight positions before the 72-column edge
-//! and plays a carriage-return effect when automatic wrap completes.  Keep
+//! and plays a carriage-return effect when automatic wrap completes. Keep
 //! those policy details here so the rodio mixer itself remains untouched.
 
 use crate::core::config::LidState;
@@ -29,17 +29,19 @@ impl AudioEngine {
         let printable = (' '..='~').contains(&event.character);
 
         // The old standalone audio state had a fixed post-character bell at
-        // column 62. Suppress only that audio-only trigger; terminal state and
-        // transmitted bytes are untouched.
+        // column 62 and applied it to every character event. Suppress that
+        // audio-only trigger; terminal state and transmitted bytes are
+        // untouched. Explicit BEL still rings because its character remains
+        // BEL when forwarded.
         let mut forwarded = event;
-        if printable && forwarded.column == LEGACY_AUDIO_BELL_COLUMN {
+        if forwarded.column == LEGACY_AUDIO_BELL_COLUMN {
             forwarded.column = LEGACY_AUDIO_BELL_COLUMN.saturating_sub(1);
         }
         self.inner.character(forwarded);
 
         // RusTair checks column == width - 8 before printing. With the
         // standalone's post-character event semantics, a 72-column page
-        // therefore rings after the character advances the carriage to 65.
+        // therefore rings on the character that advances the carriage to 65.
         if printable && event.column == ASR33_MARGIN_BELL_POST_COLUMN {
             self.inner.character(CharacterEvent {
                 character: '\u{7}',
