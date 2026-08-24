@@ -293,9 +293,8 @@ impl AudioStateMachine {
     fn advance(&mut self, now: Duration) {
         if let Some(fade) = self.continuous_fade {
             let progress = fade_progress(now, fade.start, fade.duration);
-            self.continuous_gains = std::array::from_fn(|index| {
-                lerp(fade.from[index], fade.to[index], progress)
-            });
+            self.continuous_gains =
+                std::array::from_fn(|index| lerp(fade.from[index], fade.to[index], progress));
             if progress >= 1.0 {
                 self.continuous_gains = self.continuous_targets;
                 self.continuous_fade = None;
@@ -339,13 +338,19 @@ mod tests {
     fn printable_and_space_activity_select_legacy_continuous_loops() {
         let mut audio = AudioStateMachine::new(LidState::Up, false, Duration::ZERO);
         audio.process_character(event('A', 1), Duration::ZERO);
-        assert_eq!(audio.current_continuous(), Some(ContinuousSound::PrintChars));
+        assert_eq!(
+            audio.current_continuous(),
+            Some(ContinuousSound::PrintChars)
+        );
         let snapshot = audio.snapshot(STATE_FADE_DURATION);
         assert_near(snapshot.print_chars_gain, 1.0);
         assert_near(snapshot.print_spaces_gain, 0.0);
 
         audio.process_character(event(' ', 2), STATE_FADE_DURATION);
-        assert_eq!(audio.current_continuous(), Some(ContinuousSound::PrintSpaces));
+        assert_eq!(
+            audio.current_continuous(),
+            Some(ContinuousSound::PrintSpaces)
+        );
         let snapshot = audio.snapshot(STATE_FADE_DURATION * 2);
         assert_near(snapshot.print_chars_gain, 0.0);
         assert_near(snapshot.print_spaces_gain, 1.0);
@@ -357,7 +362,10 @@ mod tests {
         audio.process_character(event('\r', COLUMN_BELL_COLUMN), Duration::ZERO);
         audio.process_character(event('\n', 0), Duration::from_millis(1));
         audio.process_character(event('\u{7}', 0), Duration::from_millis(2));
-        assert_eq!(audio.take_next_effect().unwrap().sound, EffectSound::CarriageReturn);
+        assert_eq!(
+            audio.take_next_effect().unwrap().sound,
+            EffectSound::CarriageReturn
+        );
         assert_eq!(audio.take_next_effect().unwrap().sound, EffectSound::Bell);
         assert_eq!(audio.take_next_effect().unwrap().sound, EffectSound::Platen);
         assert_eq!(audio.take_next_effect().unwrap().sound, EffectSound::Bell);
@@ -368,7 +376,10 @@ mod tests {
         let mut audio = AudioStateMachine::new(LidState::Down, false, Duration::ZERO);
         audio.process_character(event('X', 1), Duration::ZERO);
         audio.tick(INACTIVITY_TIMEOUT - Duration::from_millis(1));
-        assert_eq!(audio.current_continuous(), Some(ContinuousSound::PrintChars));
+        assert_eq!(
+            audio.current_continuous(),
+            Some(ContinuousSound::PrintChars)
+        );
         audio.tick(INACTIVITY_TIMEOUT);
         assert_eq!(audio.current_continuous(), Some(ContinuousSound::Hum));
         let snapshot = audio.snapshot(INACTIVITY_TIMEOUT + INACTIVITY_FADE_DURATION);
@@ -383,7 +394,10 @@ mod tests {
             let now = Duration::from_millis(index * 100);
             audio.process_character(event('A', index as usize + 1), now);
             audio.tick(now + Duration::from_millis(99));
-            assert_eq!(audio.current_continuous(), Some(ContinuousSound::PrintChars));
+            assert_eq!(
+                audio.current_continuous(),
+                Some(ContinuousSound::PrintChars)
+            );
         }
     }
 

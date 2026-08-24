@@ -383,8 +383,10 @@ mod platform {
                             }
                         },
                         Ok(AudioEvent::Keypress) => state.keypress(now),
-                        Err(std::sync::mpsc::TryRecvError::Empty
-                        | std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        Err(
+                            std::sync::mpsc::TryRecvError::Empty
+                            | std::sync::mpsc::TryRecvError::Disconnected,
+                        ) => break,
                     }
                 }
             }
@@ -436,8 +438,9 @@ mod platform {
 
     impl RodioOutput {
         fn open(library: &SoundLibrary, lid: LidState) -> Result<Self, String> {
-            let stream = OutputStreamBuilder::open_default_stream()
-                .map_err(|error| format!("rodio could not open the default output device: {error}"))?;
+            let stream = OutputStreamBuilder::open_default_stream().map_err(|error| {
+                format!("rodio could not open the default output device: {error}")
+            })?;
             let mut output = Self {
                 continuous: ContinuousChannels {
                     chars: Sink::connect_new(stream.mixer()),
@@ -464,7 +467,9 @@ mod platform {
                 self.reload_continuous(library, snapshot.lid)?;
             }
             self.continuous.chars.set_volume(snapshot.print_chars_gain);
-            self.continuous.spaces.set_volume(snapshot.print_spaces_gain);
+            self.continuous
+                .spaces
+                .set_volume(snapshot.print_spaces_gain);
             self.continuous.hum.set_volume(snapshot.hum_gain);
             self.continuous.tape.set_volume(snapshot.tape_reader_gain);
 

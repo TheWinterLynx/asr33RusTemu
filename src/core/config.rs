@@ -712,7 +712,9 @@ mod tests {
         );
 
         config.terminal.config.paste_on_right_click = false;
-        let serialized = config.to_yaml_string().expect("disabled setting serializes");
+        let serialized = config
+            .to_yaml_string()
+            .expect("disabled setting serializes");
         assert!(serialized.contains("paste_on_right_click: false"));
         let roundtrip = AppConfig::from_yaml_str(&serialized).expect("disabled setting parses");
         assert!(!roundtrip.terminal.config.paste_on_right_click);

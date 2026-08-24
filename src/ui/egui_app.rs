@@ -710,7 +710,9 @@ impl EguiApp {
             ui.label("Sound");
             let sound_label = if self.sound_muted { "Muted" } else { "On" };
             let sound_tooltip = match self.audio.availability() {
-                AudioAvailability::Starting => "Audio device is starting (F6 toggles mute)".to_owned(),
+                AudioAvailability::Starting => {
+                    "Audio device is starting (F6 toggles mute)".to_owned()
+                }
                 AudioAvailability::Available => "Toggle mechanical audio mute (F6)".to_owned(),
                 AudioAvailability::Unavailable(message) => {
                     format!("Audio unavailable: {message}. F6 still changes the saved mute state")
@@ -1215,10 +1217,10 @@ impl EguiApp {
             let follow =
                 ui.selectable_label(follows_reader, "Follow")
                     .on_hover_text(if follows_reader {
-                    "Viewport follows the read head; click for free inspection"
-                } else {
-                    "Free tape inspection; reader position is unchanged; click to follow"
-                });
+                        "Viewport follows the read head; click for free inspection"
+                    } else {
+                        "Free tape inspection; reader position is unchanged; click to follow"
+                    });
             if follow.clicked() {
                 if follows_reader {
                     self.reader_view.inspect_manually();
@@ -2003,7 +2005,10 @@ mod tests {
             explicit,
             (
                 Vec::new(),
-                Some("port enumeration failed: {error}".replace("{error}", "enumeration unavailable"))
+                Some(
+                    "port enumeration failed: {error}"
+                        .replace("{error}", "enumeration unavailable")
+                )
             )
         );
     }

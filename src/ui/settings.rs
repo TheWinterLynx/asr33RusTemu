@@ -621,7 +621,9 @@ fn connection(
     active_serial: Option<&SerialConfig>,
 ) {
     ui.heading("Connection");
-    ui.weak("Serial-only target: the configured port is opened only after explicit Connect/Reconnect.");
+    ui.weak(
+        "Serial-only target: the configured port is opened only after explicit Connect/Reconnect.",
+    );
     section(ui, metrics, "Status");
     ui.label(if connected {
         "Connected"
@@ -887,7 +889,9 @@ fn tape_punch(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) 
 fn sound(ui: &mut egui::Ui, metrics: SettingsUiMetrics, c: &mut AppConfig) {
     let s = &mut c.sound.config;
     ui.heading("Sound");
-    ui.weak("Native ASR-33 mechanical audio. Apply or Save changes the current session immediately.");
+    ui.weak(
+        "Native ASR-33 mechanical audio. Apply or Save changes the current session immediately.",
+    );
     section(ui, metrics, "Mechanical audio");
     row(
         ui,
