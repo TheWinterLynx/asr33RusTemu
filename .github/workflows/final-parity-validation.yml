@@ -45,9 +45,9 @@ jobs:
       - name: Reject obsolete transport references
         shell: pwsh
         run: |
-          git grep -niE 'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh'
+          git grep -niE 'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh' -- . ':(exclude).github/workflows/final-parity-validation.yml'
           if ($LASTEXITCODE -eq 0) {
-            throw 'Obsolete transport reference found in tracked files.'
+            throw 'Obsolete transport reference found in tracked product files.'
           }
           if ($LASTEXITCODE -ne 1) {
             exit $LASTEXITCODE
