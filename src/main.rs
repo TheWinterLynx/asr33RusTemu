@@ -187,15 +187,9 @@ mod tests {
 
     #[test]
     fn embedded_default_config_accepts_cli_overrides_without_disk_file() {
-        let cli = ConfigCli::try_parse_from([
-            "asr33emu",
-            "--columns",
-            "80",
-            "--baud",
-            "9600",
-            "--mute",
-        ])
-        .expect("CLI is valid");
+        let cli =
+            ConfigCli::try_parse_from(["asr33emu", "--columns", "80", "--baud", "9600", "--mute"])
+                .expect("CLI is valid");
         let loaded = embedded_default_config(&cli).expect("embedded default config loads");
         assert_eq!(loaded.file.terminal.config.columns, 72);
         assert_eq!(loaded.effective.terminal.config.columns, 80);
