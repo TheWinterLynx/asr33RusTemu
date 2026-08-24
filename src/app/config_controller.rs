@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::config::SerialConfig;
-use crate::core::config::{AppConfig, BackendKind, ValidationError};
+use crate::core::config::{AppConfig, ValidationError};
 use crate::core::config_store::{ConfigStore, ConfigStoreError};
 
 static KEYBOARD_REPEAT_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -23,7 +23,6 @@ pub enum ChangeClass {
     Live,
     Reconnect,
     Restart,
-    Unavailable,
     Legacy,
 }
 
@@ -112,20 +111,6 @@ impl ConfigChangePlan {
             old.backend.serial_config != new.backend.serial_config,
             "serial connection",
             ChangeClass::Reconnect,
-        );
-        add(
-            old.backend.kind != new.backend.kind,
-            "backend selection",
-            if new.backend.kind == BackendKind::Ssh {
-                ChangeClass::Unavailable
-            } else {
-                ChangeClass::Reconnect
-            },
-        );
-        add(
-            old.backend.ssh_config != new.backend.ssh_config,
-            "SSH",
-            ChangeClass::Unavailable,
         );
         add(old.sound != new.sound, "sound", ChangeClass::Live);
         add(
@@ -329,14 +314,6 @@ mod tests {
         b.terminal.config.columns += 1;
         b.terminal.config.send_cr_at_startup = !b.terminal.config.send_cr_at_startup;
         assert!(ConfigChangePlan::between(&a, &b).requires_restart());
-        let mut b = a.clone();
-        b.backend.kind = BackendKind::Ssh;
-        assert!(
-            ConfigChangePlan::between(&a, &b)
-                .changes
-                .iter()
-                .any(|x| x.class == ChangeClass::Unavailable)
-        );
     }
 
     #[test]
