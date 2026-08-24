@@ -1,10 +1,22 @@
 //! Pure Settings state and config-difference classification.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::core::config::SerialConfig;
 use crate::core::config::{AppConfig, BackendKind, ValidationError};
 use crate::core::config_store::{ConfigStore, ConfigStoreError};
+
+static KEYBOARD_REPEAT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[must_use]
+pub fn keyboard_repeat_enabled() -> bool {
+    KEYBOARD_REPEAT_ENABLED.load(Ordering::Relaxed)
+}
+
+fn set_keyboard_repeat_enabled(enabled: bool) {
+    KEYBOARD_REPEAT_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeClass {
@@ -47,6 +59,11 @@ impl ConfigChangePlan {
         add(
             a.keyboard_parity_mode != b.keyboard_parity_mode,
             "keyboard parity",
+            ChangeClass::Live,
+        );
+        add(
+            a.keyboard_repeat != b.keyboard_repeat,
+            "keyboard repeat",
             ChangeClass::Live,
         );
         add(
@@ -150,6 +167,7 @@ pub struct SettingsState {
 impl SettingsState {
     #[must_use]
     pub fn new(path: PathBuf, disk_config: AppConfig, applied_config: AppConfig) -> Self {
+        set_keyboard_repeat_enabled(applied_config.terminal.config.keyboard_repeat);
         Self {
             store: ConfigStore::new(path),
             runtime_start_config: applied_config.clone(),
@@ -190,6 +208,7 @@ impl SettingsState {
     }
     pub fn commit_apply(&mut self, plan: &ConfigChangePlan) {
         self.applied_config = self.draft_config.clone();
+        set_keyboard_repeat_enabled(self.applied_config.terminal.config.keyboard_repeat);
         self.pending_restart =
             ConfigChangePlan::between(&self.runtime_start_config, &self.applied_config)
                 .changes
@@ -206,6 +225,7 @@ impl SettingsState {
     }
     pub fn update_applied_from_live_control(&mut self, update: impl FnOnce(&mut AppConfig)) {
         update(&mut self.applied_config);
+        set_keyboard_repeat_enabled(self.applied_config.terminal.config.keyboard_repeat);
         self.draft_config = self.applied_config.clone();
     }
     pub fn clear_reconnect_required(&mut self) {
@@ -279,6 +299,7 @@ mod tests {
         b.terminal.config.mode = TerminalMode::Local;
         b.terminal.config.input_return_mode = InputReturnMode::CrLf;
         b.terminal.config.paste_on_right_click = !a.terminal.config.paste_on_right_click;
+        b.terminal.config.keyboard_repeat = !a.terminal.config.keyboard_repeat;
         assert!(
             ConfigChangePlan::between(&a, &b)
                 .changes
@@ -290,6 +311,12 @@ mod tests {
                 .changes
                 .iter()
                 .any(|x| x.label == "right-click paste" && x.class == ChangeClass::Live)
+        );
+        assert!(
+            ConfigChangePlan::between(&a, &b)
+                .changes
+                .iter()
+                .any(|x| x.label == "keyboard repeat" && x.class == ChangeClass::Live)
         );
         let mut b = a.clone();
         b.backend.serial_config.port = "COM5".into();
