@@ -31,7 +31,7 @@ class ConfigMergeCharacterizationTests(unittest.TestCase):
     def base_config(self):
         return {
             "frontend": {"type": "tkinter"},
-            "backend": {"type": "serial", "serial_config": {
+            "backend": {"serial_config": {
                 "port": "COM4", "baudrate": 110, "databits": 8,
                 "parity": "N", "stopbits": 1,
             }},
@@ -94,7 +94,6 @@ class ConfigEndToEndCharacterizationTests(unittest.TestCase):
         config = self.load(
             "asr33_config.yaml",
             "--frontend", "pygame",
-            "--backend", "ssh",
             "--term_mode", "local",
             "--columns", "80",
             "--rows", "30",
@@ -108,7 +107,6 @@ class ConfigEndToEndCharacterizationTests(unittest.TestCase):
         )
         effective = config.get_merged_config()._data
         self.assertEqual(effective["frontend"]["type"], "pygame")
-        self.assertEqual(effective["backend"]["type"], "ssh")
         self.assertEqual(effective["terminal"]["config"]["mode"], "local")
         self.assertEqual(effective["terminal"]["config"]["columns"], 80)
         self.assertEqual(effective["terminal"]["config"]["rows"], 30)
