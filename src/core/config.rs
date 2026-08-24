@@ -7,9 +7,8 @@
 //! CLI overrides. This difference must be approved before Rust configuration
 //! is connected to the application.
 //!
-//! The Rust target is deliberately serial-only. The legacy Python SSH backend
-//! remains only as historical/reference code while the migration is being
-//! closed out; it is not part of the Rust configuration surface.
+//! The application exposes a single serial transport and has no transport
+//! selector in its configuration surface.
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -393,7 +392,7 @@ impl Serialize for StopBits {
 }
 
 impl<'de> Deserialize<'de> for StopBits {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
