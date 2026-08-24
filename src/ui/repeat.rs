@@ -90,8 +90,14 @@ mod tests {
         ];
         filter_events(&mut events, false);
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], egui::Event::Key { repeat: false, .. }));
-        assert!(matches!(&events[1], egui::Event::Text(text) if text == "a"));
+        assert!(matches!(
+            events.first(),
+            Some(egui::Event::Key { repeat: false, .. })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(egui::Event::Text(text)) if text == "a"
+        ));
     }
 
     #[test]
