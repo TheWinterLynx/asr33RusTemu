@@ -1,6 +1,6 @@
 use asr33emu::core::config::{ConfigCli, LoadedConfig};
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 fn repository_root() -> &'static Path {
@@ -80,11 +80,7 @@ fn frozen_legacy_snapshot(strict: bool) -> Value {
     snapshot
 }
 
-fn compare_rust_to_frozen_legacy(
-    config_filename: &str,
-    overrides: &[&str],
-    expected: Value,
-) {
+fn compare_rust_to_frozen_legacy(config_filename: &str, overrides: &[&str], expected: Value) {
     let config_path = repository_root().join(config_filename);
     let mut rust_args = vec!["asr33emu".to_owned(), "--config".to_owned()];
     rust_args.push(config_path.to_string_lossy().into_owned());
