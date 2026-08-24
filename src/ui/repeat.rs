@@ -3,13 +3,21 @@
 //! egui/winit normally emits a repeated `Key` event immediately followed by
 //! the corresponding `Text` event. When repeat is disabled both halves must
 //! be removed, otherwise printable keys would still repeat through `Text`.
-//! Application function-key shortcuts remain single-shot in both modes.
+//! Application function-key shortcuts remain single-shot in both modes, while
+//! ordinary egui text fields retain normal host editing behaviour.
 
 use eframe::egui;
 
 use crate::app::config_controller::keyboard_repeat_enabled;
 
 pub(super) fn filter_host_repeat_events(context: &egui::Context) {
+    // This policy belongs to the ASR keyboard, not to Settings/COM/SSH text
+    // editors. egui keeps this flag true while a text-edit style widget owns
+    // keyboard input, so leave those events untouched.
+    if context.wants_keyboard_input() {
+        return;
+    }
+
     let repeat_enabled = keyboard_repeat_enabled();
     context.input_mut(|input| filter_events(&mut input.events, repeat_enabled));
 }
