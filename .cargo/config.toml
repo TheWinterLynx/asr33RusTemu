@@ -1,0 +1,6 @@
+# Keep release binaries deployable as a single application file on Windows.
+# Windows system DLLs (User32, WASAPI, etc.) remain normal OS dependencies,
+# but the MSVC C runtime is linked into the executable instead of requiring a
+# separately installed redistributable.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
