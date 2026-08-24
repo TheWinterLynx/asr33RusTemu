@@ -34,7 +34,7 @@ fn filter_events(events: &mut Vec<egui::Event>, repeat_enabled: bool) {
                 repeat: true,
                 ..
             } if is_application_shortcut(key) => {
-                // F1-F7 control emulator UI state rather than ASR keyboard
+                // F1-F9 control emulator UI state rather than ASR keyboard
                 // data. A held function key must never toggle repeatedly.
                 suppress_following_text = false;
             }
@@ -71,6 +71,8 @@ const fn is_application_shortcut(key: egui::Key) -> bool {
             | egui::Key::F5
             | egui::Key::F6
             | egui::Key::F7
+            | egui::Key::F8
+            | egui::Key::F9
     )
 }
 
@@ -121,8 +123,16 @@ mod tests {
 
     #[test]
     fn emulator_function_shortcuts_never_autorepeat() {
-        let mut events = vec![key(egui::Key::F6, true)];
-        filter_events(&mut events, true);
-        assert!(events.is_empty());
+        for shortcut in [
+            egui::Key::F5,
+            egui::Key::F6,
+            egui::Key::F7,
+            egui::Key::F8,
+            egui::Key::F9,
+        ] {
+            let mut events = vec![key(shortcut, true)];
+            filter_events(&mut events, true);
+            assert!(events.is_empty(), "{shortcut:?} repeated unexpectedly");
+        }
     }
 }
