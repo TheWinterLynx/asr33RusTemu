@@ -1,8 +1,5 @@
 # ASR-33 Emulator configuration
 
-frontend:
-  type: "tkinter"  # Options: "tkinter" | "pygame"
-
 sound:
   config:
     lid: "up"  # Options: "up" | "down"

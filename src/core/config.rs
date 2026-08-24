@@ -19,7 +19,6 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub frontend: FrontendSection,
     pub sound: SoundSection,
     pub terminal: TerminalSection,
     pub backend: BackendSection,
@@ -121,9 +120,6 @@ pub struct ConfigCli {
     #[arg(long, default_value = "asr33_config.yaml")]
     pub config: PathBuf,
 
-    #[arg(long, value_enum)]
-    pub frontend: Option<FrontendConfigValue>,
-
     #[arg(long = "term_mode", value_enum)]
     pub term_mode: Option<TerminalMode>,
 
@@ -157,9 +153,6 @@ pub struct ConfigCli {
 
 impl ConfigCli {
     pub fn apply_to(&self, config: &mut AppConfig) {
-        if let Some(value) = self.frontend {
-            config.frontend.kind = value;
-        }
         if let Some(value) = self.term_mode {
             config.terminal.config.mode = value;
         }
@@ -192,25 +185,6 @@ impl ConfigCli {
             config.backend.serial_config.stopbits = value;
         }
     }
-}
-
-/// Values accepted from the legacy Python frontend setting.
-///
-/// These variants are compatibility inputs, not Rust UI architecture choices.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
-pub enum FrontendConfigValue {
-    #[serde(rename = "tkinter")]
-    #[value(name = "tkinter")]
-    LegacyTkinter,
-    #[serde(rename = "pygame")]
-    #[value(name = "pygame")]
-    LegacyPygame,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FrontendSection {
-    #[serde(rename = "type")]
-    pub kind: FrontendConfigValue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

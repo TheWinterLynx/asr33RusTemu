@@ -66,8 +66,6 @@ fn default_yaml_with_all_shared_cli_overrides_matches_python() {
     compare_python_and_rust(
         "asr33_config.yaml",
         &[
-            "--frontend",
-            "pygame",
             "--term_mode",
             "local",
             "--columns",
@@ -96,8 +94,6 @@ fn strict_yaml_with_baud_alias_and_terminal_overrides_matches_python() {
     compare_python_and_rust(
         "asr33_strict.yaml",
         &[
-            "--frontend",
-            "tkinter",
             "--term_mode",
             "line",
             "--columns",
