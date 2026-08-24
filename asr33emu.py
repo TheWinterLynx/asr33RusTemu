@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 
 """
-ASR-33 Emulator Wrapper with YAML config and compact serial spec.
+ASR-33 Emulator Wrapper with YAML config.
 
 Usage examples:
-    python asr33_wrapper.py --config config.yaml
-    python asr33_wrapper.py --frontend tkinter --backend serial --serial COM3:110-8N1
+    python asr33emu.py --config config.yaml
+    python asr33emu.py --frontend tkinter --baudrate 110
 """
 
 from asr33_config import ASR33Config
 from asr33_backend_serial import SerialBackend
-from asr33_backend_ssh import SSHV2Backend
 from asr33_shim_throttle import DataThrottle
 from asr33_terminal import Terminal
 from asr33_sounds_sm import ASR33AudioModule as ASR33_Sounds
@@ -19,11 +18,11 @@ from asr33_frontend_tk import ASR33TkFrontend as TkFrontend
 
 
 DEFAULT_FRONTEND = "tkinter"
-DEFAULT_BACKEND = "serial"
 
 
 class EmulatorWrapper:
     """ASR-33 Emulator Wrapper Class"""
+
     def __init__(self):
         # Initialize selections as None placeholders first.
         self.comm_backend = None
@@ -52,22 +51,12 @@ class EmulatorWrapper:
         except AttributeError as e:
             raise RuntimeError(f"Missing configuration section: {e}") from e
 
-        # Backend
-        backend_type = backend_cfg.get("type", default=DEFAULT_BACKEND)
-        if backend_type == "serial":
-            cfg = backend_cfg.serial_config
-            self.comm_backend = SerialBackend(
-                upper_layer=None,  # Forward reference set later
-                config=cfg
-            )
-        elif backend_type == "ssh":
-            cfg = backend_cfg.ssh_config
-            self.comm_backend = SSHV2Backend(
-                upper_layer=None,
-                config=cfg
-                )
-        else:
-            raise ValueError(f"Unsupported backend type: {backend_type}")
+        # Serial transport
+        cfg = backend_cfg.serial_config
+        self.comm_backend = SerialBackend(
+            upper_layer=None,  # Forward reference set later
+            config=cfg,
+        )
 
         # Comm backend feeds data to DataThrottle, which feeds data to Terminal
         # Get DataThrottle config from YAML file or use defaults
@@ -75,7 +64,7 @@ class EmulatorWrapper:
         self.data_throttle = DataThrottle(
             lower_layer=self.comm_backend,
             upper_layer=None,  # Forward reference set later
-            config=cfg
+            config=cfg,
         )
 
         # Terminal
@@ -84,7 +73,7 @@ class EmulatorWrapper:
         self.term = Terminal(
             comm_interface=self.data_throttle,
             frontend=None,  # Forward reference set later
-            config=cfg
+            config=cfg,
         )
 
         # ASR-33 sound support
@@ -97,7 +86,7 @@ class EmulatorWrapper:
                 terminal=self.term,
                 backend=self.data_throttle,
                 config=cfg_data,
-                sound=self.sound
+                sound=self.sound,
             )
         elif frontend_type == "tkinter":
             self.frontend = TkFrontend(
