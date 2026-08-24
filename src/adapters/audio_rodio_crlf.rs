@@ -6,7 +6,7 @@
 //! for audio, matching RusTair: the CR one-shot is allowed to ring cleanly and
 //! an immediately following LF does not layer the platen sample on top of it.
 
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -116,14 +116,9 @@ impl AudioEngine {
 
     pub fn refresh_status(&mut self) -> Option<AudioAvailability> {
         let mut changed = None;
-        loop {
-            match self.statuses.try_recv() {
-                Ok(status) => {
-                    self.availability = status.clone();
-                    changed = Some(status);
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(status) = self.statuses.try_recv() {
+            self.availability = status.clone();
+            changed = Some(status);
         }
         changed
     }
