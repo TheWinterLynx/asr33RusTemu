@@ -7,79 +7,82 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  residual-frontend-cleanup:
-    name: Remove residual frontend references
+  windows-validation:
+    name: Windows Rust + Python parity gate
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout audit branch
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: agent/final-parity-audit
 
-      - name: Remove residual legacy frontend code
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python reference dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PyYAML pyserial pygame-ce pillow fonttools
+
+      - name: Set up stable Rust with rustfmt and clippy
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+
+      - name: Reject obsolete transport references
         shell: pwsh
         run: |
           @'
-          from pathlib import Path
+          import pathlib
+          import re
+          import subprocess
+          import sys
 
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding='utf-8')
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'{path}: expected one match, found {count}: {old!r}')
-              p.write_text(text.replace(old, new, 1), encoding='utf-8')
-
-          replace_once(
-              'src/app/config_controller.rs',
-              '    Legacy,\n',
-              ''
-          )
-          replace_once(
-              'src/app/config_controller.rs',
-              '        add(\n            old.frontend != new.frontend,\n            "legacy frontend",\n            ChangeClass::Legacy,\n        );\n',
-              ''
-          )
-
-          replace_once(
-              'src/ui/settings.rs',
-              '            SettingsPage::General => general(ui, metrics, state, &mut self.draft_theme),\n',
-              '            SettingsPage::General => general(ui, metrics, &mut self.draft_theme),\n'
-          )
-          replace_once(
-              'src/ui/settings.rs',
-              '        ChangeClass::Legacy => ("LEGACY", "Legacy compatibility input"),\n',
-              ''
-          )
-          replace_once(
-              'src/ui/settings.rs',
-              'fn general(\n    ui: &mut egui::Ui,\n    metrics: SettingsUiMetrics,\n    state: &mut SettingsState,\n    theme: &mut ThemeKind,\n) {\n',
-              'fn general(ui: &mut egui::Ui, metrics: SettingsUiMetrics, theme: &mut ThemeKind) {\n'
-          )
-          replace_once(
-              'src/ui/settings.rs',
-              '    section(ui, metrics, "Compatibility");\n    let legacy_frontend = match state.draft_config.frontend.kind {\n        FrontendConfigValue::LegacyTkinter => "tkinter",\n        FrontendConfigValue::LegacyPygame => "pygame",\n    };\n    ui.label(format!(\n        "frontend.type = {legacy_frontend} (read-only; Rust always uses egui)"\n    ))\n    .on_hover_cursor(egui::CursorIcon::Help)\n    .on_hover_text("Legacy frontend selection from Python. The Rust application always uses egui.");\n',
-              ''
-          )
+          excluded = {'.github/workflows/final-parity-validation.yml'}
+          pattern = re.compile(r'ssh|paramiko|SSHV2Backend|ssh_config|backend_ssh', re.IGNORECASE)
+          hits = []
+          for name in subprocess.check_output(['git', 'ls-files'], text=True).splitlines():
+              if name in excluded:
+                  continue
+              path = pathlib.Path(name)
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for line_number, line in enumerate(text.splitlines(), 1):
+                  if pattern.search(line):
+                      hits.append(f'{name}:{line_number}:{line}')
+          if hits:
+              print('\n'.join(hits))
+              sys.exit('Obsolete transport reference found in tracked product files.')
+          print('No obsolete transport references found.')
           '@ | python -
 
-      - name: Format and compile check
-        shell: pwsh
-        run: |
-          cargo fmt
-          cargo check --all-targets --all-features
-          git diff --check
+      - name: Rust formatting gate
+        run: cargo fmt --check
 
-      - name: Commit cleanup
+      - name: Rust clippy gate
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rust unit and integration tests
+        run: cargo test --all
+
+      - name: Python characterization oracle tests
+        run: python -m unittest discover -s tests -p "test_*characterization.py"
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Windows binary CLI smoke test
         shell: pwsh
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/app/config_controller.rs src/ui/settings.rs
-          git commit -m 'Remove residual legacy frontend references [skip ci]'
-          git push origin HEAD:agent/final-parity-audit
+        run: .\target\release\asr33emu.exe --help
